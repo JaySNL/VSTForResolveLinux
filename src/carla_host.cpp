@@ -69,7 +69,13 @@ NativeTimeInfo g_time_info;
 // the first plugin that uses it.
 // ---------------------------------------------------------------------------
 
-uint32_t HostGetBufferSize(NativeHostHandle) { return g_max_frames; }
+// What Carla believes the block size is. It must match what Resolve really hands us: Carla's rack
+// allocates its engine buffers from this, and a mismatch means it processes memory that was never
+// written. Resolve's block is 455 frames, not a power of two, and it is not known until the first
+// process call - so this starts at a sane value and is corrected below.
+uint32_t g_engine_frames = 512;
+
+uint32_t HostGetBufferSize(NativeHostHandle) { return g_engine_frames; }
 double HostGetSampleRate(NativeHostHandle) { return g_sample_rate; }
 bool HostIsOffline(NativeHostHandle) { return false; }
 
@@ -198,6 +204,7 @@ bool CarlaHostLoad(double sample_rate, uint32_t max_frames)
     }
 
     InputScratch().assign(static_cast<size_t>(g_channel_count) * g_max_frames, 0.0f);
+    g_engine_frames = 512;
 
     if (!g_idle_running.exchange(true)) {
         g_idle_thread = std::thread(IdleLoop);
@@ -218,6 +225,16 @@ bool CarlaHostProcess(float** buffers, uint32_t channel_count, uint32_t frames)
         return false;
     }
 
+    // Carla is NOT re-armed here. Doing deactivate, BUFFER_SIZE_CHANGED and activate from inside
+    // the audio callback crashed Resolve on project load, in this very function - the core dump
+    // named BridgeAfterProcess with BridgeThunkProcessSecondary above it. The engine keeps the
+    // size it was given at load, and the block size below is only reported.
+    if (frames != g_engine_frames) {
+        const uint32_t previous = g_engine_frames;
+        g_engine_frames = frames;
+        Log("carla: Resolve's block is %u frames, Carla was told %u at load", frames, previous);
+    }
+
     const uint32_t channels = channel_count < g_channel_count ? channel_count : g_channel_count;
     std::vector<float>& scratch = InputScratch();
     if (scratch.size() < static_cast<size_t>(channels) * g_max_frames) {
@@ -232,6 +249,48 @@ bool CarlaHostProcess(float** buffers, uint32_t channel_count, uint32_t frames)
     }
 
     g_descriptor->process(g_plugin, input, buffers, frames, nullptr, 0);
+
+    // Measure what the chain returns, rather than reasoning about it. A silent chain and a chain
+    // producing garbage look the same on a meter, and the peak tells them apart in one line.
+    static int measured = 0;
+    if (measured < 3) {
+        ++measured;
+        float input_peak = 0.0f;
+        float output_peak = 0.0f;
+        for (uint32_t channel = 0; channel < channels && channel < 2; ++channel) {
+            for (uint32_t frame = 0; frame < frames; ++frame) {
+                const float dry = input[channel][frame];
+                const float wet = buffers[channel][frame];
+                if (dry > input_peak) input_peak = dry;
+                if (-dry > input_peak) input_peak = -dry;
+                if (wet > output_peak) output_peak = wet;
+                if (-wet > output_peak) output_peak = -wet;
+            }
+        }
+        Log("carla: block %d - dry peak %.4f, chain peak %.4f", measured,
+            static_cast<double>(input_peak), static_cast<double>(output_peak));
+    }
+
+    // A guard, not a fix. A chain that produces infinities or wild gain reaches monitors and ears
+    // before anyone can read a log, so an implausible block is replaced by the dry signal it came
+    // from. It reports once; if this ever fires, the cause is upstream and worth finding.
+    static bool reported_bad_output = false;
+    for (uint32_t channel = 0; channel < channels && channel < 2; ++channel) {
+        for (uint32_t frame = 0; frame < frames; ++frame) {
+            const float sample = buffers[channel][frame];
+            if (sample > 4.0f || sample < -4.0f || sample != sample) {
+                for (uint32_t restore = 0; restore < channels && restore < 2; ++restore) {
+                    std::memcpy(buffers[restore], input[restore], frames * sizeof(float));
+                }
+                if (!reported_bad_output) {
+                    reported_bad_output = true;
+                    Log("carla: the chain returned an implausible sample (%.3f) - the dry signal is "
+                        "passed through instead", static_cast<double>(sample));
+                }
+                return true;
+            }
+        }
+    }
     return true;
 }
 

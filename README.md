@@ -246,6 +246,40 @@ decode AAC, so an `.mp4` gives no waveform and no samples to process; use PCM fo
 Resolve's stderr, and so every `[fxbridge]` line, lands in
 `~/.local/share/DaVinciResolve/logs/ResolveDebug.txt`.
 
+## Status: the CLAP host works, the Carla host does not
+
+**Use the CLAP host.** It is the default and it is the one that has been exercised end to end:
+`pp-track.clap` runs inside Fairlight with live audio, its own window, the show and hide button, a
+correct effect name and an empty panel.
+
+    FXBRIDGE_CLAP=/home/jooshua/.clap/pp-track.clap  /opt/resolve/bin/resolve
+
+**`FXBRIDGE_HOST=carla` is not usable yet.** Carla loads, instantiates, activates, opens its window
+and reports processing, but the audio is wrong and Resolve crashes. Measured on 2026-08-24:
+
+- With the rack in the chain there is no audio and the bus clips into the red.
+- Resolve crashes on project load, `SIGSEGV`, and the core dump names `BridgeAfterProcess` with
+  `BridgeThunkProcessSecondary` above it - our audio path, faulting after Carla's `process` runs.
+  The faulting frame is a jump to a small address such as `0x3146`, which is a call through a
+  pointer that Carla's processing left in a bad state.
+
+What has been ruled out, and what has not:
+
+- **Not the block size, on the evidence so far.** Carla is told 512 at load and Resolve's block is
+  455. Correcting it *from inside the audio callback* - deactivate, `BUFFER_SIZE_CHANGED`, activate -
+  made things worse and crashed in the same place. Never re-arm an engine on the real-time thread.
+- **Untested: the host handle.** `carla_create_native_plugin_host_handle(desc, handle)` is never
+  called. Its documentation says it is "suitable for CarlaHost API calls", which suggests it is for
+  adding plugins rather than required for processing - but it is the clearest missing piece, and it
+  is the next thing to try.
+- **Untested: whether an empty rack passes audio at all.** The build now logs the dry peak and the
+  chain peak for the first three blocks. Silence and garbage look identical on a meter and that one
+  line separates them. Run it and read the line before changing anything else.
+
+There is an output guard in `CarlaHostProcess`: a block containing a sample beyond +/-4.0 or a NaN
+is discarded and the dry signal passed instead. It is a hearing-safety measure, not a fix, and it
+reports once.
+
 ## Per-instance: our own vtable
 
 The stock `BMDStereoDelay` vtable is **not patched**. Patching it made every Delay in the project
