@@ -366,6 +366,32 @@ bool SafeRead(const void* address, void* out, size_t length)
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(length);
 }
 
+// Writability, tested without faulting.
+//
+// SafeRead proves a buffer can be read. It does not prove it can be written, and that distinction
+// is what caused every audio fault in this bridge: Resolve does not always hand over as many
+// writable output channels as the hosted plugin wants, and a stale pointer can be perfectly
+// readable while its page is not writable. Measured 2026-08-25: output[0]=0x7f3ee5583f2c and
+// output[1]=0x7f3f963b5560, a gigabyte apart, and the memcpy into the second one killed the
+// process.
+//
+// process_vm_writev reports the failure instead of raising it, so the sample is written back to
+// itself and a rejection simply means "do not touch this channel".
+bool SafeWriteProbe(void* address)
+{
+    if (address == nullptr) {
+        return false;
+    }
+    float sample = 0.0f;
+    if (!SafeRead(address, &sample, sizeof(sample))) {
+        return false;
+    }
+    iovec local{&sample, sizeof(sample)};
+    iovec remote{address, sizeof(sample)};
+    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) ==
+           static_cast<ssize_t>(sizeof(sample));
+}
+
 bool LooksLikePointer(unsigned long value)
 {
     return value > 0x10000 && value < 0x800000000000UL && (value & 7) == 0;
@@ -1408,23 +1434,31 @@ constexpr unsigned int kMaxChannels = 16;
 
 namespace {
 
-// Both ends of the block must be readable before the plugin sees the buffer.
-bool ChannelsAreReadable(float** buffers, unsigned int channels, unsigned long frames)
+// How many leading channels are genuinely usable: both ends of the block readable, and both ends
+// writable. Returns a count rather than a yes or no, because Resolve providing fewer channels than
+// the plugin wants is normal and must not cost the whole block.
+unsigned int UsableChannels(float** buffers, unsigned int wanted, unsigned long frames)
 {
-    for (unsigned int channel = 0; channel < channels; ++channel) {
+    if (buffers == nullptr || frames == 0) {
+        return 0;
+    }
+    for (unsigned int channel = 0; channel < wanted; ++channel) {
         unsigned long channel_pointer = 0;
         if (!SafeRead(buffers + channel, &channel_pointer, sizeof(channel_pointer)) ||
             channel_pointer == 0) {
-            return false;
+            return channel;
         }
-        float probe = 0.0f;
         auto* const samples = reinterpret_cast<float*>(channel_pointer);
+        float probe = 0.0f;
         if (!SafeRead(samples, &probe, sizeof(probe)) ||
             !SafeRead(samples + frames - 1, &probe, sizeof(probe))) {
-            return false;
+            return channel;
+        }
+        if (!SafeWriteProbe(samples) || !SafeWriteProbe(samples + frames - 1)) {
+            return channel;
         }
     }
-    return true;
+    return wanted;
 }
 
 }  // namespace
@@ -1440,9 +1474,14 @@ extern "C" void BridgeBeforeProcess(void* self, const void* timebase, float** in
         return;
     }
 
-    const unsigned int wanted = effect->plugin->ChannelCount();
-    if (wanted == 0 || wanted > kMaxChannels || input == nullptr || frames == 0 ||
-        frames > kMaxFrames || !ChannelsAreReadable(input, wanted, frames)) {
+    const unsigned int asked = effect->plugin->ChannelCount();
+    if (asked == 0 || asked > kMaxChannels || input == nullptr || frames == 0 ||
+        frames > kMaxFrames) {
+        effect->dry_frames = 0;
+        return;
+    }
+    const unsigned int wanted = UsableChannels(input, asked, frames);
+    if (wanted == 0) {
         effect->dry_frames = 0;
         return;
     }
@@ -1465,15 +1504,47 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
     (void)timebase;
     (void)input;
 
+    // Breadcrumbs, first few calls only.
+    //
+    // This function has faulted repeatedly and Process #1 never reaches the log, so the fault is
+    // before it. Two guesses at the cause were wrong. Each step now announces itself, and the last
+    // line in the log names the step that died.
+    static int steps = 0;
+    const bool trace = ++steps <= 5;
+    if (trace) Log("after#%d: entry self=%p output=%p frames=%lu", steps, self, output, frames);
+
     ClaimedEffect* const effect = FindEffect(self);
     if (effect == nullptr || effect->plugin == nullptr) {
+        if (trace) Log("after#%d: not ours, returning", steps);
         return;  // not ours: a stock Delay elsewhere in the project
     }
+    if (trace) Log("after#%d: effect=%p plugin=%p", steps, effect, effect->plugin);
 
-    const unsigned int wanted = effect->plugin->ChannelCount();
-    if (wanted == 0 || output == nullptr || frames == 0 || frames > kMaxFrames ||
-        !ChannelsAreReadable(output, wanted, frames)) {
+    const unsigned int asked = effect->plugin->ChannelCount();
+    if (asked == 0 || output == nullptr || frames == 0 || frames > kMaxFrames) {
+        if (trace) Log("after#%d: arguments rejected", steps);
         return;
+    }
+
+    // Only the channels Resolve really gave us, proven writable.
+    const unsigned int wanted = UsableChannels(output, asked, frames);
+    if (trace) Log("after#%d: plugin wants %u channels, %u are usable", steps, asked, wanted);
+    if (wanted == 0) {
+        if (trace) Log("after#%d: no usable output channel, leaving the block alone", steps);
+        return;
+    }
+    static unsigned int reported_short = 0;
+    if (wanted < asked && reported_short < 3) {
+        ++reported_short;
+        Log("audio: Resolve provided %u of the %u channels \"%s\" wants", wanted, asked,
+            effect->plugin->Name());
+    }
+    if (trace) {
+        // The pointers themselves, and the dry block's state. ChannelsAreReadable proves only that
+        // these can be read; the restore below writes to them.
+        Log("after#%d: output[0]=%p output[1]=%p dry.size=%zu dry_frames=%lu dry_channels=%u",
+            steps, output[0], wanted > 1 ? output[1] : nullptr, effect->dry.size(),
+            effect->dry_frames, effect->dry_channels);
     }
 
     // Put the dry signal back over whatever the carrier effect wrote, so the hosted plugin hears
@@ -1482,14 +1553,17 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
     if (effect->dry_frames == frames && effect->dry_channels == wanted &&
         effect->dry.size() >= static_cast<size_t>(wanted) * kMaxFrames) {
         for (unsigned int channel = 0; channel < wanted; ++channel) {
+            if (trace) Log("after#%d: restoring channel %u", steps, channel);
             std::memcpy(output[channel], &effect->dry[channel * kMaxFrames],
                         frames * sizeof(float));
         }
         restored = true;
     }
+    if (trace) Log("after#%d: dry %s, calling the plugin", steps, restored ? "restored" : "MISSING");
 
     const bool processed = effect->plugin->Process(output, wanted,
                                                    static_cast<unsigned int>(frames));
+    if (trace) Log("after#%d: the plugin returned", steps);
 
     if (++g_process_calls <= 3) {
         Log("Process #%d: frames=%lu, %u channels, dry %s, plugin %s",
