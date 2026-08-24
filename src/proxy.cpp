@@ -26,6 +26,7 @@
 
 #include "clap_host.h"
 #include "carla_host.h"
+#include "vst2_host.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -41,6 +42,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <atomic>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -91,39 +93,70 @@ void Log(const char* format, ...)
 
 namespace {
 
-bool UsingCarla()
+// Which loader is behind the wrapper. Everything below this line is the same for all of them:
+// the Fairlight carrier, the vtable claim, the editor visibility owner and the window.
+enum class Loader { Clap, Carla, Vst2 };
+
+Loader SelectedLoader()
 {
     const char* const host = std::getenv("FXBRIDGE_HOST");
-    return host != nullptr && std::strcmp(host, "carla") == 0;
+    if (host == nullptr) {
+        return Loader::Clap;
+    }
+    if (std::strcmp(host, "carla") == 0) {
+        return Loader::Carla;
+    }
+    if (std::strcmp(host, "vst2") == 0) {
+        return Loader::Vst2;
+    }
+    return Loader::Clap;
 }
+
+bool UsingCarla() { return SelectedLoader() == Loader::Carla; }
+bool UsingVst2() { return SelectedLoader() == Loader::Vst2; }
 
 bool HostProcess(float** buffers, unsigned int channels, unsigned int frames)
 {
-    return UsingCarla() ? CarlaHostProcess(buffers, channels, frames)
-                        : ClapHostProcess(buffers, channels, frames);
+    switch (SelectedLoader()) {
+        case Loader::Carla: return CarlaHostProcess(buffers, channels, frames);
+        case Loader::Vst2:  return Vst2HostProcess(buffers, channels, frames);
+        default:            return ClapHostProcess(buffers, channels, frames);
+    }
 }
 
 unsigned int HostChannelCount()
 {
-    return UsingCarla() ? CarlaHostChannelCount() : ClapHostChannelCount();
+    switch (SelectedLoader()) {
+        case Loader::Carla: return CarlaHostChannelCount();
+        case Loader::Vst2:  return Vst2HostChannelCount();
+        default:            return ClapHostChannelCount();
+    }
 }
 
 const char* HostName()
 {
-    return UsingCarla() ? CarlaHostName() : ClapHostName();
+    switch (SelectedLoader()) {
+        case Loader::Carla: return CarlaHostName();
+        case Loader::Vst2:  return Vst2HostName();
+        default:            return ClapHostName();
+    }
 }
 
 bool HostOpenEditor()
 {
-    return UsingCarla() ? CarlaHostOpenEditor() : ClapHostOpenEditor();
+    switch (SelectedLoader()) {
+        case Loader::Carla: return CarlaHostOpenEditor();
+        case Loader::Vst2:  return Vst2HostOpenEditor();
+        default:            return ClapHostOpenEditor();
+    }
 }
 
 void HostCloseEditor()
 {
-    if (UsingCarla()) {
-        CarlaHostCloseEditor();
-    } else {
-        ClapHostCloseEditor();
+    switch (SelectedLoader()) {
+        case Loader::Carla: CarlaHostCloseEditor(); break;
+        case Loader::Vst2:  Vst2HostCloseEditor(); break;
+        default:            ClapHostCloseEditor(); break;
     }
 }
 
@@ -950,7 +983,11 @@ bool ReadQStringArgument(const void* reference, char* out, size_t out_size)
 // off, or to "1" to turn a default-off one on.
 //
 //   FXBRIDGE_RENAME          on   the effect names itself after the hosted plugin
-//   FXBRIDGE_EMPTY_PANEL     on   no Delay control tree, and our window opens with the effect
+//   FXBRIDGE_EMPTY_PANEL     off  empties the panel by truncating the tree's item list. OFF after
+//                                 a crash on this path: the item count is not stable across
+//                                 effects (25 on one, 19 on another), so the list is not the
+//                                 vector of pointers it was read as, and something else may still
+//                                 index into it.
 //   FXBRIDGE_PRIMARY_PROCESS off  hooks Process at +0x4d0 as well - this one crashed Resolve
 static bool EnabledByEnvironment(const char* name, bool on_by_default = false)
 {
@@ -1031,6 +1068,17 @@ void LoadConfiguredPlugin()
 {
     ClapHostSetLogger([](const char* line) { Log("%s", line); });
     CarlaHostSetLogger([](const char* line) { Log("%s", line); });
+    Vst2HostSetLogger([](const char* line) { Log("%s", line); });
+
+    if (UsingVst2()) {
+        const char* const path = std::getenv("FXBRIDGE_VST2");
+        if (path == nullptr || path[0] == '\0') {
+            Log("vst2: FXBRIDGE_VST2 is not set, audio passes through untouched");
+        } else if (!Vst2HostLoad(path, 48000.0, 8192)) {
+            Log("vst2: %s did not load, audio passes through untouched", path);
+        }
+        return;
+    }
 
     if (UsingCarla()) {
         if (!CarlaHostLoad(48000.0, 8192)) {
@@ -1295,9 +1343,9 @@ int g_process_calls = 0;
 
 }  // namespace
 
-// The dry block saved between the two halves of the Process trampoline.
-static unsigned long g_dry_frames = 0;
-static unsigned int g_dry_channels = 0;
+// The dry block saved between the two halves of the Process trampoline, per thread.
+static thread_local unsigned long g_dry_frames = 0;
+static thread_local unsigned int g_dry_channels = 0;
 
 extern "C" {
 BRIDGE_HIDDEN2 void* g_original_process_primary = nullptr;
@@ -1328,11 +1376,27 @@ constexpr unsigned int kMaxChannels = 16;
 
 namespace {
 
-// Allocated once, at full size, so the audio thread never waits for a heap.
+// Per thread, because Resolve renders audio on several threads at once.
+//
+// This was one global buffer with two global counters, and one shared plugin behind them. With a
+// single effect on a single track that is invisible; as soon as the project carries a few effects,
+// two threads are inside this path together, each overwriting the other's dry block and both
+// re-entering a plugin that is not re-entrant. Every fault tonight, on the CLAP host and the Carla
+// host alike, was the same two frames: BridgeAfterProcess under BridgeThunkProcessSecondary.
+//
+// The buffer is a thread_local, so each thread keeps its own dry block, and the hosted plugin is
+// serialised by a lock, because neither CLAP nor Carla promises a re-entrant process().
 std::vector<float>& DryScratch()
 {
-    static std::vector<float> scratch(kMaxChannels * kMaxFrames, 0.0f);
+    static thread_local std::vector<float> scratch(kMaxChannels * kMaxFrames, 0.0f);
     return scratch;
+}
+
+// Held only around the hosted plugin's process call.
+std::mutex& HostProcessLock()
+{
+    static std::mutex lock;
+    return lock;
 }
 
 // Both ends of the block must be readable before the plugin sees the buffer.
@@ -1402,7 +1466,11 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
         restored = true;
     }
 
-    const bool processed = HostProcess(output, wanted, static_cast<unsigned int>(frames));
+    bool processed = false;
+    {
+        const std::lock_guard<std::mutex> guard(HostProcessLock());
+        processed = HostProcess(output, wanted, static_cast<unsigned int>(frames));
+    }
 
     if (++g_process_calls <= 3) {
         Log("Process #%d: frames=%lu, %u channels, dry %s, plugin %s",
@@ -1944,7 +2012,7 @@ int ClaimInstance(void* instance)
     // With no control tree there is no panel, and Resolve never calls InitializeEffectEdit - the
     // editor path is gated on the panel existing. Verified on 2026-08-24: with the panel suppressed
     // the log carries no InitializeEffectEdit line at all. So the window is opened here instead.
-    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
+    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL")) {
         BridgeEditorShow("the effect was added");
     }
 
@@ -2154,7 +2222,7 @@ void PatchDelayClassVtable()
     // disassembly for an sret first.
 
     // After the trace loop, so the no-op wins the slot rather than the tracer.
-    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
+    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL")) {
         PatchOurSlot(kGenerateUserInterfaceOffset, nullptr,
                      reinterpret_cast<void*>(&BridgeGenerateUserInterface));
         Log("empty panel is ON - GenerateUserInterface is a no-op in our vtable");
