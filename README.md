@@ -571,38 +571,96 @@ editor lives inside it; a destroyed window left the plugin believing its GUI sti
 3. One hosted plugin per effect instance, with its own editor.
 
 
-## The close-during-playback crash: gone, cause never found
+## The crash in Resolve's mixer: three theories dead, cause still unknown
 
-On 2026-08-25, closing the plugin panel while the timeline played crashed Resolve. Two core dumps
-were taken (01:04:36 and 01:05:28), both `SIGSEGV / SEGV_MAPERR`.
+This one is written down because it has now survived two fixes, and each fix was built on a theory
+that a measurement then killed. The record matters more than the theories.
 
-**The dumps are worthless, and it is worth knowing why.** Frames #0 and #1 of the faulting thread
-sit inside `backtrace_symbols`:
+**The fault, verified.** Two dumps (2026-08-25 01:22:27 and 01:51:18), identical frames:
 
-    #0 libc.so.6 + 0x1a95e2
-    #1 __backtrace_symbols (libc.so.6 + 0x159d07)
-    #2 resolve + 0x35920e7
-    #3 resolve + 0x3591313
-    #4 libc.so.6 + 0x44cb0        <- __restore_rt
-    #5 ClapHostLogParameters (libfxbridge.so + 0x936f)
+    MixPole::ApplyGainSmooth+0x188
+    BusSourcePreFader::AddChannelSourceToChannelBus
+    BusSourcePreFader::AddToBus  →  AddToMix::Execute
+    NativeAudioEngine2::AdvancedLoadSamples  →  ALSAPlayandCaptureLoop     (the audio thread)
 
-Resolve installs its own crash handler. The handler faulted while it walked the stack, so the dump
-records the handler's death, not the original one. The `ClapHostLogParameters` attribution below it
-is the handler misreading frames — that function runs once, at effect creation, and cannot be on a
-panel-close path. **Read frame #0 before believing frame #5.**
+Disassembled, `+0x188` is:
 
-The crash stopped after `libfxbridge.so` was rebuilt from `c039715` and installed. Nothing in the
-source changed between the crashing build and the working one: the working build is the same commit,
-compiled again. That leaves two candidates, and this repo cannot tell them apart:
+    mov  0x8(%r12),%rdi      # a member of the MixPole
+    test %rdi,%rdi
+    je   …                   # null is already handled
+    mov  (%rdi),%rax         # its vptr
+    call *0x20(%rax)         # <- the fault
 
-- the installed `.so` was stale — plausible, because installing from the build was itself a fix
-  (`e8333fb`), and a crash had already been reported once against a two-commit-old library;
-- the fault is a race that simply did not fire again.
+So the object is **non-null garbage**, not null and not a short buffer. That reads as a freed or
+overwritten `AudioNode`, and it says nothing about who freed it.
 
-**So it is not fixed, it is absent.** No change is credited with fixing it. If it returns, the first
-move is not a core dump — it is `md5sum` on the installed library against `build/libfxbridge.so`.
+**Theory 1: the hosted plugin wrote past its block.** A limiter with lookahead rounding its work up
+to an internal block would overrun Resolve's buffer, which holds exactly `frames` floats. Plausible,
+and it fit pp-track (a limiter) crashing where Dragonfly (no lookahead) did not.
 
-One suspicion remains recorded but unproven: of the hand-written trampolines only
-`BRIDGE_PROCESS_THUNK` carries CFI unwind data. `BRIDGE_AUDIO_THUNK`, `BridgeThunkSetParameter` and
-`BRIDGE_TRACE_THUNK` carry none, so a stack walker that meets one has nothing to work from. That
-explains a *handler* crash. It does not explain the first fault.
+*Measured and refuted.* The plugin now runs over our own scratch with 8192 frames of headroom, and a
+marker sits one sample past every block. The marker survived **every** block - zero reports - and the
+crash came back unchanged. The isolation is kept anyway: it is the right boundary, and it is what
+turned the theory into a measurement.
+
+**Theory 2: Resolve's output buffer was shorter than `frames`.** Dead on inspection, not on a hunch:
+`UsableChannels` already read- and write-probes the **first and last** sample of every channel before
+anything is copied into it.
+
+**Theory 3: the emptied panel.** The tree truncation in `BridgeGenerateUserInterface` is the one
+place we edit a Fairlight data structure. *Refuted by the dumps themselves:* the 01:22 crash happened
+with `FXBRIDGE_EMPTY_PANEL` off and the 01:51 crash with it on, and the frames are identical.
+
+**What is left, and what would settle it.** Both crashes carried pp-track; Dragonfly ran all evening
+without one. Two experiments decide whether the bridge is involved at all, and neither is a code
+change:
+
+1. the same timeline with Dragonfly Hall Reverb in place of pp-track;
+2. the same timeline with our effect removed.
+
+**A crash dump is not always the crash.** Earlier the same night, a dump named
+`ClapHostLogParameters` and frames #0/#1 sat inside `backtrace_symbols`: Resolve's own crash handler
+had faulted while walking the stack, so the dump recorded the handler's death and the attribution
+below it was noise. Read frame #0 before believing frame #5. Of our hand-written trampolines only
+`BRIDGE_PROCESS_THUNK` carries CFI unwind data, which is the likeliest reason a stack walker dies in
+one - unproven, and it explains a *handler* crash, never a first fault.
+
+**A crash that stops is not a crash that is fixed.** The close-panel-during-playback crash of the
+same night disappeared after a rebuild of the *same commit* and has not returned. Nothing is credited
+with fixing it. If it comes back, the first move is `md5sum` on the installed library against
+`build/libfxbridge.so`, not a core dump.
+
+## Scanning, and one plugin per effect (2026-08-25)
+
+`plugin_scan.cpp` walks the standard folders and `proxy.cpp` turns each result into one menu entry.
+Fifteen entries appear on this machine; the key each entry carries maps back to the plugin file, so
+picking an entry loads that plugin and no other. Verified in Resolve.
+
+Nothing is loaded to build the menu - the name is the file's stem. Asking a plugin its name would
+start a Wine process per Windows plugin at Resolve's startup, twenty-two of them here.
+
+Three traps the scanner already carries:
+
+- `~/.vst` is a **root**, `carla.vst` is a **bundle**. A bundle is read flat, because Carla ships a
+  `styles/` folder beside its plugins with a Qt style plugin in it, and `dlopen` on that runs a Qt
+  plugin's constructors inside Resolve.
+- Names that start with `lib`, or contain `bridge`, `interposer` or `chainloader`, are support
+  libraries, not plugins. The filter is on the name, before anything is opened.
+- The menu name is stored in the project, so the scan is sorted and de-duplicated by path. An entry
+  that changes name between runs is an effect that stops loading.
+
+**Everything that was shared is now per effect**: the plugin, its buffers, its editor window, its
+name in both encodings, and its editor's shown/wanted flags. Each of those was a real defect while it
+was shared, and each is recorded in the commit that removed it. The one thing still shared is the
+`BridgeEditorWasClosedByUser` callback, which knows the window but not the effect.
+
+**The carrier's knobs are not the plugin's parameters.** They were forwarded by index. Dragging the
+Delay panel's Delay Time knob sent index 5 to pp-track and silenced it, and it read as a broken audio
+path until someone read the `knob:` lines in the log. There is no mapping to find; the binding is
+gone, behind `FXBRIDGE_KNOB_BINDING` for studying a plugin whose parameter order is known.
+
+**CLAP's `on_timer` is main-thread work.** It runs beside every GUI call, and a plugin may touch its
+editor from it. Our timer thread had neither a lock nor an honest answer from
+`clap_host_thread_check` - it reported itself as the *audio* thread - and Resolve died six frames
+inside pp-track's GUI code. One mutex per plugin around every main-thread call, and the timer thread
+answers as main.
