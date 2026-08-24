@@ -131,7 +131,10 @@ class ClapPlugin final : public HostedPlugin {
 public:
     ~ClapPlugin() override
     {
+        // The timer stops before anything is torn down, and StopTimer joins - so no thread is
+        // inside the plugin by the time destroy() is called.
         StopTimer();
+        std::lock_guard<std::mutex> held(main_lock_);
         if (plugin_ != nullptr) {
             if (gui_created_) {
                 const auto* const gui = static_cast<const clap_plugin_gui_t*>(
@@ -297,6 +300,7 @@ public:
         if (plugin_ == nullptr) {
             return false;
         }
+        std::lock_guard<std::mutex> held(main_lock_);
         const auto* const gui = static_cast<const clap_plugin_gui_t*>(
             plugin_->get_extension(plugin_, CLAP_EXT_GUI));
         if (gui == nullptr) {
@@ -353,7 +357,11 @@ public:
         return true;
     }
 
-    void CloseEditor() override { PluginWindowHide(window_); }
+    void CloseEditor() override
+    {
+        std::lock_guard<std::mutex> held(main_lock_);
+        PluginWindowHide(window_);
+    }
 
     void LogParameters() const
     {
@@ -414,18 +422,42 @@ private:
 
     void StopTimer()
     {
-        if (timer_running_.exchange(false) && timer_thread_.joinable()) {
-            timer_thread_.join();
+        const bool was_running = timer_running_.exchange(false);
+        if (!was_running || !timer_thread_.joinable()) {
+            return;
         }
+        // A plugin may unregister its timer from inside on_timer, which runs on the timer thread.
+        // Joining there would be a thread joining itself: std::terminate, not a hang. The flag is
+        // already false, so the loop ends on its own and the destructor does the join.
+        if (std::this_thread::get_id() == timer_thread_id_) {
+            return;
+        }
+        timer_thread_.join();
     }
 
+    // The plugin's idle loop.
+    //
+    // CLAP puts on_timer on the main thread, next to every GUI call, and a plugin is entitled to
+    // touch its editor from it. So two rules hold here, and breaking either one crashed Resolve on
+    // 2026-08-25 with the fault six frames inside pp-track's own GUI code:
+    //
+    //   1. This thread must hold main_lock_ while it is inside the plugin. Resolve's UI thread
+    //      takes the same lock around create, set_parent, show and destroy, so the two never meet.
+    //   2. The plugin must be told this thread IS the main thread. The old answer was "no", which
+    //      made clap_host_thread_check report the timer as the audio thread - so a plugin doing
+    //      GUI work in on_timer was told it was on the wrong thread for exactly that work.
     void TimerLoop()
     {
+        timer_thread_id_ = std::this_thread::get_id();
         while (timer_running_.load()) {
             const uint32_t period = timer_period_.load();
             std::this_thread::sleep_for(std::chrono::milliseconds(period != 0 ? period : 16));
             if (!timer_running_.load() || plugin_ == nullptr) {
                 continue;
+            }
+            std::lock_guard<std::mutex> held(main_lock_);
+            if (!timer_running_.load() || plugin_ == nullptr) {
+                continue;  // stopped while we waited for the lock
             }
             const auto* const timer = static_cast<const clap_plugin_timer_support_t*>(
                 plugin_->get_extension(plugin_, CLAP_EXT_TIMER_SUPPORT));
@@ -477,7 +509,13 @@ private:
     static bool HostIsMainThread(const clap_host_t* host)
     {
         ClapPlugin* const self = From(host);
-        return self != nullptr && std::this_thread::get_id() == self->main_thread_id_;
+        if (self == nullptr) {
+            return false;
+        }
+        const std::thread::id here = std::this_thread::get_id();
+        // The timer thread does main-thread work under main_lock_, so it answers as main. See
+        // TimerLoop for why answering "no" here is not a white lie but a crash.
+        return here == self->main_thread_id_ || here == self->timer_thread_id_;
     }
     static bool HostIsAudioThread(const clap_host_t* host) { return !HostIsMainThread(host); }
 
@@ -539,6 +577,11 @@ private:
     std::atomic<clap_id> timer_id_{0};
     std::atomic<uint32_t> timer_period_{16};
     std::thread::id main_thread_id_;
+    std::thread::id timer_thread_id_;
+
+    // Held by whichever thread is doing main-thread work on this plugin. Never taken on the audio
+    // thread: process() is the one call CLAP allows to run beside the main thread.
+    std::mutex main_lock_;
 
     PendingParameter parameters_[kMaxParameters];
     uint32_t parameter_count_ = 0;

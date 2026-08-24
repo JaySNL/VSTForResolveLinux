@@ -195,6 +195,10 @@ struct ClaimedEffect {
     // buffer, a second effect with a second plugin would rename the first one.
     char label_narrow[128] = {0};
     wchar_t label_wide[128] = {0};
+
+    // This effect's editor, not the bridge's. See BridgeEditorShowFor.
+    std::atomic<bool> editor_wanted{false};
+    std::atomic<bool> editor_shown{false};
 };
 
 // Fills both encodings from one name.
@@ -267,20 +271,30 @@ ClaimedEffect* AppendEffect(void* instance_key, void* audio_plugin_key)
 // A close that the user performed is remembered, so re-asserting never fights them.
 // ---------------------------------------------------------------------------
 
-namespace {
+// The editor belongs to an effect, not to the bridge.
+//
+// This used to be one pair of flags and one call on g_focused_effect, which was right while only
+// one plugin could exist. It is not right now: with two effects in a project, opening the second
+// one's panel remapped the FIRST one's window - visible in the log on 2026-08-25 as
+// "editor remapped" for instance 1 while Resolve was calling InitializeEffectEdit for instance 2.
+// So each hook passes the effect it was called for, and the flags live on that effect.
 
-std::atomic<bool> g_editor_wanted{false};
-std::atomic<bool> g_editor_shown{false};
-
-}  // namespace
-
-extern "C" void BridgeEditorShow(const char* because)
+ClaimedEffect* EffectOrFocused(void* self)
 {
-    const bool was_shown = g_editor_shown.exchange(true);
-    g_editor_wanted.store(true);
-    ClaimedEffect* const effect = g_focused_effect.load();
-    if (effect == nullptr || effect->plugin == nullptr || !effect->plugin->OpenEditor()) {
-        g_editor_shown.store(false);
+    ClaimedEffect* const effect = FindEffect(self);
+    return effect != nullptr ? effect : g_focused_effect.load();
+}
+
+extern "C" void BridgeEditorShowFor(ClaimedEffect* effect, const char* because)
+{
+    if (effect == nullptr || effect->plugin == nullptr) {
+        Log("editor: %s asked for a window and no effect owns it", because);
+        return;
+    }
+    const bool was_shown = effect->editor_shown.exchange(true);
+    effect->editor_wanted.store(true);
+    if (!effect->plugin->OpenEditor()) {
+        effect->editor_shown.store(false);
         Log("editor: %s asked for the window and the host refused", because);
         return;
     }
@@ -289,30 +303,42 @@ extern "C" void BridgeEditorShow(const char* because)
     }
 }
 
-extern "C" void BridgeEditorHide(const char* because)
+extern "C" void BridgeEditorHideFor(ClaimedEffect* effect, const char* because)
 {
-    g_editor_wanted.store(false);
-    if (g_editor_shown.exchange(false)) {
-        ClaimedEffect* const effect = g_focused_effect.load();
-        if (effect != nullptr && effect->plugin != nullptr) {
-            effect->plugin->CloseEditor();
-        }
+    if (effect == nullptr || effect->plugin == nullptr) {
+        return;
+    }
+    effect->editor_wanted.store(false);
+    if (effect->editor_shown.exchange(false)) {
+        effect->plugin->CloseEditor();
         Log("editor: hidden (%s)", because);
     }
 }
 
-// The host telling us its window is gone. Not a request to bring it back.
+// The host telling us a window is gone. Not a request to bring it back.
+//
+// The window pump knows which X11 window closed but not which effect owns it, so every effect is
+// marked closed. Nothing acts on the flag on its own - there is no re-assert loop - so the cost is
+// that closing one editor also forgets that another was open, and Resolve's next
+// InitializeEffectEdit opens the right one anyway.
 extern "C" void BridgeEditorWasClosedByUser()
 {
-    g_editor_wanted.store(false);
-    g_editor_shown.store(false);
+    const size_t count = g_effect_count.load();
+    for (size_t index = 0; index < count; ++index) {
+        g_effects[index].editor_wanted.store(false);
+        g_effects[index].editor_shown.store(false);
+    }
 }
 
 // Called from the idle tick. Puts the window back if it should be there and is not.
 extern "C" void BridgeEditorReassert()
 {
-    if (g_editor_wanted.load() && !g_editor_shown.load()) {
-        BridgeEditorShow("re-asserted");
+    const size_t count = g_effect_count.load();
+    for (size_t index = 0; index < count; ++index) {
+        ClaimedEffect& effect = g_effects[index];
+        if (effect.editor_wanted.load() && !effect.editor_shown.load()) {
+            BridgeEditorShowFor(&effect, "re-asserted");
+        }
     }
 }
 
@@ -1339,14 +1365,14 @@ extern "C" long BridgeInitializeEffectEdit(void* self, const char* title, void* 
             g_original_initialize_editor)(self, title, parent);
     }
     Log("InitializeEffectEdit: stock returned %ld, opening the hosted editor", result);
-    BridgeEditorShow("InitializeEffectEdit");
+    BridgeEditorShowFor(EffectOrFocused(self), "InitializeEffectEdit");
     return result;
 }
 
 extern "C" void BridgeCloseEffectEdit(void* self)
 {
     Log("CloseEffectEdit");
-    BridgeEditorHide("CloseEffectEdit");
+    BridgeEditorHideFor(EffectOrFocused(self), "CloseEffectEdit");
     if (g_original_close_editor != nullptr) {
         reinterpret_cast<void (*)(void*)>(g_original_close_editor)(self);
     }
@@ -1407,14 +1433,14 @@ extern "C" long BridgeInitializeEffectEditThunk(void* self, const char* title, v
             g_original_initialize_editor_thunk)(self, title, parent);
     }
     Log("AudioPlugin::InitializeEffectEdit: stock returned %ld, opening the hosted editor", result);
-    BridgeEditorShow("AudioPlugin::InitializeEffectEdit");
+    BridgeEditorShowFor(EffectOrFocused(self), "AudioPlugin::InitializeEffectEdit");
     return result;
 }
 
 extern "C" void BridgeCloseEffectEditThunk(void* self)
 {
     Log("AudioPlugin::CloseEffectEdit");
-    BridgeEditorHide("AudioPlugin::CloseEffectEdit");
+    BridgeEditorHideFor(EffectOrFocused(self), "AudioPlugin::CloseEffectEdit");
     if (g_original_close_editor_thunk != nullptr) {
         reinterpret_cast<void (*)(void*)>(g_original_close_editor_thunk)(self);
     }
@@ -1716,6 +1742,7 @@ bool PatchVtableSlot(unsigned char* vtable, size_t offset, void** saved, void* r
     "  movq %rsp, %rbp\n" \
     "  pushq %rdi\n  pushq %rsi\n  pushq %rdx\n" \
     "  pushq %rcx\n  pushq %r8\n  pushq %r9\n" \
+    "  movq %rdi, %rsi\n" \
     "  movl $" slot ", %edi\n" \
     "  call BridgeReportSlot\n" \
     "  popq %r9\n  popq %r8\n  popq %rcx\n" \
@@ -1726,7 +1753,7 @@ bool PatchVtableSlot(unsigned char* vtable, size_t offset, void** saved, void* r
     ".size " name ", .-" name "\n"
 
 extern "C" {
-BRIDGE_HIDDEN2 void BridgeReportSlot(unsigned int slot);
+BRIDGE_HIDDEN2 void BridgeReportSlot(unsigned int slot, void* self);
 BRIDGE_HIDDEN2 void* g_trace_original_16 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk16();
 BRIDGE_HIDDEN2 void* g_trace_original_17 = nullptr;
@@ -1944,7 +1971,7 @@ extern "C" const wchar_t* BridgeUserEffectName(void* self)
     return effect->label_wide;
 }
 
-extern "C" void BridgeReportSlot(unsigned int slot)
+extern "C" void BridgeReportSlot(unsigned int slot, void* self)
 {
     if (slot >= sizeof(g_trace_slots) / sizeof(g_trace_slots[0])) {
         return;
@@ -1959,9 +1986,9 @@ extern "C" void BridgeReportSlot(unsigned int slot)
     // hosted window has to follow. Measured on 2026-08-24: one press logs UpdateEffectEditTitle and
     // the OnEditorIdle heartbeat resumes; the next press logs HideSubWindows.
     if (entry.offset == kUpdateEffectEditTitleOffset) {
-        BridgeEditorShow("UpdateEffectEditTitle");
+        BridgeEditorShowFor(EffectOrFocused(self), "UpdateEffectEditTitle");
     } else if (entry.offset == kHideSubWindowsOffset) {
-        BridgeEditorHide("HideSubWindows");
+        BridgeEditorHideFor(EffectOrFocused(self), "HideSubWindows");
     }
 }
 
@@ -2201,7 +2228,7 @@ int ClaimInstance(void* instance)
     // editor path is gated on the panel existing. Verified on 2026-08-24: with the panel suppressed
     // the log carries no InitializeEffectEdit line at all. So the window is opened here instead.
     if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
-        BridgeEditorShow("the effect was added");
+        BridgeEditorShowFor(entry, "the effect was added");
     }
 
     return claimed;
