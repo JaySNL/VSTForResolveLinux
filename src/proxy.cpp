@@ -1191,8 +1191,9 @@ extern "C" bool BridgeHasEditorThunk(void* self)
     //
     // So an empty panel and Resolve's own show button are mutually exclusive, and the switch that
     // removes the panel also gives up the button.
-    const bool ours = HostChannelCount() > 0 &&
-                      !EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true);
+    // Safe again: the empty panel is now a built tree with its items removed, not an unbuilt one,
+    // so Resolve has something valid to hang an editor on.
+    const bool ours = HostChannelCount() > 0;
     if (++g_editor_reports <= 8) {
         Log("AudioPlugin::HasEditor: stock says %s, we answer %s",
             stock ? "true" : "false", (stock || ours) ? "true" : "false");
@@ -1973,27 +1974,59 @@ constexpr size_t kResourceTreeOffset = 0x360;
 constexpr size_t kPanelWidthOffset = 0x3a8;
 constexpr size_t kPanelHeightOffset = 0x3ac;
 
+// The tree's item list. Dumped from a freshly built Delay panel on 2026-08-24:
+//
+//     tree+0x00  0x7ff76f0b4aa8   a vptr - the tree is a real object
+//     tree+0x10  0x7ff72b6baf00   begin
+//     tree+0x18  0x7ff72b6bafc8   end            (end - begin = 0xc8 = 25 items)
+//     tree+0x20  0x7ff72b6bb000   capacity end
+//
+// Three ascending pointers with end below the capacity end is a std::vector, and 25 items matches
+// the Delay's knobs, text and frames.
+constexpr size_t kTreeItemsBegin = 0x10;
+constexpr size_t kTreeItemsEnd = 0x18;
+
 extern "C" void BridgeGenerateUserInterface(void* self)
 {
     (void)self;
     // Reached only while the switch is on: the slot is not patched otherwise.
     static bool reported = false;
 
-    // Study mode: let the stock builder run, then read what a valid tree looks like. An empty tree
-    // is what crashed Resolve - it builds its editor from this and the first virtual call on a
-    // zeroed tree jumps into nothing.
+    // Let the stock builder run, then empty the tree.
+    //
+    // Skipping the builder was the first attempt and it crashed: Resolve builds its editor from
+    // this tree, and a tree that was never built is all zeros, so the first virtual call on it
+    // jumps into nothing. Running the builder and then truncating its item list leaves a tree that
+    // is fully constructed and simply has no controls in it - which is what an empty panel should
+    // have been from the start.
+    //
+    // The items are leaked. They belong to the tree's own allocator and 25 small objects once per
+    // effect is not worth the risk of freeing something we do not own.
+    using Builder = void (*)(void*);
+    void* const stock =
+        g_stock_vtable != nullptr
+            ? *reinterpret_cast<void**>(g_stock_vtable + kGenerateUserInterfaceOffset)
+            : nullptr;
+    if (stock != nullptr) {
+        reinterpret_cast<Builder>(stock)(self);
+    }
+
+    auto* const tree = reinterpret_cast<unsigned char*>(self) + kResourceTreeOffset;
+    void* begin = nullptr;
+    void* end = nullptr;
+    if (SafeRead(tree + kTreeItemsBegin, &begin, sizeof(begin)) &&
+        SafeRead(tree + kTreeItemsEnd, &end, sizeof(end)) && begin != nullptr && end >= begin) {
+        const long items = (reinterpret_cast<const char*>(end) -
+                            reinterpret_cast<const char*>(begin)) / 8;
+        *reinterpret_cast<void**>(tree + kTreeItemsEnd) = begin;
+        if (!reported) {
+            Log("panel: the stock tree had %ld items, now none", items);
+        }
+    } else if (!reported) {
+        Log("panel: the tree does not look like a vector - left as the stock built it");
+    }
+
     if (EnabledByEnvironment("FXBRIDGE_STUDY_PANEL")) {
-        if (g_trace_slots[0].original != nullptr) {
-            // The stock function is whatever the trace saved for this slot.
-        }
-        using Builder = void (*)(void*);
-        void* const stock = g_stock_vtable != nullptr
-                                ? *reinterpret_cast<void**>(g_stock_vtable +
-                                                            kGenerateUserInterfaceOffset)
-                                : nullptr;
-        if (stock != nullptr) {
-            reinterpret_cast<Builder>(stock)(self);
-        }
         if (!reported) {
             reported = true;
             auto* const bytes = reinterpret_cast<const unsigned char*>(self);
@@ -2015,13 +2048,9 @@ extern "C" void BridgeGenerateUserInterface(void* self)
                 Log("%s", line);
             }
         }
-        return;
     }
 
-    if (!reported) {
-        reported = true;
-        Log("GenerateUserInterface suppressed - the panel stays empty, the plugin has its own window");
-    }
+    reported = true;
 }
 
 // Redirect the stock GenerateUserInterface slot, and put it back. Only the create call for our own
