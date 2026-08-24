@@ -1,3 +1,6 @@
 [submodule "third_party/clap"]
 	path = third_party/clap
 	url = https://github.com/free-audio/clap.git
+[submodule "third_party/dpf"]
+	path = third_party/dpf
+	url = https://github.com/DISTRHO/DPF.git
