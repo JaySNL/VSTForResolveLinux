@@ -25,6 +25,7 @@
 // faulting, so a wrong guess about a pointer cannot take Resolve down.
 
 #include "clap_host.h"
+#include "carla_host.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -39,6 +40,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <atomic>
 #include <vector>
 
 namespace {
@@ -74,6 +76,123 @@ void Log(const char* format, ...)
     std::fflush(stderr);
     va_end(args);
 }
+
+// ---------------------------------------------------------------------------
+// Which host runs.
+//
+// FXBRIDGE_HOST=carla puts Carla in the chain instead of the CLAP host. Carla loads VST2, VST3,
+// LV2, CLAP and AU itself, and a Windows plugin bridged by yabridge presents as a native VST2 or
+// VST3 - so one host reaches every format, and its patchbay is the patcher. FXBRIDGE_CARLA_MODE
+// picks "rack" (a serial chain, the default) or "patchbay" (arbitrary routing).
+//
+// The CLAP host stays the default: it is direct, it has no second process, and it is the one that
+// has been exercised.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool UsingCarla()
+{
+    const char* const host = std::getenv("FXBRIDGE_HOST");
+    return host != nullptr && std::strcmp(host, "carla") == 0;
+}
+
+bool HostProcess(float** buffers, unsigned int channels, unsigned int frames)
+{
+    return UsingCarla() ? CarlaHostProcess(buffers, channels, frames)
+                        : ClapHostProcess(buffers, channels, frames);
+}
+
+unsigned int HostChannelCount()
+{
+    return UsingCarla() ? CarlaHostChannelCount() : ClapHostChannelCount();
+}
+
+const char* HostName()
+{
+    return UsingCarla() ? CarlaHostName() : ClapHostName();
+}
+
+bool HostOpenEditor()
+{
+    return UsingCarla() ? CarlaHostOpenEditor() : ClapHostOpenEditor();
+}
+
+void HostCloseEditor()
+{
+    if (UsingCarla()) {
+        CarlaHostCloseEditor();
+    } else {
+        ClapHostCloseEditor();
+    }
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Editor visibility.
+//
+// One place decides whether the hosted window should be on screen, for every host. Before this,
+// each host was wired separately - the CLAP window through Resolve's editor calls, the Carla window
+// through a claim-time open - so every new host needed its own fix and a change to one broke the
+// other.
+//
+// Two rules, and they are what makes it self-healing:
+//
+//   * Any signal that means "the user is looking at this effect" asks for the window. Asking twice
+//     is free, because both hosts remap an existing window instead of building a second one.
+//   * The state is re-asserted on the idle tick. If the window went away without telling us - a
+//     window manager, a host that dropped it - the next tick puts it back, rather than leaving a
+//     button that does nothing.
+//
+// A close that the user performed is remembered, so re-asserting never fights them.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::atomic<bool> g_editor_wanted{false};
+std::atomic<bool> g_editor_shown{false};
+
+}  // namespace
+
+extern "C" void BridgeEditorShow(const char* because)
+{
+    const bool was_shown = g_editor_shown.exchange(true);
+    g_editor_wanted.store(true);
+    if (!HostOpenEditor()) {
+        g_editor_shown.store(false);
+        Log("editor: %s asked for the window and the host refused", because);
+        return;
+    }
+    if (!was_shown) {
+        Log("editor: shown (%s)", because);
+    }
+}
+
+extern "C" void BridgeEditorHide(const char* because)
+{
+    g_editor_wanted.store(false);
+    if (g_editor_shown.exchange(false)) {
+        HostCloseEditor();
+        Log("editor: hidden (%s)", because);
+    }
+}
+
+// The host telling us its window is gone. Not a request to bring it back.
+extern "C" void BridgeEditorWasClosedByUser()
+{
+    g_editor_wanted.store(false);
+    g_editor_shown.store(false);
+}
+
+// Called from the idle tick. Puts the window back if it should be there and is not.
+extern "C" void BridgeEditorReassert()
+{
+    if (g_editor_wanted.load() && !g_editor_shown.load()) {
+        BridgeEditorShow("re-asserted");
+    }
+}
+
 
 // The vtable we hand out. Two entries below the function pointers carry offset-to-top and the
 // typeinfo pointer, so dynamic_cast on the interface keeps working.
@@ -419,7 +538,7 @@ void InsertOurEntry(void* container)
     if (!strings_ready) {
         // The hosted plugin supplies the name. Keep the source effect's numeric id, because that is
         // what the stock factory needs when the create hook redirects the key.
-        const char* const hosted = ClapHostName();
+        const char* const hosted = HostName();
         std::snprintf(g_clone_name_text, sizeof(g_clone_name_text), "%s",
                       hosted != nullptr ? hosted : "Bridge Test");
         std::snprintf(g_clone_key_text, sizeof(g_clone_key_text), "%s:1112360057", g_clone_name_text);
@@ -906,11 +1025,19 @@ namespace {
 // Which plugin to run. Override with FXBRIDGE_CLAP; every plugin on this machine ships a .clap.
 const char kDefaultClapPlugin[] = "/home/jooshua/.clap/DragonflyHallReverb.clap";
 
-// CLAP requires load, init and activate on the main thread. This runs from the bridge's
+// Both hosts need load, init and activate on the main thread. This runs from the bridge's
 // initialisation, which is Resolve's main thread, long before any audio starts.
-void LoadConfiguredClapPlugin()
+void LoadConfiguredPlugin()
 {
     ClapHostSetLogger([](const char* line) { Log("%s", line); });
+    CarlaHostSetLogger([](const char* line) { Log("%s", line); });
+
+    if (UsingCarla()) {
+        if (!CarlaHostLoad(48000.0, 8192)) {
+            Log("carla: did not load, audio passes through untouched");
+        }
+        return;
+    }
 
     const char* const configured = std::getenv("FXBRIDGE_CLAP");
     const char* const path = (configured != nullptr && configured[0] != '\0') ? configured
@@ -1004,10 +1131,12 @@ extern "C" bool BridgeHasEditor(void* self)
     if (g_original_has_editor != nullptr) {
         stock = reinterpret_cast<bool (*)(void*)>(g_original_has_editor)(self);
     }
+    const bool ours = HostChannelCount() > 0;
     if (++g_editor_reports <= 8) {
-        Log("HasEditor: stock says %s", stock ? "true" : "false");
+        Log("HasEditor: stock says %s, we answer %s",
+            stock ? "true" : "false", (stock || ours) ? "true" : "false");
     }
-    return stock;
+    return stock || ours;
 }
 
 extern "C" void* BridgeGetEffectEdit(void* self)
@@ -1029,14 +1158,14 @@ extern "C" long BridgeInitializeEffectEdit(void* self, const char* title, void* 
             g_original_initialize_editor)(self, title, parent);
     }
     Log("InitializeEffectEdit: stock returned %ld, opening the hosted editor", result);
-    ClapHostOpenEditor();
+    BridgeEditorShow("InitializeEffectEdit");
     return result;
 }
 
 extern "C" void BridgeCloseEffectEdit(void* self)
 {
     Log("CloseEffectEdit");
-    ClapHostCloseEditor();
+    BridgeEditorHide("CloseEffectEdit");
     if (g_original_close_editor != nullptr) {
         reinterpret_cast<void (*)(void*)>(g_original_close_editor)(self);
     }
@@ -1051,10 +1180,24 @@ extern "C" bool BridgeHasEditorThunk(void* self)
     if (g_original_has_editor_thunk != nullptr) {
         stock = reinterpret_cast<bool (*)(void*)>(g_original_has_editor_thunk)(self);
     }
+    // The rule: if a host window exists AND Resolve has a control tree to hang an editor on, this
+    // effect has an editor.
+    //
+    // The second half is not optional. The stock answer follows the control tree: true while the
+    // Delay knobs are there, false once GenerateUserInterface is suppressed. Answering true anyway
+    // makes Resolve build its editor from a tree that was never built, and the first virtual call
+    // on that object jumps to a garbage address - measured 2026-08-24, SIGSEGV with the faulting
+    // frame at 0x3306 and nothing below it.
+    //
+    // So an empty panel and Resolve's own show button are mutually exclusive, and the switch that
+    // removes the panel also gives up the button.
+    const bool ours = HostChannelCount() > 0 &&
+                      !EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true);
     if (++g_editor_reports <= 8) {
-        Log("AudioPlugin::HasEditor: stock says %s", stock ? "true" : "false");
+        Log("AudioPlugin::HasEditor: stock says %s, we answer %s",
+            stock ? "true" : "false", (stock || ours) ? "true" : "false");
     }
-    return stock;
+    return stock || ours;
 }
 
 extern "C" void* BridgeGetEffectEditThunk(void* self)
@@ -1080,14 +1223,14 @@ extern "C" long BridgeInitializeEffectEditThunk(void* self, const char* title, v
             g_original_initialize_editor_thunk)(self, title, parent);
     }
     Log("AudioPlugin::InitializeEffectEdit: stock returned %ld, opening the hosted editor", result);
-    ClapHostOpenEditor();
+    BridgeEditorShow("AudioPlugin::InitializeEffectEdit");
     return result;
 }
 
 extern "C" void BridgeCloseEffectEditThunk(void* self)
 {
     Log("AudioPlugin::CloseEffectEdit");
-    ClapHostCloseEditor();
+    BridgeEditorHide("AudioPlugin::CloseEffectEdit");
     if (g_original_close_editor_thunk != nullptr) {
         reinterpret_cast<void (*)(void*)>(g_original_close_editor_thunk)(self);
     }
@@ -1219,7 +1362,7 @@ extern "C" void BridgeBeforeProcess(void* self, const void* timebase, float** in
     (void)timebase;
     (void)output;
 
-    const unsigned int wanted = ClapHostChannelCount();
+    const unsigned int wanted = HostChannelCount();
     if (wanted == 0 || wanted > kMaxChannels || input == nullptr || frames == 0 ||
         frames > kMaxFrames || !ChannelsAreReadable(input, wanted, frames)) {
         g_dry_frames = 0;
@@ -1241,7 +1384,7 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
     (void)timebase;
     (void)input;
 
-    const unsigned int wanted = ClapHostChannelCount();
+    const unsigned int wanted = HostChannelCount();
     if (wanted == 0 || output == nullptr || frames == 0 || frames > kMaxFrames ||
         !ChannelsAreReadable(output, wanted, frames)) {
         return;
@@ -1258,7 +1401,7 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
         restored = true;
     }
 
-    const bool processed = ClapHostProcess(output, wanted, static_cast<unsigned int>(frames));
+    const bool processed = HostProcess(output, wanted, static_cast<unsigned int>(frames));
 
     if (++g_process_calls <= 3) {
         Log("Process #%d: frames=%lu, %u channels, dry %s, plugin %s",
@@ -1465,7 +1608,7 @@ void PrepareLabels()
     if (g_label_narrow[0] != '\0') {
         return;
     }
-    const char* const name = ClapHostName();
+    const char* const name = HostName();
     if (name == nullptr || name[0] == '\0') {
         return;
     }
@@ -1579,9 +1722,9 @@ extern "C" void BridgeReportSlot(unsigned int slot)
     // hosted window has to follow. Measured on 2026-08-24: one press logs UpdateEffectEditTitle and
     // the OnEditorIdle heartbeat resumes; the next press logs HideSubWindows.
     if (entry.offset == kUpdateEffectEditTitleOffset) {
-        ClapHostOpenEditor();
+        BridgeEditorShow("UpdateEffectEditTitle");
     } else if (entry.offset == kHideSubWindowsOffset) {
-        ClapHostCloseEditor();
+        BridgeEditorHide("HideSubWindows");
     }
 }
 
@@ -1801,7 +1944,7 @@ int ClaimInstance(void* instance)
     // editor path is gated on the panel existing. Verified on 2026-08-24: with the panel suppressed
     // the log carries no InitializeEffectEdit line at all. So the window is opened here instead.
     if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
-        ClapHostOpenEditor();
+        BridgeEditorShow("the effect was added");
     }
 
     return claimed;
@@ -1809,11 +1952,72 @@ int ClaimInstance(void* instance)
 
 }  // namespace
 
+// The resource tree lives at this+0x360, and the stock builder writes the panel extents on the
+// object itself. Read out of BMDStereoDelay::GenerateUserInterface:
+//
+//     lea  0x360(%r13), %r14     # r13 is `this` - the PluginUIResourceTree
+//     call SimpleUiGenerator::GetDefaultBackgroundColor()
+//     mov  %eax, 0x398(%r13)     # the background colour
+//     call SimpleUiGenerator::DefaultWidth()   -> movss %xmm0, 0x3a8(%r13)
+//     call SimpleUiGenerator::DefaultHeight()  -> movss %xmm0, 0x3ac(%r13)
+//
+// and the controls are added through these, all exported and all named:
+//
+//     BMDAudioPluginImpl::BindParameterByName(char const*)  -> a PluginUIBinding*
+//     bmd::PluginUIResourceTree::AddKnob(binding, ..., label, ..., min, max, ...)
+//     bmd::PluginUIResourceTree::AddText / AddFrame / AddMeter / AddComboBoxToToolbar
+//
+// So replacing the panel is a matter of building this tree ourselves. What is not yet known is the
+// tree's own layout, which is why this step lets the stock builder run and then reads the result.
+constexpr size_t kResourceTreeOffset = 0x360;
+constexpr size_t kPanelWidthOffset = 0x3a8;
+constexpr size_t kPanelHeightOffset = 0x3ac;
+
 extern "C" void BridgeGenerateUserInterface(void* self)
 {
     (void)self;
     // Reached only while the switch is on: the slot is not patched otherwise.
     static bool reported = false;
+
+    // Study mode: let the stock builder run, then read what a valid tree looks like. An empty tree
+    // is what crashed Resolve - it builds its editor from this and the first virtual call on a
+    // zeroed tree jumps into nothing.
+    if (EnabledByEnvironment("FXBRIDGE_STUDY_PANEL")) {
+        if (g_trace_slots[0].original != nullptr) {
+            // The stock function is whatever the trace saved for this slot.
+        }
+        using Builder = void (*)(void*);
+        void* const stock = g_stock_vtable != nullptr
+                                ? *reinterpret_cast<void**>(g_stock_vtable +
+                                                            kGenerateUserInterfaceOffset)
+                                : nullptr;
+        if (stock != nullptr) {
+            reinterpret_cast<Builder>(stock)(self);
+        }
+        if (!reported) {
+            reported = true;
+            auto* const bytes = reinterpret_cast<const unsigned char*>(self);
+            float width = 0.0f;
+            float height = 0.0f;
+            std::memcpy(&width, bytes + kPanelWidthOffset, sizeof(width));
+            std::memcpy(&height, bytes + kPanelHeightOffset, sizeof(height));
+            Log("panel: the stock tree is built - %.0f x %.0f", static_cast<double>(width),
+                static_cast<double>(height));
+            const unsigned char* const tree = bytes + kResourceTreeOffset;
+            char line[200];
+            for (int row = 0; row < 4; ++row) {
+                int written = std::snprintf(line, sizeof(line), "panel: tree+0x%02x ", row * 16);
+                for (int column = 0; column < 16 && written < static_cast<int>(sizeof(line)) - 4;
+                     ++column) {
+                    written += std::snprintf(line + written, sizeof(line) - written, "%02x ",
+                                             tree[row * 16 + column]);
+                }
+                Log("%s", line);
+            }
+        }
+        return;
+    }
+
     if (!reported) {
         reported = true;
         Log("GenerateUserInterface suppressed - the panel stays empty, the plugin has its own window");
@@ -1980,7 +2184,7 @@ extern "C" void* GetBMDPluginInterface()
         *reinterpret_cast<void***>(stock) = &g_vtable[2];
         g_interface = stock;
         PatchDelayClassVtable();
-        LoadConfiguredClapPlugin();
+        LoadConfiguredPlugin();
 
         Log("our vtable installed, version reads %d",
             reinterpret_cast<GetVersionFn>(g_vtable[2 + kGetPluginInterfaceVersion])(stock));

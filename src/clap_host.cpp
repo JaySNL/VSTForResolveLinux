@@ -256,6 +256,8 @@ uint32_t ReadPortChannelCount(const clap_plugin_t* plugin)
 // Defined in proxy.cpp. Arming the trace here is the whole point: everything Resolve does after the
 // window manager takes our window away lands in the log.
 extern "C" void BridgeArmEditorTrace();
+extern "C" void BridgeEditorWasClosedByUser();
+extern "C" void BridgeEditorReassert();
 
 namespace {
 
@@ -279,9 +281,11 @@ void XEventLoop()
                 XUnmapWindow(g_display, g_window);
                 XFlush(g_display);
                 Log("clap: the window manager closed the editor window");
+                BridgeEditorWasClosedByUser();
                 BridgeArmEditorTrace();
             }
         }
+        BridgeEditorReassert();
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 }
