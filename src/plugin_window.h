@@ -1,34 +1,41 @@
-// The window every loader hangs its editor in.
+// The window a plugin hangs its editor in - one per plugin, not one for all.
 //
 // Resolve's side of the editor - HasEditor, InitializeEffectEdit, UpdateEffectEditTitle,
 // HideSubWindows - is owned by proxy.cpp and is the same for every format. This is the other half:
-// one X11 parent window that a plugin embeds into, with one close handler and one event pump.
+// the X11 parent window a plugin embeds into, with one close handler and one event pump.
 //
 // CLAP, VST2 and VST3 all embed the same way: the host supplies a native window handle and the
 // plugin draws into it. So they share this, rather than each carrying its own copy of the X11
 // plumbing and its own idea of what "closed" means.
+//
+// One X11 display and one pump thread serve every window. The window itself is per plugin, because
+// two effects in one project are two editors, and a shared parent would have them drawing over
+// each other.
 #ifndef FXBRIDGE_PLUGIN_WINDOW_H
 #define FXBRIDGE_PLUGIN_WINDOW_H
 
-#include <cstdint>
+struct PluginWindow;
 
-// Creates the parent window at the size the plugin asked for, or raises the existing one. The
-// returned value is the X11 Window id, which is what every plugin format wants as its parent.
-// Returns 0 on failure.
-unsigned long PluginWindowOpen(unsigned int width, unsigned int height, const char* title);
+// Creates a parent window at the size the plugin asked for. Returns null on failure.
+PluginWindow* PluginWindowCreate(unsigned int width, unsigned int height, const char* title);
 
-// Maps an existing window again. False when there is nothing to show.
-bool PluginWindowShow();
+// The X11 Window id, which is what every plugin format wants as its parent. Zero if there is none.
+unsigned long PluginWindowHandle(const PluginWindow* window);
+
+// Maps the window again. False when there is nothing to show.
+bool PluginWindowShow(PluginWindow* window);
 
 // Hides without destroying: the plugin's editor lives inside, and reopening should be a remap.
-void PluginWindowHide();
+void PluginWindowHide(PluginWindow* window);
 
-// True while the window exists, whether mapped or not.
-bool PluginWindowExists();
+// Destroys it. The plugin must have released its editor first, or it is left drawing into a window
+// that no longer exists.
+void PluginWindowDestroy(PluginWindow* window);
 
-// The X11 display, for a loader that needs to flush after its own calls.
+void PluginWindowFlush(PluginWindow* window);
+
+// The shared X11 display, for a loader that needs to flush after its own calls.
 void* PluginWindowDisplay();
-void PluginWindowFlush();
 
 void PluginWindowSetLogger(void (*logger)(const char*));
 

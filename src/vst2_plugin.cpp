@@ -4,7 +4,7 @@
 
 #include "plugin_window.h"
 #include "vst2_abi.h"
-#include "clap_host.h"
+#include "clap_plugin.h"
 
 #include <dlfcn.h>
 
@@ -41,6 +41,12 @@ public:
                 Dispatch(kEffEditClose, 0, 0, nullptr, 0.0f);
             }
             Dispatch(kEffClose, 0, 0, nullptr, 0.0f);
+        }
+        // The window goes after the editor is closed, never before: a plugin still drawing into a
+        // destroyed window faults inside its own toolkit.
+        if (window_ != nullptr) {
+            PluginWindowDestroy(window_);
+            window_ = nullptr;
         }
         if (library_ != nullptr) {
             dlclose(library_);
@@ -159,7 +165,7 @@ public:
             return false;
         }
         if (editor_open_) {
-            return PluginWindowShow();
+            return PluginWindowShow(window_);
         }
 
         // Ask the plugin its size before making the window, so it is right the first time.
@@ -175,21 +181,22 @@ public:
             }
         }
 
-        const unsigned long window = PluginWindowOpen(width, height, name_);
-        if (window == 0) {
+        window_ = PluginWindowCreate(width, height, name_);
+        const unsigned long handle = PluginWindowHandle(window_);
+        if (handle == 0) {
             return false;
         }
-        if (Dispatch(kEffEditOpen, 0, 0, reinterpret_cast<void*>(window), 0.0f) == 0) {
+        if (Dispatch(kEffEditOpen, 0, 0, reinterpret_cast<void*>(handle), 0.0f) == 0) {
             // Some plugins answer 0 and open anyway, so this is reported, not treated as failure.
             Log("vst2: effEditOpen answered 0 for \"%s\"", name_);
         }
-        PluginWindowFlush();
+        PluginWindowFlush(window_);
         editor_open_ = true;
         Log("vst2: editor open for \"%s\" at %ux%u", name_, width, height);
         return true;
     }
 
-    void CloseEditor() override { PluginWindowHide(); }
+    void CloseEditor() override { PluginWindowHide(window_); }
 
 private:
     intptr_t Dispatch(int32_t opcode, int32_t index, intptr_t value, void* ptr, float opt)
@@ -256,6 +263,7 @@ private:
     uint32_t max_frames_ = 8192;
     uint32_t channels_ = 0;
     bool editor_open_ = false;
+    PluginWindow* window_ = nullptr;
     char name_[128] = {0};
     std::vector<float> scratch_;
 };
@@ -277,43 +285,6 @@ PluginFormat FormatFromPath(const char* path)
     return PluginFormat::Unknown;
 }
 
-// CLAP, still behind the single-instance host in clap_host.cpp.
-//
-// That host keeps its plugin, its editor and its parameter queue in file scope, so it can back
-// exactly one effect. Rather than leave CLAP unusable while VST2 moves to per-instance hosting,
-// the first effect takes it and any second effect is refused out loud. Converting clap_host.cpp
-// the way vst2_plugin.cpp is written here is the fix, and it is not done yet.
-class ClapSingletonPlugin final : public HostedPlugin {
-public:
-    static bool taken;
-
-    bool Load(const char* path, double sample_rate, uint32_t max_frames)
-    {
-        if (taken) {
-            Log("clap: the single-instance host is already in use - this effect gets no plugin");
-            return false;
-        }
-        if (!ClapHostLoad(path, sample_rate, max_frames)) {
-            return false;
-        }
-        ClapHostLogParameters();
-        taken = true;
-        return true;
-    }
-
-    bool Process(float** buffers, uint32_t channel_count, uint32_t frames) override
-    {
-        return ClapHostProcess(buffers, channel_count, frames);
-    }
-    uint32_t ChannelCount() const override { return ClapHostChannelCount(); }
-    const char* Name() const override { return ClapHostName(); }
-    bool OpenEditor() override { return ClapHostOpenEditor(); }
-    void CloseEditor() override { ClapHostCloseEditor(); }
-    PluginFormat Format() const override { return PluginFormat::Clap; }
-};
-
-bool ClapSingletonPlugin::taken = false;
-
 HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, double sample_rate,
                                  uint32_t max_frames)
 {
@@ -326,12 +297,7 @@ HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, double s
         return nullptr;
     }
     if (format == PluginFormat::Clap) {
-        auto* const plugin = new ClapSingletonPlugin();
-        if (plugin->Load(path, sample_rate, max_frames)) {
-            return plugin;
-        }
-        delete plugin;
-        return nullptr;
+        return CreateClapPlugin(path, sample_rate, max_frames);
     }
     Log("plugin: %s is a format this build cannot host yet", path != nullptr ? path : "(null)");
     return nullptr;
@@ -341,4 +307,5 @@ void PluginInstanceSetLogger(void (*logger)(const char*))
 {
     g_logger = logger;
     PluginWindowSetLogger(logger);
+    ClapPluginSetLogger(logger);
 }

@@ -24,9 +24,7 @@
 // against. Reads of returned memory go through process_vm_readv, which reports EFAULT instead of
 // faulting, so a wrong guess about a pointer cannot take Resolve down.
 
-#include "clap_host.h"
 #include "carla_host.h"
-#include "vst2_host.h"
 #include "plugin_instance.h"
 #include "plugin_scan.h"
 
@@ -1130,11 +1128,13 @@ bool ReadQStringArgument(const void* reference, char* out, size_t out_size)
 // off, or to "1" to turn a default-off one on.
 //
 //   FXBRIDGE_RENAME          on   the effect names itself after the hosted plugin
-//   FXBRIDGE_EMPTY_PANEL     off  empties the panel by truncating the tree's item list. OFF after
-//                                 a crash on this path: the item count is not stable across
-//                                 effects (25 on one, 19 on another), so the list is not the
-//                                 vector of pointers it was read as, and something else may still
-//                                 index into it.
+//   FXBRIDGE_EMPTY_PANEL     on   empties the panel by truncating the tree's item list, leaving
+//                                 the slot header and its bypass toggle. ON because the stock
+//                                 panel is not cosmetic: its knobs call SetParameterValue, and
+//                                 that was writing stray parameters into the hosted plugin - see
+//                                 BridgeOnSetParameter. Set it to 0 to get the carrier's panel
+//                                 back; the crash once seen on this path was a first attempt that
+//                                 skipped the builder, which this code no longer does.
 //   FXBRIDGE_PRIMARY_PROCESS off  hooks Process at +0x4d0 as well - this one crashed Resolve
 static bool EnabledByEnvironment(const char* name, bool on_by_default = false)
 {
@@ -1212,9 +1212,7 @@ const char kDefaultClapPlugin[] = "/home/jooshua/.clap/DragonflyHallReverb.clap"
 // Loggers only. Plugins are loaded per effect now, at claim time, not once at startup.
 void LoadConfiguredPlugin()
 {
-    ClapHostSetLogger([](const char* line) { Log("%s", line); });
     CarlaHostSetLogger([](const char* line) { Log("%s", line); });
-    Vst2HostSetLogger([](const char* line) { Log("%s", line); });
     PluginInstanceSetLogger([](const char* line) { Log("%s", line); });
     PluginScanSetLogger([](const char* line) { Log("%s", line); });
 
@@ -1279,10 +1277,17 @@ extern "C" void BridgeOnSetParameter(void* self, unsigned int index, float value
         Log("knob: index %u -> %.6f", index, static_cast<double>(value));
     }
 
-    // Only forward what is unambiguously a 0..1 position. Anything else waits for the mapping.
-    if (value >= 0.0f && value <= 1.0f) {
-        ClapHostQueueParameterNormalised(index, value);
-    }
+    // The carrier's knobs are NOT the plugin's parameters, and binding them by index does damage.
+    //
+    // Measured on 2026-08-25: with the stock Delay panel on screen, dragging its Delay Time knob
+    // sent index 5 to the hosted plugin. On pp-track that silenced it - output at -inf, its own
+    // input meter flat - and the fault looked like a broken audio path for as long as nobody read
+    // the knob lines in the log. The index means one thing on the Delay and another on every
+    // plugin, so there is no mapping to find: the plugin's own editor is the interface.
+    //
+    // Set FXBRIDGE_KNOB_BINDING=1 to send them anyway, which is only useful for studying a plugin
+    // whose parameter order is known.
+    (void)value;
 }
 
 // The editor gate. Resolve asks HasEditor() before it offers an external editor at all, and the
@@ -2195,7 +2200,7 @@ int ClaimInstance(void* instance)
     // With no control tree there is no panel, and Resolve never calls InitializeEffectEdit - the
     // editor path is gated on the panel existing. Verified on 2026-08-24: with the panel suppressed
     // the log carries no InitializeEffectEdit line at all. So the window is opened here instead.
-    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL")) {
+    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
         BridgeEditorShow("the effect was added");
     }
 
@@ -2405,7 +2410,7 @@ void PatchDelayClassVtable()
     // disassembly for an sret first.
 
     // After the trace loop, so the no-op wins the slot rather than the tracer.
-    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL")) {
+    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
         PatchOurSlot(kGenerateUserInterfaceOffset, nullptr,
                      reinterpret_cast<void*>(&BridgeGenerateUserInterface));
         Log("empty panel is ON - GenerateUserInterface is a no-op in our vtable");
