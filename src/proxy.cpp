@@ -27,6 +27,7 @@
 #include "clap_host.h"
 #include "carla_host.h"
 #include "vst2_host.h"
+#include "plugin_instance.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -115,49 +116,98 @@ Loader SelectedLoader()
 bool UsingCarla() { return SelectedLoader() == Loader::Carla; }
 bool UsingVst2() { return SelectedLoader() == Loader::Vst2; }
 
-bool HostProcess(float** buffers, unsigned int channels, unsigned int frames)
+// Which plugin the configured path names, and what to call it in the menu before anything is
+// loaded. The scanner will replace both: one entry per plugin found, named from the file.
+const char* ConfiguredPluginPath()
 {
-    switch (SelectedLoader()) {
-        case Loader::Carla: return CarlaHostProcess(buffers, channels, frames);
-        case Loader::Vst2:  return Vst2HostProcess(buffers, channels, frames);
-        default:            return ClapHostProcess(buffers, channels, frames);
+    const char* const vst2 = std::getenv("FXBRIDGE_VST2");
+    if (vst2 != nullptr && vst2[0] != '\0') {
+        return vst2;
     }
+    const char* const clap = std::getenv("FXBRIDGE_CLAP");
+    if (clap != nullptr && clap[0] != '\0') {
+        return clap;
+    }
+    return "/home/jooshua/.clap/DragonflyHallReverb.clap";
 }
 
-unsigned int HostChannelCount()
+// The file's own name, with its directory and extension removed. Reading it costs nothing, while
+// loading a plugin to ask its name can start a Wine process.
+const char* MenuNameFromPath(const char* path)
 {
-    switch (SelectedLoader()) {
-        case Loader::Carla: return CarlaHostChannelCount();
-        case Loader::Vst2:  return Vst2HostChannelCount();
-        default:            return ClapHostChannelCount();
+    static char name[128];
+    const char* const slash = std::strrchr(path, '/');
+    std::snprintf(name, sizeof(name), "%s", slash != nullptr ? slash + 1 : path);
+    char* const dot = std::strrchr(name, '.');
+    if (dot != nullptr) {
+        *dot = '\0';
     }
+    return name;
 }
 
-const char* HostName()
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// One plugin per effect.
+//
+// The audio path holds no shared state. Each claimed effect owns its plugin and its dry buffer,
+// and a lookup on the audio thread is a linear scan over a fixed array with an atomic count -
+// entries are appended under a lock and never removed, so a reader never waits and never sees a
+// half-written entry.
+//
+// This replaces one global dry buffer, two global counters and one shared plugin. Resolve renders
+// on several threads, so with more than one effect those globals were written by two threads at
+// once and the same non-re-entrant plugin was called from both. Every crash inside Resolve came
+// back to BridgeAfterProcess, and it only ever appeared once a project carried a second effect.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr size_t kMaxClaimedEffects = 64;
+
+struct ClaimedEffect {
+    // Resolve may call us with either the bmd::PluginInstance subobject or the AudioPlugin one,
+    // so both addresses map to the same effect.
+    void* instance_key = nullptr;
+    void* audio_plugin_key = nullptr;
+    HostedPlugin* plugin = nullptr;
+    std::vector<float> dry;
+    unsigned long dry_frames = 0;
+    unsigned int dry_channels = 0;
+};
+
+ClaimedEffect g_effects[kMaxClaimedEffects];
+std::atomic<size_t> g_effect_count{0};
+std::mutex g_effect_append_lock;
+
+// The effect whose editor Resolve last opened. The window is shared, so one editor shows at a time.
+std::atomic<ClaimedEffect*> g_focused_effect{nullptr};
+
+ClaimedEffect* FindEffect(const void* key)
 {
-    switch (SelectedLoader()) {
-        case Loader::Carla: return CarlaHostName();
-        case Loader::Vst2:  return Vst2HostName();
-        default:            return ClapHostName();
+    const size_t count = g_effect_count.load(std::memory_order_acquire);
+    for (size_t index = 0; index < count; ++index) {
+        ClaimedEffect& effect = g_effects[index];
+        if (effect.instance_key == key || effect.audio_plugin_key == key) {
+            return &effect;
+        }
     }
+    return nullptr;
 }
 
-bool HostOpenEditor()
+ClaimedEffect* AppendEffect(void* instance_key, void* audio_plugin_key)
 {
-    switch (SelectedLoader()) {
-        case Loader::Carla: return CarlaHostOpenEditor();
-        case Loader::Vst2:  return Vst2HostOpenEditor();
-        default:            return ClapHostOpenEditor();
+    const std::lock_guard<std::mutex> guard(g_effect_append_lock);
+    const size_t count = g_effect_count.load(std::memory_order_relaxed);
+    if (count >= kMaxClaimedEffects) {
+        return nullptr;
     }
-}
-
-void HostCloseEditor()
-{
-    switch (SelectedLoader()) {
-        case Loader::Carla: CarlaHostCloseEditor(); break;
-        case Loader::Vst2:  Vst2HostCloseEditor(); break;
-        default:            ClapHostCloseEditor(); break;
-    }
+    ClaimedEffect& effect = g_effects[count];
+    effect.instance_key = instance_key;
+    effect.audio_plugin_key = audio_plugin_key;
+    // Published last: a reader that sees the new count sees a complete entry.
+    g_effect_count.store(count + 1, std::memory_order_release);
+    return &effect;
 }
 
 }  // namespace
@@ -192,7 +242,8 @@ extern "C" void BridgeEditorShow(const char* because)
 {
     const bool was_shown = g_editor_shown.exchange(true);
     g_editor_wanted.store(true);
-    if (!HostOpenEditor()) {
+    ClaimedEffect* const effect = g_focused_effect.load();
+    if (effect == nullptr || effect->plugin == nullptr || !effect->plugin->OpenEditor()) {
         g_editor_shown.store(false);
         Log("editor: %s asked for the window and the host refused", because);
         return;
@@ -206,7 +257,10 @@ extern "C" void BridgeEditorHide(const char* because)
 {
     g_editor_wanted.store(false);
     if (g_editor_shown.exchange(false)) {
-        HostCloseEditor();
+        ClaimedEffect* const effect = g_focused_effect.load();
+        if (effect != nullptr && effect->plugin != nullptr) {
+            effect->plugin->CloseEditor();
+        }
         Log("editor: hidden (%s)", because);
     }
 }
@@ -571,7 +625,7 @@ void InsertOurEntry(void* container)
     if (!strings_ready) {
         // The hosted plugin supplies the name. Keep the source effect's numeric id, because that is
         // what the stock factory needs when the create hook redirects the key.
-        const char* const hosted = HostName();
+        const char* const hosted = MenuNameFromPath(ConfiguredPluginPath());
         std::snprintf(g_clone_name_text, sizeof(g_clone_name_text), "%s",
                       hosted != nullptr ? hosted : "Bridge Test");
         std::snprintf(g_clone_key_text, sizeof(g_clone_key_text), "%s:1112360057", g_clone_name_text);
@@ -1062,39 +1116,16 @@ namespace {
 // Which plugin to run. Override with FXBRIDGE_CLAP; every plugin on this machine ships a .clap.
 const char kDefaultClapPlugin[] = "/home/jooshua/.clap/DragonflyHallReverb.clap";
 
-// Both hosts need load, init and activate on the main thread. This runs from the bridge's
-// initialisation, which is Resolve's main thread, long before any audio starts.
+// Loggers only. Plugins are loaded per effect now, at claim time, not once at startup.
 void LoadConfiguredPlugin()
 {
     ClapHostSetLogger([](const char* line) { Log("%s", line); });
     CarlaHostSetLogger([](const char* line) { Log("%s", line); });
     Vst2HostSetLogger([](const char* line) { Log("%s", line); });
+    PluginInstanceSetLogger([](const char* line) { Log("%s", line); });
 
-    if (UsingVst2()) {
-        const char* const path = std::getenv("FXBRIDGE_VST2");
-        if (path == nullptr || path[0] == '\0') {
-            Log("vst2: FXBRIDGE_VST2 is not set, audio passes through untouched");
-        } else if (!Vst2HostLoad(path, 48000.0, 8192)) {
-            Log("vst2: %s did not load, audio passes through untouched", path);
-        }
-        return;
-    }
-
-    if (UsingCarla()) {
-        if (!CarlaHostLoad(48000.0, 8192)) {
-            Log("carla: did not load, audio passes through untouched");
-        }
-        return;
-    }
-
-    const char* const configured = std::getenv("FXBRIDGE_CLAP");
-    const char* const path = (configured != nullptr && configured[0] != '\0') ? configured
-                                                                             : kDefaultClapPlugin;
-    if (ClapHostLoad(path, 48000.0, 8192)) {
-        ClapHostLogParameters();
-    } else {
-        Log("clap: %s did not load, audio passes through untouched", path);
-    }
+    const char* const path = ConfiguredPluginPath();
+    Log("plugin: the menu entry will load %s", path);
 }
 
 }  // namespace
@@ -1179,7 +1210,9 @@ extern "C" bool BridgeHasEditor(void* self)
     if (g_original_has_editor != nullptr) {
         stock = reinterpret_cast<bool (*)(void*)>(g_original_has_editor)(self);
     }
-    const bool ours = HostChannelCount() > 0;
+    const ClaimedEffect* const effect = FindEffect(self);
+    const bool ours = effect != nullptr && effect->plugin != nullptr &&
+                      effect->plugin->ChannelCount() > 0;
     if (++g_editor_reports <= 8) {
         Log("HasEditor: stock says %s, we answer %s",
             stock ? "true" : "false", (stock || ours) ? "true" : "false");
@@ -1241,7 +1274,9 @@ extern "C" bool BridgeHasEditorThunk(void* self)
     // removes the panel also gives up the button.
     // Safe again: the empty panel is now a built tree with its items removed, not an unbuilt one,
     // so Resolve has something valid to hang an editor on.
-    const bool ours = HostChannelCount() > 0;
+    const ClaimedEffect* const effect = FindEffect(self);
+    const bool ours = effect != nullptr && effect->plugin != nullptr &&
+                      effect->plugin->ChannelCount() > 0;
     if (++g_editor_reports <= 8) {
         Log("AudioPlugin::HasEditor: stock says %s, we answer %s",
             stock ? "true" : "false", (stock || ours) ? "true" : "false");
@@ -1343,9 +1378,6 @@ int g_process_calls = 0;
 
 }  // namespace
 
-// The dry block saved between the two halves of the Process trampoline, per thread.
-static thread_local unsigned long g_dry_frames = 0;
-static thread_local unsigned int g_dry_channels = 0;
 
 extern "C" {
 BRIDGE_HIDDEN2 void* g_original_process_primary = nullptr;
@@ -1376,29 +1408,6 @@ constexpr unsigned int kMaxChannels = 16;
 
 namespace {
 
-// Per thread, because Resolve renders audio on several threads at once.
-//
-// This was one global buffer with two global counters, and one shared plugin behind them. With a
-// single effect on a single track that is invisible; as soon as the project carries a few effects,
-// two threads are inside this path together, each overwriting the other's dry block and both
-// re-entering a plugin that is not re-entrant. Every fault tonight, on the CLAP host and the Carla
-// host alike, was the same two frames: BridgeAfterProcess under BridgeThunkProcessSecondary.
-//
-// The buffer is a thread_local, so each thread keeps its own dry block, and the hosted plugin is
-// serialised by a lock, because neither CLAP nor Carla promises a re-entrant process().
-std::vector<float>& DryScratch()
-{
-    static thread_local std::vector<float> scratch(kMaxChannels * kMaxFrames, 0.0f);
-    return scratch;
-}
-
-// Held only around the hosted plugin's process call.
-std::mutex& HostProcessLock()
-{
-    static std::mutex lock;
-    return lock;
-}
-
 // Both ends of the block must be readable before the plugin sees the buffer.
 bool ChannelsAreReadable(float** buffers, unsigned int channels, unsigned long frames)
 {
@@ -1423,54 +1432,64 @@ bool ChannelsAreReadable(float** buffers, unsigned int channels, unsigned long f
 extern "C" void BridgeBeforeProcess(void* self, const void* timebase, float** input,
                                     float** output, unsigned long frames)
 {
-    (void)self;
     (void)timebase;
     (void)output;
 
-    const unsigned int wanted = HostChannelCount();
-    if (wanted == 0 || wanted > kMaxChannels || input == nullptr || frames == 0 ||
-        frames > kMaxFrames || !ChannelsAreReadable(input, wanted, frames)) {
-        g_dry_frames = 0;
+    ClaimedEffect* const effect = FindEffect(self);
+    if (effect == nullptr || effect->plugin == nullptr) {
         return;
     }
 
-    std::vector<float>& scratch = DryScratch();
-    for (unsigned int channel = 0; channel < wanted; ++channel) {
-        std::memcpy(&scratch[channel * kMaxFrames], input[channel], frames * sizeof(float));
+    const unsigned int wanted = effect->plugin->ChannelCount();
+    if (wanted == 0 || wanted > kMaxChannels || input == nullptr || frames == 0 ||
+        frames > kMaxFrames || !ChannelsAreReadable(input, wanted, frames)) {
+        effect->dry_frames = 0;
+        return;
     }
-    g_dry_frames = frames;
-    g_dry_channels = wanted;
+
+    if (effect->dry.size() < static_cast<size_t>(wanted) * kMaxFrames) {
+        effect->dry_frames = 0;
+        return;  // allocated at claim time; never allocate on the audio thread
+    }
+
+    for (unsigned int channel = 0; channel < wanted; ++channel) {
+        std::memcpy(&effect->dry[channel * kMaxFrames], input[channel], frames * sizeof(float));
+    }
+    effect->dry_frames = frames;
+    effect->dry_channels = wanted;
 }
 
 extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** input,
                                    float** output, unsigned long frames)
 {
-    (void)self;
     (void)timebase;
     (void)input;
 
-    const unsigned int wanted = HostChannelCount();
+    ClaimedEffect* const effect = FindEffect(self);
+    if (effect == nullptr || effect->plugin == nullptr) {
+        return;  // not ours: a stock Delay elsewhere in the project
+    }
+
+    const unsigned int wanted = effect->plugin->ChannelCount();
     if (wanted == 0 || output == nullptr || frames == 0 || frames > kMaxFrames ||
         !ChannelsAreReadable(output, wanted, frames)) {
         return;
     }
 
-    // Put the dry signal back over whatever the stock effect wrote, so the hosted plugin hears the
-    // track and not a delayed copy of it.
+    // Put the dry signal back over whatever the carrier effect wrote, so the hosted plugin hears
+    // the track and not a delayed copy of it.
     bool restored = false;
-    if (g_dry_frames == frames && g_dry_channels == wanted) {
-        const std::vector<float>& scratch = DryScratch();
+    if (effect->dry_frames == frames && effect->dry_channels == wanted &&
+        effect->dry.size() >= static_cast<size_t>(wanted) * kMaxFrames) {
         for (unsigned int channel = 0; channel < wanted; ++channel) {
-            std::memcpy(output[channel], &scratch[channel * kMaxFrames], frames * sizeof(float));
+            std::memcpy(output[channel], &effect->dry[channel * kMaxFrames],
+                        frames * sizeof(float));
         }
         restored = true;
     }
 
-    bool processed = false;
-    {
-        const std::lock_guard<std::mutex> guard(HostProcessLock());
-        processed = HostProcess(output, wanted, static_cast<unsigned int>(frames));
-    }
+    const bool processed = effect->plugin->Process(output, wanted,
+                                                   static_cast<unsigned int>(frames));
 
     if (++g_process_calls <= 3) {
         Log("Process #%d: frames=%lu, %u channels, dry %s, plugin %s",
@@ -1677,7 +1696,7 @@ void PrepareLabels()
     if (g_label_narrow[0] != '\0') {
         return;
     }
-    const char* const name = HostName();
+    const char* const name = MenuNameFromPath(ConfiguredPluginPath());
     if (name == nullptr || name[0] == '\0') {
         return;
     }
@@ -2004,6 +2023,22 @@ int ClaimInstance(void* instance)
             ++claimed;
             break;
         }
+    }
+
+    // This effect's own plugin. Nothing is shared with any other effect.
+    ClaimedEffect* const entry = AppendEffect(instance, audio_plugin_subobject);
+    if (entry != nullptr) {
+        const char* const path = ConfiguredPluginPath();
+        entry->plugin = CreateHostedPlugin(FormatFromPath(path), path, 48000.0, kMaxFrames);
+        if (entry->plugin != nullptr) {
+            entry->dry.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
+            g_focused_effect.store(entry);
+            Log("effect: hosting \"%s\" for this instance", entry->plugin->Name());
+        } else {
+            Log("effect: no plugin for this instance - audio passes through");
+        }
+    } else {
+        Log("effect: more than %zu effects claimed, this one gets no plugin", kMaxClaimedEffects);
     }
 
     NameInstance(audio_plugin_subobject);
