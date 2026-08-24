@@ -28,6 +28,7 @@
 #include "carla_host.h"
 #include "vst2_host.h"
 #include "plugin_instance.h"
+#include "plugin_scan.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -44,6 +45,7 @@
 #include <cstdio>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace {
@@ -152,6 +154,10 @@ const char* MenuNameFromPath(const char* path)
 namespace {
 constexpr unsigned long kMaxFrames = 8192;
 constexpr unsigned int kMaxChannels = 16;
+
+// Written one sample past every block handed to a plugin, and read back afterwards. A plugin that
+// writes more than it was asked for is a real failure mode, not a theory - see BridgeAfterProcess.
+constexpr float kOverrunMarker = -1234.5f;
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -185,7 +191,28 @@ struct ClaimedEffect {
     float* channels[kMaxChannels] = {nullptr};
     unsigned long dry_frames = 0;
     unsigned int dry_channels = 0;
+
+    // This effect's own name, in both encodings Resolve asks for. Held per effect and not in one
+    // shared buffer, because the name hooks return the pointer they are given: with a shared
+    // buffer, a second effect with a second plugin would rename the first one.
+    char label_narrow[128] = {0};
+    wchar_t label_wide[128] = {0};
 };
+
+// Fills both encodings from one name.
+void SetEffectLabel(ClaimedEffect* effect, const char* name)
+{
+    if (effect == nullptr || name == nullptr || name[0] == '\0') {
+        return;
+    }
+    std::snprintf(effect->label_narrow, sizeof(effect->label_narrow), "%s", name);
+    size_t index = 0;
+    const size_t limit = sizeof(effect->label_wide) / sizeof(effect->label_wide[0]);
+    for (; index + 1 < limit && name[index] != '\0'; ++index) {
+        effect->label_wide[index] = static_cast<wchar_t>(name[index]);
+    }
+    effect->label_wide[index] = 0;
+}
 
 ClaimedEffect g_effects[kMaxClaimedEffects];
 std::atomic<size_t> g_effect_count{0};
@@ -618,26 +645,67 @@ void InitStaticQtString(StaticQtString& target, const char* ascii)
     target.offset = offsetof(StaticQtString, text);
 }
 
-// One clone of the source entry, named after the plugin we host. The menu entry, the effect slot on
-// the track and the audio are then the same thing under one name, instead of a Delay that secretly
-// sounds like something else. The category stays Uncategorized - see the note further down.
+// One menu entry per plugin the scanner found.
+//
+// Each entry is a clone of the source effect's definition with two fields swapped: the key and the
+// display name. The rest of the 64-byte definition stays the source's, which is what makes the
+// entry instantiable at all - the stock factory builds the source effect, and the create hook then
+// claims the instance and gives it the plugin the key names.
+//
+// The clones are heap-allocated and never freed. Their addresses are handed to Qt as static
+// QStringData, so they have to outlive every effect; a vector would move them on the first growth
+// and leave Qt reading freed memory. The category stays Uncategorized - see the note further down.
 struct Clone {
-    const char* key;
-    const char* name;
+    std::string key;   // "<plugin name>:1112360057"
+    std::string name;  // what the menu reads
+    std::string path;  // the plugin file this entry loads
+    PluginFormat format;
     StaticQtString key_string;
     StaticQtString name_string;
     void* key_slot;
 };
 
-char g_clone_key_text[160];
-char g_clone_name_text[128];
-
-Clone g_clones[] = {
-    {g_clone_key_text, g_clone_name_text, {}, {}, nullptr},
-};
-
-char kOurPluginKey[160] = "Bridge Test:1112360057";  // the clone the create hook redirects
+std::vector<Clone*> g_clones;
 const void* g_source_node = nullptr;
+
+// Builds one clone per scanned plugin, once. Returns them in menu order.
+const std::vector<Clone*>& Catalogue()
+{
+    static bool built = false;
+    if (built) {
+        return g_clones;
+    }
+    built = true;
+
+    for (const ScannedPlugin& scanned : ScannedPlugins()) {
+        auto* const clone = new Clone();
+        clone->key = scanned.key;
+        clone->name = scanned.name;
+        clone->path = scanned.path;
+        clone->format = scanned.format;
+        InitStaticQtString(clone->key_string, clone->key.c_str());
+        InitStaticQtString(clone->name_string, clone->name.c_str());
+        clone->key_slot = &clone->key_string;
+        g_clones.push_back(clone);
+    }
+    Log("menu: %zu entries to insert", g_clones.size());
+    return g_clones;
+}
+
+// Which clone a key names, or null. The create hook asks this on every CreatePluginInstance call,
+// so it is a linear scan over a list that is built once and never changed.
+const Clone* CloneForKey(const char* key)
+{
+    if (key == nullptr) {
+        return nullptr;
+    }
+    for (const Clone* clone : Catalogue()) {
+        if (clone->key == key) {
+            return clone;
+        }
+    }
+    return nullptr;
+}
 
 using EmplaceFn = void* (*)(void* tree, const void* key, void* value_pair);
 
@@ -658,43 +726,28 @@ void InsertOurEntry(void* container)
         return;
     }
 
-    static bool strings_ready = false;
-    if (!strings_ready) {
-        // The hosted plugin supplies the name. Keep the source effect's numeric id, because that is
-        // what the stock factory needs when the create hook redirects the key.
-        const char* const hosted = MenuNameFromPath(ConfiguredPluginPath());
-        std::snprintf(g_clone_name_text, sizeof(g_clone_name_text), "%s",
-                      hosted != nullptr ? hosted : "Bridge Test");
-        std::snprintf(g_clone_key_text, sizeof(g_clone_key_text), "%s:1112360057", g_clone_name_text);
-        std::snprintf(kOurPluginKey, sizeof(kOurPluginKey), "%s", g_clone_key_text);
-
-        for (auto& clone : g_clones) {
-            InitStaticQtString(clone.key_string, clone.key);
-            InitStaticQtString(clone.name_string, clone.name);
-            clone.key_slot = &clone.key_string;
-        }
-        strings_ready = true;
-        Log("  menu entry will read \"%s\"", g_clone_name_text);
-    }
-
     unsigned char value_pair[kPairBytes];
     const auto* source_pair = static_cast<const unsigned char*>(g_source_node) + kNodeHeaderBytes;
 
-    for (auto& clone : g_clones) {
+    int inserted = 0;
+    for (Clone* clone : Catalogue()) {
+        // The source pair is re-read per clone: emplace copy-constructs from what we pass, and
+        // reading once and reusing the buffer would hand every clone the same QString refcount.
         if (!SafeRead(source_pair, value_pair, sizeof(value_pair))) {
             Log("  insert skipped: source entry unreadable");
             return;
         }
 
         // Swap in this clone's key and display name. The other 56 bytes stay the source's.
-        void* name_data = &clone.name_string;
-        std::memcpy(value_pair + 0, &clone.key_slot, sizeof(void*));  // pair.first = key
-        std::memcpy(value_pair + 8, &name_data, sizeof(void*));       // definition.name
+        void* name_data = &clone->name_string;
+        std::memcpy(value_pair + 0, &clone->key_slot, sizeof(void*));  // pair.first = key
+        std::memcpy(value_pair + 8, &name_data, sizeof(void*));        // definition.name
 
-        emplace(container, &clone.key_slot, value_pair);
-        if (g_query_calls <= kMaxLoggedCalls) {
-            Log("  inserted \"%s\" as \"%s\"", clone.key, clone.name);
-        }
+        emplace(container, &clone->key_slot, value_pair);
+        ++inserted;
+    }
+    if (g_query_calls <= kMaxLoggedCalls) {
+        Log("  inserted %d entries", inserted);
     }
 }
 
@@ -846,7 +899,10 @@ void* g_instance_vtable[2 + kInstanceSlotCount];
 void* g_stock_instance_vtable = nullptr;
 bool g_instance_vtable_built = false;
 int g_instances_wrapped = 0;
-bool g_creating_ours = false;
+// The clone CreatePluginInstance was called for, or null. Set in the entry hook and read in
+// the exit hook - one call on one thread, the same window the bool had.
+struct Clone;
+thread_local const Clone* g_creating_clone = nullptr;
 int g_pre_process_calls = 0;
 int g_post_process_calls = 0;
 
@@ -1098,16 +1154,16 @@ extern "C" void* BridgeInspectCreateEntry(const void* self, unsigned long catego
 
     char name[160];
     const bool readable = ReadQStringArgument(key, name, sizeof(name));
-    const bool ours = readable && std::strcmp(name, kOurPluginKey) == 0;
+    const Clone* const clone = readable ? CloneForKey(name) : nullptr;
 
     if (++g_create_inspections <= kMaxLoggedCalls) {
         Log("CreatePluginInstance #%d: category=%lu key=\"%s\"%s",
             g_create_inspections, category, readable ? name : "<unreadable>",
-            ours ? "  <- ours, substituting the source key" : "");
+            clone != nullptr ? "  <- ours, substituting the source key" : "");
     }
 
-    g_creating_ours = ours;
-    if (!ours) {
+    g_creating_clone = clone;
+    if (clone == nullptr) {
         return nullptr;
     }
 
@@ -1138,11 +1194,11 @@ extern "C" void BridgeInspectCreateExit(void* result)
     // Claim only what we asked for. A Delay the editor added stays a stock Delay, because its vptrs
     // still point at the stock vtable - that is the whole reason the class vtable is no longer
     // patched.
-    if (g_creating_ours && result != nullptr) {
+    if (g_creating_clone != nullptr && result != nullptr) {
         BridgeClaimInstance(result);
     }
 
-    g_creating_ours = false;  // the editor now follows Resolve's own open and close calls
+    g_creating_clone = nullptr;  // the editor now follows Resolve's own open and close calls
 }
 
 
@@ -1160,9 +1216,11 @@ void LoadConfiguredPlugin()
     CarlaHostSetLogger([](const char* line) { Log("%s", line); });
     Vst2HostSetLogger([](const char* line) { Log("%s", line); });
     PluginInstanceSetLogger([](const char* line) { Log("%s", line); });
+    PluginScanSetLogger([](const char* line) { Log("%s", line); });
 
-    const char* const path = ConfiguredPluginPath();
-    Log("plugin: the menu entry will load %s", path);
+    // Scan now, at library load, rather than on the first QueryPluginList call. The scan touches
+    // the filesystem, and QueryPluginList runs while Resolve builds its effect menu.
+    ScannedPlugins();
 }
 
 }  // namespace
@@ -1539,45 +1597,68 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
             effect->plugin->Name());
     }
 
-    // Put the dry signal back over whatever the carrier effect wrote, so the hosted plugin hears
-    // the track and not a delayed copy of it.
-    bool restored = false;
-    if (effect->dry_frames == frames && effect->dry_channels == wanted &&
-        effect->dry.size() >= static_cast<size_t>(wanted) * kMaxFrames) {
-        for (unsigned int channel = 0; channel < wanted; ++channel) {
-            std::memcpy(output[channel], &effect->dry[channel * kMaxFrames],
-                        frames * sizeof(float));
-        }
-        restored = true;
+    if (asked > kMaxChannels ||
+        effect->spare.size() < static_cast<size_t>(asked) * kMaxFrames) {
+        return;
     }
 
-    // Adapt the channel count rather than decline the block.
+    // The plugin never sees Resolve's buffers.
     //
-    // Resolve gives this effect one channel on a mono track, and a stereo plugin that is handed one
-    // channel simply refuses to run - which is a silent pass-through, not an error anyone can see.
-    // So the plugin is always given the full set it asked for: the real channels first, then
-    // stand-ins carrying a copy of the last real one. Only the real channels are read back, so the
-    // stand-ins are scratch the plugin is free to write.
-    float** plugin_buffers = output;
-    if (wanted < asked && effect->spare.size() >= static_cast<size_t>(asked) * kMaxFrames) {
-        for (unsigned int channel = 0; channel < asked && channel < kMaxChannels; ++channel) {
-            if (channel < wanted) {
-                effect->channels[channel] = output[channel];
-                continue;
-            }
-            float* const stand_in = &effect->spare[channel * kMaxFrames];
-            std::memcpy(stand_in, output[wanted - 1], frames * sizeof(float));
-            effect->channels[channel] = stand_in;
+    // This is the fix for a crash inside Resolve's own mixer, and the reason is worth keeping:
+    // Resolve's block buffer holds exactly `frames` floats, and a plugin is free to write more
+    // than it was asked for. A limiter with lookahead that rounds its work up to an internal block
+    // does exactly that. The write lands past the end of a Fairlight heap buffer, and the fault
+    // then appears somewhere else entirely - the crash dump for pp-track on 2026-08-25 pointed at
+    // MixPole::ApplyGainSmooth+0x188, which is `call *0x20(%rax)` through a vtable pointer that
+    // had been overwritten.
+    //
+    // So the plugin runs over our own scratch, which has kMaxFrames of headroom per channel, and
+    // exactly `frames` samples are copied back. An overrunning plugin now damages our spare and
+    // nothing else.
+    const bool have_dry = effect->dry_frames == frames && effect->dry_channels == wanted &&
+                          effect->dry.size() >= static_cast<size_t>(wanted) * kMaxFrames;
+
+    for (unsigned int channel = 0; channel < asked; ++channel) {
+        float* const scratch = &effect->spare[channel * kMaxFrames];
+        // The real channels carry the dry signal, so the plugin hears the track and not the
+        // carrier effect's delayed copy of it. Channels Resolve did not provide carry a copy of
+        // the last real one, so a stereo plugin still runs on a mono track.
+        const unsigned int source = channel < wanted ? channel : wanted - 1;
+        if (have_dry) {
+            std::memcpy(scratch, &effect->dry[source * kMaxFrames], frames * sizeof(float));
+        } else {
+            std::memcpy(scratch, output[source], frames * sizeof(float));
         }
-        plugin_buffers = effect->channels;
+        effect->channels[channel] = scratch;
+        // A marker just past the block. If the plugin writes over it, the overrun is measured
+        // instead of guessed - and it is measured in our memory, where it is harmless.
+        scratch[frames] = kOverrunMarker;
     }
 
-    const bool processed = effect->plugin->Process(plugin_buffers, asked,
+    const bool processed = effect->plugin->Process(effect->channels, asked,
                                                    static_cast<unsigned int>(frames));
+
+    bool overran = false;
+    for (unsigned int channel = 0; channel < asked; ++channel) {
+        float* const scratch = &effect->spare[channel * kMaxFrames];
+        if (scratch[frames] != kOverrunMarker) {
+            overran = true;
+        }
+        if (channel < wanted) {
+            std::memcpy(output[channel], scratch, frames * sizeof(float));
+        }
+    }
+
+    static unsigned int reported_overrun = 0;
+    if (overran && reported_overrun < 3) {
+        ++reported_overrun;
+        Log("audio: \"%s\" wrote past the %lu frames it was given - contained in our scratch",
+            effect->plugin->Name(), frames);
+    }
 
     if (++g_process_calls <= 3) {
         Log("Process #%d: frames=%lu, %u of %u channels, dry %s, plugin %s",
-            g_process_calls, frames, wanted, asked, restored ? "restored" : "MISSING",
+            g_process_calls, frames, wanted, asked, have_dry ? "used" : "MISSING",
             processed ? "ran" : "declined");
     }
 }
@@ -1772,27 +1853,6 @@ constexpr size_t kHideSubWindowsOffset = 0x830;
 
 namespace {
 
-char g_label_narrow[128] = {0};
-wchar_t g_label_wide[128] = {0};
-
-void PrepareLabels()
-{
-    if (g_label_narrow[0] != '\0') {
-        return;
-    }
-    const char* const name = MenuNameFromPath(ConfiguredPluginPath());
-    if (name == nullptr || name[0] == '\0') {
-        return;
-    }
-    std::snprintf(g_label_narrow, sizeof(g_label_narrow), "%s", name);
-    size_t index = 0;
-    for (; index + 1 < sizeof(g_label_wide) / sizeof(g_label_wide[0]) && name[index] != '\0';
-         ++index) {
-        g_label_wide[index] = static_cast<wchar_t>(name[index]);
-    }
-    g_label_wide[index] = 0;
-}
-
 // Returns true when the bytes look like a wide string. Reads through SafeRead, so a bad pointer
 // costs a false instead of a fault.
 bool LooksWide(const void* text)
@@ -1833,15 +1893,15 @@ extern "C" const void* BridgeEffectName(void* self)
     if (g_original_effect_name != nullptr) {
         stock = reinterpret_cast<const void* (*)(void*)>(g_original_effect_name)(self);
     }
-    PrepareLabels();
     if (++g_label_reports <= 6) {
         LogStockLabel("GetEffectName", stock);
     }
-    if (g_label_narrow[0] == '\0') {
-        return stock;
+    const ClaimedEffect* const effect = FindEffect(self);
+    if (effect == nullptr || effect->label_narrow[0] == '\0') {
+        return stock;  // not one of ours: a stock Delay keeps its own name
     }
-    return LooksWide(stock) ? static_cast<const void*>(g_label_wide)
-                            : static_cast<const void*>(g_label_narrow);
+    return LooksWide(stock) ? static_cast<const void*>(effect->label_wide)
+                            : static_cast<const void*>(effect->label_narrow);
 }
 
 extern "C" const void* BridgeEffectNameThunk(void* self)
@@ -1850,15 +1910,15 @@ extern "C" const void* BridgeEffectNameThunk(void* self)
     if (g_original_effect_name_thunk != nullptr) {
         stock = reinterpret_cast<const void* (*)(void*)>(g_original_effect_name_thunk)(self);
     }
-    PrepareLabels();
     if (++g_label_reports <= 6) {
         LogStockLabel("AudioPlugin::GetEffectName", stock);
     }
-    if (g_label_narrow[0] == '\0') {
+    const ClaimedEffect* const effect = FindEffect(self);
+    if (effect == nullptr || effect->label_narrow[0] == '\0') {
         return stock;
     }
-    return LooksWide(stock) ? static_cast<const void*>(g_label_wide)
-                            : static_cast<const void*>(g_label_narrow);
+    return LooksWide(stock) ? static_cast<const void*>(effect->label_wide)
+                            : static_cast<const void*>(effect->label_narrow);
 }
 
 // SetUserEffectName takes a wchar_t const*, so this one is wide by declaration. It answers nullptr
@@ -1869,14 +1929,14 @@ extern "C" const wchar_t* BridgeUserEffectName(void* self)
     if (g_original_user_effect_name != nullptr) {
         stock = reinterpret_cast<const wchar_t* (*)(void*)>(g_original_user_effect_name)(self);
     }
-    PrepareLabels();
     if (++g_label_reports <= 6) {
         LogStockLabel("GetUserEffectName", stock);
     }
-    if (stock != nullptr || g_label_wide[0] == 0) {
+    const ClaimedEffect* const effect = FindEffect(self);
+    if (stock != nullptr || effect == nullptr || effect->label_wide[0] == 0) {
         return stock;
     }
-    return g_label_wide;
+    return effect->label_wide;
 }
 
 extern "C" void BridgeReportSlot(unsigned int slot)
@@ -2002,13 +2062,12 @@ constexpr size_t kGenerateUserInterfaceOffset = 0x460;
 constexpr size_t kNameRecordOffset = 0x550;
 constexpr size_t kNameRecordCloneBytes = 256;
 
-void RenameInstance(void* primary_base)
+void RenameInstance(void* primary_base, const ClaimedEffect* effect)
 {
     if (!EnabledByEnvironment("FXBRIDGE_RENAME", true)) {
         return;
     }
-    PrepareLabels();
-    if (primary_base == nullptr || g_label_narrow[0] == '\0') {
+    if (primary_base == nullptr || effect == nullptr || effect->label_narrow[0] == '\0') {
         return;
     }
 
@@ -2039,10 +2098,10 @@ void RenameInstance(void* primary_base)
         return;
     }
 
-    const char* const our_name = g_label_narrow;
+    const char* const our_name = effect->label_narrow;
     std::memcpy(clone, &our_name, sizeof(our_name));
     *reinterpret_cast<void**>(field) = clone;
-    Log("rename: instance now names itself \"%s\"", g_label_narrow);
+    Log("rename: instance now names itself \"%s\"", effect->label_narrow);
 }
 
 // The AudioPlugin group, and the slot that names the effect.
@@ -2054,10 +2113,9 @@ constexpr size_t kSetUserEffectNameOffset = 0x6b8;
 // The label is not hooked. GetEffectName returns a string by value, and faking an sret means
 // building whatever string type it returns. SetUserEffectName is the other side of the same pair
 // and its declaration already names the type: wchar_t const*. So the name is set, not faked.
-void NameInstance(void* audio_plugin_subobject)
+void NameInstance(void* audio_plugin_subobject, const ClaimedEffect* effect)
 {
-    PrepareLabels();
-    if (audio_plugin_subobject == nullptr || g_label_wide[0] == 0) {
+    if (audio_plugin_subobject == nullptr || effect == nullptr || effect->label_wide[0] == 0) {
         return;
     }
 
@@ -2068,8 +2126,8 @@ void NameInstance(void* audio_plugin_subobject)
 
     const size_t slot = (kSetUserEffectNameOffset - kAudioPluginGroup) / sizeof(void*);
     using Setter = void (*)(void*, const wchar_t*);
-    reinterpret_cast<Setter>(vtable[slot])(audio_plugin_subobject, g_label_wide);
-    Log("instance named \"%ls\" through SetUserEffectName", g_label_wide);
+    reinterpret_cast<Setter>(vtable[slot])(audio_plugin_subobject, effect->label_wide);
+    Log("instance named \"%ls\" through SetUserEffectName", effect->label_wide);
 }
 
 // Point one instance at our vtable. Returns how many vptr fields were rewritten.
@@ -2109,25 +2167,30 @@ int ClaimInstance(void* instance)
         }
     }
 
-    // This effect's own plugin. Nothing is shared with any other effect.
+    // This effect's own plugin, named by the menu entry the user picked. Nothing is shared with
+    // any other effect: two entries in one project are two plugins.
     ClaimedEffect* const entry = AppendEffect(instance, audio_plugin_subobject);
     if (entry != nullptr) {
-        const char* const path = ConfiguredPluginPath();
-        entry->plugin = CreateHostedPlugin(FormatFromPath(path), path, 48000.0, kMaxFrames);
+        const Clone* const chosen = g_creating_clone;
+        const char* const path = chosen != nullptr ? chosen->path.c_str() : ConfiguredPluginPath();
+        const PluginFormat format =
+            chosen != nullptr ? chosen->format : FormatFromPath(path);
+        SetEffectLabel(entry, chosen != nullptr ? chosen->name.c_str() : MenuNameFromPath(path));
+        entry->plugin = CreateHostedPlugin(format, path, 48000.0, kMaxFrames);
         if (entry->plugin != nullptr) {
             entry->dry.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
             entry->spare.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
             g_focused_effect.store(entry);
-            Log("effect: hosting \"%s\" for this instance", entry->plugin->Name());
+            Log("effect: hosting \"%s\" from %s", entry->plugin->Name(), path);
         } else {
-            Log("effect: no plugin for this instance - audio passes through");
+            Log("effect: no plugin for %s - audio passes through", path);
         }
     } else {
         Log("effect: more than %zu effects claimed, this one gets no plugin", kMaxClaimedEffects);
     }
 
-    NameInstance(audio_plugin_subobject);
-    RenameInstance(primary_base);
+    NameInstance(audio_plugin_subobject, entry);
+    RenameInstance(primary_base, entry);
 
     // With no control tree there is no panel, and Resolve never calls InitializeEffectEdit - the
     // editor path is gated on the panel existing. Verified on 2026-08-24: with the panel suppressed

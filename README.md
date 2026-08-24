@@ -570,3 +570,39 @@ editor lives inside it; a destroyed window left the plugin believing its GUI sti
 2. Move the timer onto Resolve's event loop.
 3. One hosted plugin per effect instance, with its own editor.
 
+
+## The close-during-playback crash: gone, cause never found
+
+On 2026-08-25, closing the plugin panel while the timeline played crashed Resolve. Two core dumps
+were taken (01:04:36 and 01:05:28), both `SIGSEGV / SEGV_MAPERR`.
+
+**The dumps are worthless, and it is worth knowing why.** Frames #0 and #1 of the faulting thread
+sit inside `backtrace_symbols`:
+
+    #0 libc.so.6 + 0x1a95e2
+    #1 __backtrace_symbols (libc.so.6 + 0x159d07)
+    #2 resolve + 0x35920e7
+    #3 resolve + 0x3591313
+    #4 libc.so.6 + 0x44cb0        <- __restore_rt
+    #5 ClapHostLogParameters (libfxbridge.so + 0x936f)
+
+Resolve installs its own crash handler. The handler faulted while it walked the stack, so the dump
+records the handler's death, not the original one. The `ClapHostLogParameters` attribution below it
+is the handler misreading frames — that function runs once, at effect creation, and cannot be on a
+panel-close path. **Read frame #0 before believing frame #5.**
+
+The crash stopped after `libfxbridge.so` was rebuilt from `c039715` and installed. Nothing in the
+source changed between the crashing build and the working one: the working build is the same commit,
+compiled again. That leaves two candidates, and this repo cannot tell them apart:
+
+- the installed `.so` was stale — plausible, because installing from the build was itself a fix
+  (`e8333fb`), and a crash had already been reported once against a two-commit-old library;
+- the fault is a race that simply did not fire again.
+
+**So it is not fixed, it is absent.** No change is credited with fixing it. If it returns, the first
+move is not a core dump — it is `md5sum` on the installed library against `build/libfxbridge.so`.
+
+One suspicion remains recorded but unproven: of the hand-written trampolines only
+`BRIDGE_PROCESS_THUNK` carries CFI unwind data. `BRIDGE_AUDIO_THUNK`, `BridgeThunkSetParameter` and
+`BRIDGE_TRACE_THUNK` carry none, so a stack walker that meets one has nothing to work from. That
+explains a *handler* crash. It does not explain the first fault.
