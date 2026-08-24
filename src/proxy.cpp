@@ -147,6 +147,13 @@ const char* MenuNameFromPath(const char* path)
 
 }  // namespace
 
+// The limits the audio path works within. Declared here because the per-effect registry below
+// sizes its buffers from them.
+namespace {
+constexpr unsigned long kMaxFrames = 8192;
+constexpr unsigned int kMaxChannels = 16;
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // One plugin per effect.
 //
@@ -172,6 +179,10 @@ struct ClaimedEffect {
     void* audio_plugin_key = nullptr;
     HostedPlugin* plugin = nullptr;
     std::vector<float> dry;
+    // Stand-in buffers for channels Resolve does not provide, so a stereo plugin can still run on
+    // a mono track. Allocated at claim time; never on the audio thread.
+    std::vector<float> spare;
+    float* channels[kMaxChannels] = {nullptr};
     unsigned long dry_frames = 0;
     unsigned int dry_channels = 0;
 };
@@ -1429,8 +1440,6 @@ BRIDGE_HIDDEN2 void BridgeThunkProcessSecondary();
 //
 // Every channel pointer is validated and both ends of the block are probed before the plugin is
 // handed anything, so a surprising argument costs a skipped block instead of the application.
-constexpr unsigned long kMaxFrames = 8192;
-constexpr unsigned int kMaxChannels = 16;
 
 namespace {
 
@@ -1504,33 +1513,23 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
     (void)timebase;
     (void)input;
 
-    // Breadcrumbs, first few calls only.
-    //
-    // This function has faulted repeatedly and Process #1 never reaches the log, so the fault is
-    // before it. Two guesses at the cause were wrong. Each step now announces itself, and the last
-    // line in the log names the step that died.
-    static int steps = 0;
-    const bool trace = ++steps <= 5;
-    if (trace) Log("after#%d: entry self=%p output=%p frames=%lu", steps, self, output, frames);
+    // The breadcrumbs that found the writability fault are gone; the Process line below carries
+    // what is worth knowing per block. Put them back by hand if this path ever misbehaves again -
+    // step-by-step logging named the faulting statement in one run, after two wrong theories.
 
     ClaimedEffect* const effect = FindEffect(self);
     if (effect == nullptr || effect->plugin == nullptr) {
-        if (trace) Log("after#%d: not ours, returning", steps);
         return;  // not ours: a stock Delay elsewhere in the project
     }
-    if (trace) Log("after#%d: effect=%p plugin=%p", steps, effect, effect->plugin);
 
     const unsigned int asked = effect->plugin->ChannelCount();
     if (asked == 0 || output == nullptr || frames == 0 || frames > kMaxFrames) {
-        if (trace) Log("after#%d: arguments rejected", steps);
         return;
     }
 
     // Only the channels Resolve really gave us, proven writable.
     const unsigned int wanted = UsableChannels(output, asked, frames);
-    if (trace) Log("after#%d: plugin wants %u channels, %u are usable", steps, asked, wanted);
     if (wanted == 0) {
-        if (trace) Log("after#%d: no usable output channel, leaving the block alone", steps);
         return;
     }
     static unsigned int reported_short = 0;
@@ -1539,13 +1538,6 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
         Log("audio: Resolve provided %u of the %u channels \"%s\" wants", wanted, asked,
             effect->plugin->Name());
     }
-    if (trace) {
-        // The pointers themselves, and the dry block's state. ChannelsAreReadable proves only that
-        // these can be read; the restore below writes to them.
-        Log("after#%d: output[0]=%p output[1]=%p dry.size=%zu dry_frames=%lu dry_channels=%u",
-            steps, output[0], wanted > 1 ? output[1] : nullptr, effect->dry.size(),
-            effect->dry_frames, effect->dry_channels);
-    }
 
     // Put the dry signal back over whatever the carrier effect wrote, so the hosted plugin hears
     // the track and not a delayed copy of it.
@@ -1553,21 +1545,39 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
     if (effect->dry_frames == frames && effect->dry_channels == wanted &&
         effect->dry.size() >= static_cast<size_t>(wanted) * kMaxFrames) {
         for (unsigned int channel = 0; channel < wanted; ++channel) {
-            if (trace) Log("after#%d: restoring channel %u", steps, channel);
             std::memcpy(output[channel], &effect->dry[channel * kMaxFrames],
                         frames * sizeof(float));
         }
         restored = true;
     }
-    if (trace) Log("after#%d: dry %s, calling the plugin", steps, restored ? "restored" : "MISSING");
 
-    const bool processed = effect->plugin->Process(output, wanted,
+    // Adapt the channel count rather than decline the block.
+    //
+    // Resolve gives this effect one channel on a mono track, and a stereo plugin that is handed one
+    // channel simply refuses to run - which is a silent pass-through, not an error anyone can see.
+    // So the plugin is always given the full set it asked for: the real channels first, then
+    // stand-ins carrying a copy of the last real one. Only the real channels are read back, so the
+    // stand-ins are scratch the plugin is free to write.
+    float** plugin_buffers = output;
+    if (wanted < asked && effect->spare.size() >= static_cast<size_t>(asked) * kMaxFrames) {
+        for (unsigned int channel = 0; channel < asked && channel < kMaxChannels; ++channel) {
+            if (channel < wanted) {
+                effect->channels[channel] = output[channel];
+                continue;
+            }
+            float* const stand_in = &effect->spare[channel * kMaxFrames];
+            std::memcpy(stand_in, output[wanted - 1], frames * sizeof(float));
+            effect->channels[channel] = stand_in;
+        }
+        plugin_buffers = effect->channels;
+    }
+
+    const bool processed = effect->plugin->Process(plugin_buffers, asked,
                                                    static_cast<unsigned int>(frames));
-    if (trace) Log("after#%d: the plugin returned", steps);
 
     if (++g_process_calls <= 3) {
-        Log("Process #%d: frames=%lu, %u channels, dry %s, plugin %s",
-            g_process_calls, frames, wanted, restored ? "restored" : "MISSING",
+        Log("Process #%d: frames=%lu, %u of %u channels, dry %s, plugin %s",
+            g_process_calls, frames, wanted, asked, restored ? "restored" : "MISSING",
             processed ? "ran" : "declined");
     }
 }
@@ -2106,6 +2116,7 @@ int ClaimInstance(void* instance)
         entry->plugin = CreateHostedPlugin(FormatFromPath(path), path, 48000.0, kMaxFrames);
         if (entry->plugin != nullptr) {
             entry->dry.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
+            entry->spare.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
             g_focused_effect.store(entry);
             Log("effect: hosting \"%s\" for this instance", entry->plugin->Name());
         } else {
