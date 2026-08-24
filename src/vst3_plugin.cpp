@@ -182,15 +182,6 @@ std::string BinaryInsideBundle(const std::string& bundle)
     return found;
 }
 
-void CopyUtf16(const int16_t* source, char* target, size_t target_size)
-{
-    size_t index = 0;
-    for (; index + 1 < target_size && source[index] != 0; ++index) {
-        target[index] = static_cast<char>(source[index] & 0x7f);
-    }
-    target[index] = '\0';
-}
-
 constexpr v3_speaker_arrangement kArrangementMono = 1;    // front left only
 constexpr v3_speaker_arrangement kArrangementStereo = 3;  // front left and front right
 

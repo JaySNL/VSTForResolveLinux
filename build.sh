@@ -6,9 +6,10 @@ out="$root/build"
 mkdir -p "$out"
 g++ -std=c++17 -shared -fPIC -O2 -Wall -Wextra \
     -I "$root/third_party/clap/include" \
+    -I "$root/third_party/dpf/distrho/src/travesty" \
     -I /usr/include/carla/includes \
     -o "$out/libfxbridge.so" \
-    "$root/src/proxy.cpp" "$root/src/carla_host.cpp" "$root/src/vst2_plugin.cpp" "$root/src/clap_plugin.cpp" "$root/src/plugin_scan.cpp" "$root/src/plugin_window.cpp" -ldl -lX11
+    "$root/src/proxy.cpp" "$root/src/carla_host.cpp" "$root/src/vst2_plugin.cpp" "$root/src/clap_plugin.cpp" "$root/src/vst3_plugin.cpp" "$root/src/plugin_scan.cpp" "$root/src/plugin_window.cpp" -ldl -lX11
 # Refuse to install a library Resolve cannot load.
 #
 # A shared library links happily with unresolved symbols, so a missing source file still produces a

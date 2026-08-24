@@ -5,6 +5,7 @@
 #include "plugin_window.h"
 #include "vst2_abi.h"
 #include "clap_plugin.h"
+#include "vst3_plugin.h"
 
 #include <dlfcn.h>
 
@@ -299,6 +300,9 @@ HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, double s
     if (format == PluginFormat::Clap) {
         return CreateClapPlugin(path, sample_rate, max_frames);
     }
+    if (format == PluginFormat::Vst3) {
+        return CreateVst3Plugin(path, sample_rate, max_frames);
+    }
     Log("plugin: %s is a format this build cannot host yet", path != nullptr ? path : "(null)");
     return nullptr;
 }
@@ -308,4 +312,5 @@ void PluginInstanceSetLogger(void (*logger)(const char*))
     g_logger = logger;
     PluginWindowSetLogger(logger);
     ClapPluginSetLogger(logger);
+    Vst3PluginSetLogger(logger);
 }
