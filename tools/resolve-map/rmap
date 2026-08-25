@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Query the Resolve backend index. Answers the questions a plugin bridge keeps asking.
+
+  rmap vtable BMDStereoDelay              every slot, with the offset the bridge would use
+  rmap vtable BMDStereoDelay --grep Edit  only the slots whose method matches
+  rmap slot BMDStereoDelay 0x4d0          what lives at that offset
+  rmap where Process                      every class with that method, and its offset
+  rmap find UpdateChannelCount            search demangled names across all libraries
+  rmap class 'Fairlight'                  list classes whose vtable is indexed
+  rmap sym _ZN14BMDStereoDelay7ProcessE   address, size and library of one symbol
+  rmap members UpdateChannelCount         which `this` offsets a function reads and writes
+  rmap calls 'BMDStereoDelay::Process'    what a function calls, in order
+
+Offsets are FROM THE VTABLE SYMBOL, which is what the bridge's constants use. The primary
+vptr points at symbol+0x10, past offset-to-top and the typeinfo pointer.
+"""
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resolve-map.sqlite")
+
+LIBRARY_PATH = {
+    "libBMDAudioPlugins.so": "/opt/resolve/libs/libBMDAudioPlugins.so",
+    "libFairlightPage.so": "/opt/resolve/libs/libFairlightPage.so",
+    "libFairlightPanelAPI.so": "/opt/resolve/libs/libFairlightPanelAPI.so",
+    "resolve": "/opt/resolve/bin/resolve",
+}
+
+
+def db():
+    if not os.path.exists(DB):
+        sys.exit("no index at %s - run build-index.py first" % DB)
+    return sqlite3.connect(DB)
+
+
+def cmd_vtable(args):
+    if not args:
+        sys.exit("usage: rmap vtable <Class> [--grep PATTERN]")
+    cls = args[0]
+    pattern = args[args.index("--grep") + 1] if "--grep" in args else None
+    rows = db().execute(
+        "SELECT class, library, offset, target, is_thunk FROM vtable_slot "
+        "WHERE class = ? OR class LIKE ? ORDER BY library, class, offset",
+        (cls, "%" + cls + "%")).fetchall()
+    if not rows:
+        sys.exit("no vtable indexed for %r" % cls)
+    current = None
+    for klass, lib, offset, target, thunk in rows:
+        if pattern and pattern.lower() not in target.lower():
+            continue
+        if (klass, lib) != current:
+            current = (klass, lib)
+            print("")
+            print("%s   [%s]" % (klass, lib))
+        print("  +0x%03x  %s%s" % (offset, "~ " if thunk else "  ", target))
+
+
+def cmd_slot(args):
+    if len(args) < 2:
+        sys.exit("usage: rmap slot <Class> <offset>")
+    cls, offset = args[0], int(args[1], 0)
+    rows = db().execute(
+        "SELECT class, library, target, is_thunk FROM vtable_slot "
+        "WHERE (class = ? OR class LIKE ?) AND offset = ?",
+        (cls, "%" + cls + "%", offset)).fetchall()
+    if not rows:
+        sys.exit("nothing at +0x%x in %r" % (offset, cls))
+    for klass, lib, target, thunk in rows:
+        print("%s +0x%03x  %s%s   [%s]" % (klass, offset, "~ " if thunk else "", target, lib))
+
+
+def cmd_where(args):
+    if not args:
+        sys.exit("usage: rmap where <method>")
+    rows = db().execute(
+        "SELECT class, library, offset, target, is_thunk FROM vtable_slot "
+        "WHERE target LIKE ? ORDER BY is_thunk, class, offset",
+        ("%" + args[0] + "%",)).fetchall()
+    if not rows:
+        sys.exit("no vtable slot mentions %r" % args[0])
+    for klass, lib, offset, target, thunk in rows[:200]:
+        print("+0x%03x  %-40s %s%s" % (offset, klass[:40], "~ " if thunk else "", target))
+    if len(rows) > 200:
+        print("... %d more" % (len(rows) - 200))
+
+
+def cmd_find(args):
+    if not args:
+        sys.exit("usage: rmap find <pattern>")
+    rows = db().execute(
+        "SELECT library, address, size, name FROM symbol WHERE name LIKE ? "
+        "ORDER BY library, name LIMIT 200", ("%" + args[0] + "%",)).fetchall()
+    if not rows:
+        sys.exit("no symbol matches %r" % args[0])
+    for lib, addr, size, name in rows:
+        print("0x%08x %7d  %-26s %s" % (addr, size, lib, name))
+
+
+def cmd_class(args):
+    like = "%" + (args[0] if args else "") + "%"
+    rows = db().execute(
+        "SELECT class, library, COUNT(*) FROM vtable_slot WHERE class LIKE ? "
+        "GROUP BY class, library ORDER BY COUNT(*) DESC LIMIT 200", (like,)).fetchall()
+    for klass, lib, n in rows:
+        print("%4d slots  %-26s %s" % (n, lib, klass))
+
+
+def cmd_sym(args):
+    if not args:
+        sys.exit("usage: rmap sym <name-or-mangled>")
+    n = args[0]
+    rows = db().execute(
+        "SELECT library, address, size, kind, mangled, name FROM symbol "
+        "WHERE mangled = ? OR name = ? OR name LIKE ? LIMIT 40",
+        (n, n, "%" + n + "%")).fetchall()
+    if not rows:
+        sys.exit("no such symbol: %r" % n)
+    for lib, addr, size, kind, mangled, name in rows:
+        print("0x%08x  %7d bytes  %s  [%s]" % (addr, size, kind, lib))
+        print("            %s" % name)
+        print("            %s" % mangled)
+
+
+def one_symbol(needle):
+    """The single best symbol match, or exit with the ambiguity spelled out."""
+    rows = db().execute(
+        "SELECT library, address, size, name FROM symbol "
+        "WHERE (mangled = ? OR name = ? OR name LIKE ?) AND size > 0 LIMIT 20",
+        (needle, needle, "%" + needle + "%")).fetchall()
+    if not rows:
+        sys.exit("no sized symbol matches %r" % needle)
+    if len(rows) > 1:
+        exact = [r for r in rows if r[3] == needle or needle + "(" in r[3]]
+        if len(exact) == 1:
+            return exact[0]
+        print("ambiguous - %d matches:" % len(rows), file=sys.stderr)
+        for lib, addr, size, name in rows:
+            print("   %s   [%s]" % (name, lib), file=sys.stderr)
+        sys.exit(1)
+    return rows[0]
+
+
+def disassemble(library, address, size):
+    path = LIBRARY_PATH.get(library)
+    if path is None:
+        sys.exit("unknown library %r" % library)
+    out = subprocess.run(
+        ["objdump", "-d", "--no-show-raw-insn",
+         "--start-address=0x%x" % address,
+         "--stop-address=0x%x" % (address + size), path],
+        capture_output=True, text=True).stdout
+    return out.splitlines()
+
+
+def cmd_members(args):
+    """Which offsets off `this` a function touches.
+
+    This is the command that was missing when the bridge needed the channel count. The answer
+    was two stores inside BMDAudioPluginImpl::UpdateChannelCount, and finding them by eye cost
+    an evening and three wrong theories. On x86-64 SysV `this` arrives in %rdi, so a store to
+    0xNN(%rdi) is a write to a member and a load from it is a read. A function that copies
+    `this` into another register first is reported as such rather than silently under-reported.
+    """
+    if not args:
+        sys.exit("usage: rmap members <function>")
+    lib, addr, size, name = one_symbol(args[0])
+    print(name)
+    print("  [%s] 0x%x, %d bytes" % (lib, addr, size))
+    print("")
+    # Follow copies of `this`.
+    #
+    # A compiler almost always parks `this` in a callee-saved register before the first call,
+    # so the stores land on 0xNN(%rbx), not 0xNN(%rdi). Matching %rdi alone reported
+    # UpdateChannelCount as READING 0x150 and 0x158 when it writes both - the right offsets
+    # with the wrong verb, which is worse than no answer. So: track which registers currently
+    # alias `this`, and drop one the moment it is written with anything else.
+    aliases = {"%rdi"}
+    reads, writes = {}, {}
+    for line in disassemble(lib, addr, size):
+        body = line.split("\t", 1)[-1].strip() if "\t" in line else line.strip()
+
+        copy = re.match(r"mov\s+%rdi,(%r[a-z0-9]+)$", body)
+        if copy:
+            aliases.add(copy.group(1))
+        else:
+            clobber = re.match(r"\S+\s+.*,(%r[a-z0-9]+)$", body)
+            if clobber and clobber.group(1) in aliases and clobber.group(1) != "%rdi":
+                aliases.discard(clobber.group(1))
+
+        m = re.search(r"(-?0x[0-9a-f]+)\((%r[a-z0-9]+)\)", body)
+        if not m or m.group(2) not in aliases:
+            continue
+        offset = int(m.group(1), 16)
+        table = writes if re.match(r"mov\S*\s+%\w+,-?0x", body) else reads
+        table.setdefault(offset, body)
+
+    for label, table in (("writes", writes), ("reads ", reads)):
+        for offset in sorted(table):
+            print("  %s this+0x%-4x   %s" % (label, offset, table[offset]))
+    if not reads and not writes:
+        print("  no member access through `this` found in this function")
+    print("")
+    print("  registers treated as `this`: %s" % " ".join(sorted(aliases)))
+    print("  access through a pointer loaded FROM a member is not followed - one level only.")
+
+
+def cmd_calls(args):
+    """What a function calls, in order. The routing, straight out of the text section."""
+    if not args:
+        sys.exit("usage: rmap calls <function>")
+    lib, addr, size, name = one_symbol(args[0])
+    print(name)
+    print("  [%s] 0x%x, %d bytes" % (lib, addr, size))
+    print("")
+    con = db()
+    seen = 0
+    for line in disassemble(lib, addr, size):
+        body = line.split("\t", 1)[-1].strip() if "\t" in line else line.strip()
+        if not body.startswith("call"):
+            continue
+        seen += 1
+        m = re.search(r"<([^>+]+)(\+0x[0-9a-f]+)?>", body)
+        if m:
+            mangled = m.group(1).replace("@plt", "")
+            row = con.execute("SELECT name FROM symbol WHERE mangled = ? LIMIT 1",
+                              (mangled,)).fetchone()
+            print("  %s" % (row[0] if row else mangled))
+            continue
+        m = re.search(r"call\s+\*(0x[0-9a-f]+)\(", body)
+        if m:
+            print("  virtual, vtable slot %s   (vtable symbol offset +0x%x)"
+                  % (m.group(1), int(m.group(1), 16) + 0x10))
+            continue
+        print("  %s" % body)
+    if seen == 0:
+        print("  no calls")
+
+
+COMMANDS = {
+    "vtable": cmd_vtable, "slot": cmd_slot, "where": cmd_where, "find": cmd_find,
+    "class": cmd_class, "sym": cmd_sym, "members": cmd_members, "calls": cmd_calls,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+    handler = COMMANDS.get(sys.argv[1])
+    if handler is None:
+        sys.exit("unknown command %r - one of %s" % (sys.argv[1], ", ".join(COMMANDS)))
+    handler(sys.argv[2:])
