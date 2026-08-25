@@ -199,6 +199,9 @@ struct ClaimedEffect {
     // This effect's editor, not the bridge's. See BridgeEditorShowFor.
     std::atomic<bool> editor_wanted{false};
     std::atomic<bool> editor_shown{false};
+
+    // The BMDAudioPluginImpl base, which is where Resolve keeps this effect's channel counts.
+    void* primary_base = nullptr;
 };
 
 // Fills both encodings from one name.
@@ -1535,6 +1538,37 @@ namespace {
 // How many leading channels are genuinely usable: both ends of the block readable, and both ends
 // writable. Returns a count rather than a yes or no, because Resolve providing fewer channels than
 // the plugin wants is normal and must not cost the whole block.
+// How many channels Resolve really gave this effect.
+//
+// Read, never guessed. BMDAudioPluginImpl::UpdateChannelCount(int, int) writes both counts onto the
+// object, clamped by the plugin's own maxima:
+//
+//   4eb952:  mov %rax,0x150(%rbx)     # input channels
+//   4eb975:  mov %rsi,0x158(%rbx)     # output channels
+//
+// and BMDStereoDelay::Process loops its channels against 0x158(%r12). Both are 64-bit.
+//
+// This replaces a probe that walked the buffer array one entry at a time and stopped when an entry
+// failed a write test. That probe read `buffers[1]` before knowing whether index 1 existed - eight
+// bytes past the end of a one-entry array - and when those bytes happened to hold a writable
+// address, the block was copied over it. The crash then appeared on Resolve's mixing thread, in
+// AddChannelSourceToChannelBus, dereferencing a channel pointer that had never been filled.
+constexpr size_t kInputChannelCountOffset = 0x150;
+constexpr size_t kOutputChannelCountOffset = 0x158;
+unsigned int ChannelsResolveGave(const ClaimedEffect* effect, bool output)
+{
+    if (effect == nullptr || effect->primary_base == nullptr) {
+        return 0;
+    }
+    const auto* const field = static_cast<const unsigned char*>(effect->primary_base) +
+                              (output ? kOutputChannelCountOffset : kInputChannelCountOffset);
+    unsigned long count = 0;
+    if (!SafeRead(field, &count, sizeof(count))) {
+        return 0;
+    }
+    return count <= kMaxChannels ? static_cast<unsigned int>(count) : 0;
+}
+
 unsigned int UsableChannels(float** buffers, unsigned int wanted, unsigned long frames)
 {
     if (buffers == nullptr || frames == 0) {
@@ -1578,7 +1612,12 @@ extern "C" void BridgeBeforeProcess(void* self, const void* timebase, float** in
         effect->dry_frames = 0;
         return;
     }
-    const unsigned int wanted = UsableChannels(input, asked, frames);
+    const unsigned int given = ChannelsResolveGave(effect, false);
+    if (given == 0) {
+        effect->dry_frames = 0;
+        return;  // the count is unreadable; touching the array would be the old guess again
+    }
+    const unsigned int wanted = UsableChannels(input, asked < given ? asked : given, frames);
     if (wanted == 0) {
         effect->dry_frames = 0;
         return;
@@ -1616,16 +1655,21 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
         return;
     }
 
-    // Only the channels Resolve really gave us, proven writable.
-    const unsigned int wanted = UsableChannels(output, asked, frames);
+    // Only the channels Resolve really gave us: the count comes off the object, and the buffers
+    // are then proven writable at both ends before anything is copied into them.
+    const unsigned int given = ChannelsResolveGave(effect, true);
+    if (given == 0) {
+        return;
+    }
+    const unsigned int wanted = UsableChannels(output, asked < given ? asked : given, frames);
     if (wanted == 0) {
         return;
     }
     static unsigned int reported_short = 0;
     if (wanted < asked && reported_short < 3) {
         ++reported_short;
-        Log("audio: Resolve provided %u of the %u channels \"%s\" wants", wanted, asked,
-            effect->plugin->Name());
+        Log("audio: Resolve provided %u of the %u channels \"%s\" wants (it reports %u out)",
+            wanted, asked, effect->plugin->Name(), given);
     }
 
     if (asked > kMaxChannels ||
@@ -2219,6 +2263,10 @@ int ClaimInstance(void* instance)
         }
     } else {
         Log("effect: more than %zu effects claimed, this one gets no plugin", kMaxClaimedEffects);
+    }
+
+    if (entry != nullptr) {
+        entry->primary_base = primary_base;
     }
 
     NameInstance(audio_plugin_subobject, entry);
