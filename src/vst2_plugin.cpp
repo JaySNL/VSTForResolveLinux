@@ -2,6 +2,7 @@
 
 #include "plugin_instance.h"
 
+#include "host_thread.h"
 #include "plugin_window.h"
 #include "vst2_abi.h"
 #include "clap_plugin.h"
@@ -32,7 +33,7 @@ void Log(const char* format, ...)
     }
 }
 
-class Vst2Plugin final : public HostedPlugin {
+class Vst2Plugin final : public HostedPlugin, public HostMainClient {
 public:
     ~Vst2Plugin() override
     {
@@ -42,6 +43,12 @@ public:
                 Dispatch(kEffEditClose, 0, 0, nullptr, 0.0f);
             }
             Dispatch(kEffClose, 0, 0, nullptr, 0.0f);
+        }
+        // Deregister under the host lock, in that order, so a tick cannot land on a destroyed
+        // object. This runs after kEffEditClose, so the plugin is already done with its editor.
+        {
+            std::lock_guard<std::mutex> held(HostMainLock());
+            HostMainUnregister(this);
         }
         // The window goes after the editor is closed, never before: a plugin still drawing into a
         // destroyed window faults inside its own toolkit.
@@ -193,11 +200,36 @@ public:
         }
         PluginWindowFlush(window_);
         editor_open_ = true;
+
+        // Without this the window draws once and then hears nothing.
+        //
+        // A VST2 editor pumps its own event handling from effEditIdle, and the host is the only
+        // thing that calls it. A Windows plugin bridged by yabridge needs it doubly: that call
+        // is what lets the Wine side process its message queue. The symptom is exact - the GUI
+        // appears, and no knob responds.
+        //
+        // 20 ms is a normal editor idle rate. It goes on the shared host main thread, never a
+        // thread of its own: one thread per plugin inside one library is the crash this bridge
+        // already paid for once.
+        HostMainRegister(this, 20);
+
         Log("vst2: editor open for \"%s\" at %ux%u", name_, width, height);
         return true;
     }
 
-    void CloseEditor() override { PluginWindowHide(window_); }
+    void CloseEditor() override
+    {
+        std::lock_guard<std::mutex> held(HostMainLock());
+        PluginWindowHide(window_);
+    }
+
+    // From the host main thread, with HostMainLock() already held.
+    void OnHostMainTick() override
+    {
+        if (effect_ != nullptr && editor_open_) {
+            Dispatch(kEffEditIdle, 0, 0, nullptr, 0.0f);
+        }
+    }
 
 private:
     intptr_t Dispatch(int32_t opcode, int32_t index, intptr_t value, void* ptr, float opt)

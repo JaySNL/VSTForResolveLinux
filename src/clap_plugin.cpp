@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "host_thread.h"
 #include "plugin_window.h"
 
 namespace {
@@ -114,31 +115,6 @@ void ReleaseLibrary(LoadedLibrary* library)
     delete library;
 }
 
-class ClapPlugin;
-
-// One main thread for the whole host, not one per plugin.
-//
-// CLAP's "main thread" is singular and host-wide. A timer thread per plugin breaks that by
-// construction: two effects on one .clap put two threads inside one library, and a plugin's GUI
-// toolkit is process-global - a font cache, a widget list, a drawing context. Resolve died on
-// 2026-08-25 with the fault four frames inside pp-track's GUI code, under our timer thread, with
-// a per-plugin mutex already in place. The mutex was right; its scope was wrong.
-//
-// Lock order is always g_main_lock then g_timer_lock. The timer thread holds g_main_lock for a
-// whole pass and takes g_timer_lock inside it only to copy the client list; a plugin being
-// destroyed takes the two in the same order, so it cannot be torn down mid-tick.
-std::mutex g_main_lock;
-std::mutex g_timer_lock;
-std::vector<ClapPlugin*> g_timer_clients;
-std::thread g_timer_thread;
-std::atomic<bool> g_timer_running{false};
-std::atomic<uint32_t> g_timer_period{16};
-
-// True only on the shared timer thread. Cheaper and less racy than publishing its id.
-thread_local bool t_is_host_main_thread = false;
-
-void TimerThread();
-
 constexpr uint32_t kMaxParameters = 128;
 
 // A knob turn arrives on Resolve's UI thread; CLAP requires the change to reach the plugin as an
@@ -152,15 +128,15 @@ struct PendingParameter {
     double maximum{1.0};
 };
 
-class ClapPlugin final : public HostedPlugin {
+class ClapPlugin final : public HostedPlugin, public HostMainClient {
 public:
     ~ClapPlugin() override
     {
-        // g_main_lock first, then the client list - the same order the timer thread takes them.
-        // Taking the lock waits for any pass that is currently inside this plugin, and only then
-        // is this plugin removed from the list, so a tick can never land on a destroyed object.
-        std::lock_guard<std::mutex> held(g_main_lock);
-        RemoveTimerClient();
+        // The host lock first, then deregistration - the same order the tick thread takes them.
+        // Taking the lock waits for any pass currently inside this plugin, and only then is it
+        // removed from the list, so a tick can never land on a destroyed object.
+        std::lock_guard<std::mutex> held(HostMainLock());
+        HostMainUnregister(this);
         if (plugin_ != nullptr) {
             if (gui_created_) {
                 const auto* const gui = static_cast<const clap_plugin_gui_t*>(
@@ -326,7 +302,7 @@ public:
         if (plugin_ == nullptr) {
             return false;
         }
-        std::lock_guard<std::mutex> held(g_main_lock);
+        std::lock_guard<std::mutex> held(HostMainLock());
         const auto* const gui = static_cast<const clap_plugin_gui_t*>(
             plugin_->get_extension(plugin_, CLAP_EXT_GUI));
         if (gui == nullptr) {
@@ -385,12 +361,12 @@ public:
 
     void CloseEditor() override
     {
-        std::lock_guard<std::mutex> held(g_main_lock);
+        std::lock_guard<std::mutex> held(HostMainLock());
         PluginWindowHide(window_);
     }
 
-    // One idle tick. Called only by the shared timer thread, which already holds g_main_lock.
-    void Tick()
+    // One idle tick, from the host main thread with HostMainLock() already held.
+    void OnHostMainTick() override
     {
         if (plugin_ == nullptr) {
             return;
@@ -461,33 +437,7 @@ private:
 
     // Register with the shared timer, and leave it. Neither joins a thread, so a plugin may call
     // either one from inside on_timer without a thread joining itself.
-    void AddTimerClient(uint32_t period_ms)
-    {
-        std::lock_guard<std::mutex> held(g_timer_lock);
-        if (period_ms != 0 && period_ms < g_timer_period.load()) {
-            g_timer_period.store(period_ms);
-        }
-        for (const ClapPlugin* client : g_timer_clients) {
-            if (client == this) {
-                return;
-            }
-        }
-        g_timer_clients.push_back(this);
-        if (!g_timer_running.exchange(true)) {
-            g_timer_thread = std::thread(TimerThread);
-        }
-    }
 
-    void RemoveTimerClient()
-    {
-        std::lock_guard<std::mutex> held(g_timer_lock);
-        for (size_t index = 0; index < g_timer_clients.size(); ++index) {
-            if (g_timer_clients[index] == this) {
-                g_timer_clients.erase(g_timer_clients.begin() + static_cast<long>(index));
-                return;
-            }
-        }
-    }
 
     // --- the callbacks the plugin sees. host_data carries the object. --------------------------
 
@@ -504,7 +454,7 @@ private:
         }
         *out_id = 1;
         self->timer_id_.store(1);
-        self->AddTimerClient(period_ms);
+        HostMainRegister(self, period_ms);
         return true;
     }
 
@@ -512,7 +462,7 @@ private:
     {
         ClapPlugin* const self = From(host);
         if (self != nullptr) {
-            self->RemoveTimerClient();
+            HostMainUnregister(self);
         }
         return true;
     }
@@ -535,7 +485,8 @@ private:
         // main. Answering "no" there is not a white lie: clap_host_thread_check would then
         // report it as the AUDIO thread, and a plugin doing GUI work in on_timer would be told
         // it was on the wrong thread for exactly that work.
-        return t_is_host_main_thread || std::this_thread::get_id() == self->main_thread_id_;
+        return HostMainIsCurrentThread() ||
+               std::this_thread::get_id() == self->main_thread_id_;
     }
     static bool HostIsAudioThread(const clap_host_t* host) { return !HostIsMainThread(host); }
 
@@ -604,32 +555,6 @@ private:
     clap_output_events_t out_events_{};
 };
 
-// Ticks every registered plugin in turn, on one thread, under one lock.
-//
-// The list is copied before the pass rather than held across the calls: a plugin is entitled to
-// register or unregister from inside its own on_timer, and that would otherwise invalidate the
-// iterator mid-loop.
-void TimerThread()
-{
-    t_is_host_main_thread = true;
-    while (g_timer_running.load()) {
-        const uint32_t period = g_timer_period.load();
-        std::this_thread::sleep_for(std::chrono::milliseconds(period != 0 ? period : 16));
-        if (!g_timer_running.load()) {
-            break;
-        }
-        std::lock_guard<std::mutex> main(g_main_lock);
-        std::vector<ClapPlugin*> clients;
-        {
-            std::lock_guard<std::mutex> held(g_timer_lock);
-            clients = g_timer_clients;
-        }
-        for (ClapPlugin* client : clients) {
-            client->Tick();
-        }
-    }
-}
-
 }  // namespace
 
 HostedPlugin* CreateClapPlugin(const char* path, double sample_rate, uint32_t max_frames)
@@ -643,4 +568,8 @@ HostedPlugin* CreateClapPlugin(const char* path, double sample_rate, uint32_t ma
     return nullptr;
 }
 
-void ClapPluginSetLogger(void (*logger)(const char*)) { g_logger = logger; }
+void ClapPluginSetLogger(void (*logger)(const char*))
+{
+    g_logger = logger;
+    HostThreadSetLogger(logger);
+}
