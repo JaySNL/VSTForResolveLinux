@@ -1,6 +1,7 @@
 #include "host_thread.h"
 
 #include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -80,6 +81,44 @@ void HostMainUnregister(HostMainClient* client)
         }
     }
 }
+
+// A std::thread destroyed while still joinable calls std::terminate(). g_thread is a global, so
+// its destructor runs at shutdown - and until this existed, it ran on a joinable thread every
+// single time. The tick could also still be calling OnHostMainTick() on plugin objects that had
+// already been destroyed. Both show up as a host that will not quit cleanly.
+void HostMainStop()
+{
+    if (!g_running.exchange(false)) {
+        return;  // never started, or already stopped
+    }
+    // Empty the list first. A pass already under way then has nothing left to call, so no tick can
+    // reach a half-destroyed plugin while we wait.
+    {
+        std::lock_guard<std::mutex> held(g_client_lock);
+        g_clients.clear();
+    }
+    if (g_thread.joinable() && !t_is_host_main) {
+        g_thread.join();
+    }
+}
+
+namespace {
+
+// Declared after g_thread, so it is destroyed before it. That ordering is the whole point: the
+// stop has to happen while the thread object is still alive to be joined.
+struct StopOnUnload {
+    ~StopOnUnload()
+    {
+        std::fprintf(stderr, "[fxbridge] teardown: stopping the host main thread\n");
+        std::fflush(stderr);
+        HostMainStop();
+        std::fprintf(stderr, "[fxbridge] teardown: the host main thread is stopped\n");
+        std::fflush(stderr);
+    }
+};
+StopOnUnload g_stop_on_unload;
+
+}  // namespace
 
 bool HostMainIsCurrentThread() { return t_is_host_main; }
 

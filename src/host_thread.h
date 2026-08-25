@@ -29,6 +29,12 @@ void HostMainRegister(HostMainClient* client, unsigned int period_ms);
 // Safe to call from inside OnHostMainTick: nothing is joined, only the list is edited.
 void HostMainUnregister(HostMainClient* client);
 
+// Stops the thread and joins it. Called for you when the library goes away; exposed because a
+// loader may want the ticks to stop before it tears something down that a tick can reach.
+//
+// Nothing restarts after this except a fresh HostMainRegister.
+void HostMainStop();
+
 // True only on the host main thread. A loader's thread check must answer with this, not with
 // "no" - reporting the tick thread as anything else tells a plugin it is on the wrong thread
 // for the GUI work it is doing right then.

@@ -28,6 +28,10 @@ bool PluginWindowShow(PluginWindow* window);
 // Hides without destroying: the plugin's editor lives inside, and reopening should be a remap.
 void PluginWindowHide(PluginWindow* window);
 
+// Resizes the parent. A VST3 editor asks for this through IPlugFrame::resize_view, and a host that
+// ignores the request leaves the plugin drawing into a window of the wrong size.
+void PluginWindowResize(PluginWindow* window, unsigned int width, unsigned int height);
+
 // Destroys it. The plugin must have released its editor first, or it is left drawing into a window
 // that no longer exists.
 void PluginWindowDestroy(PluginWindow* window);
