@@ -1555,6 +1555,32 @@ namespace {
 // AddChannelSourceToChannelBus, dereferencing a channel pointer that had never been filled.
 constexpr size_t kInputChannelCountOffset = 0x150;
 constexpr size_t kOutputChannelCountOffset = 0x158;
+
+// The bypass switch on the effect's own header.
+//
+// Bypassing an effect in Fairlight does NOT stop Resolve calling Process. The stock effect is
+// still driven every block and checks this byte itself, taking a pass-through path when it is
+// set - BMDStereoDelay::Process opens with `cmpb $0x0,0x169(%r12)`. Our hook sits on the same
+// Process slot, so without this check the hosted plugin kept processing a "bypassed" effect.
+//
+// Read out of BMDAudioPluginImpl::Bypass(bool), which is the only writer:
+//
+//   4eebc0+:  mov %sil,0x169(%rdi)
+constexpr size_t kBypassFlagOffset = 0x169;
+
+bool EffectIsBypassed(const ClaimedEffect* effect)
+{
+    if (effect == nullptr || effect->primary_base == nullptr) {
+        return false;
+    }
+    unsigned char flag = 0;
+    const auto* const field =
+        static_cast<const unsigned char*>(effect->primary_base) + kBypassFlagOffset;
+    if (!SafeRead(field, &flag, sizeof(flag))) {
+        return false;  // unreadable is not "bypassed" - do not silence audio on a failed read
+    }
+    return flag != 0;
+}
 unsigned int ChannelsResolveGave(const ClaimedEffect* effect, bool output)
 {
     if (effect == nullptr || effect->primary_base == nullptr) {
@@ -1612,6 +1638,10 @@ extern "C" void BridgeBeforeProcess(void* self, const void* timebase, float** in
         effect->dry_frames = 0;
         return;
     }
+    if (EffectIsBypassed(effect)) {
+        effect->dry_frames = 0;
+        return;
+    }
     const unsigned int given = ChannelsResolveGave(effect, false);
     if (given == 0) {
         effect->dry_frames = 0;
@@ -1652,6 +1682,17 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
 
     const unsigned int asked = effect->plugin->ChannelCount();
     if (asked == 0 || output == nullptr || frames == 0 || frames > kMaxFrames) {
+        return;
+    }
+
+    // Bypassed: leave the block exactly as Resolve produced it. The stock effect has already
+    // passed the audio through, so doing nothing here is what bypass means.
+    if (EffectIsBypassed(effect)) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            Log("audio: the effect is bypassed - the hosted plugin is out of the path");
+        }
         return;
     }
 
