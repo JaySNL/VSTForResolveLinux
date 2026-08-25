@@ -48,6 +48,47 @@ std::atomic<bool> g_pump_running{false};
 std::mutex g_lock;
 std::vector<PluginWindow*> g_windows;
 
+// Hand input focus to the window the plugin actually draws in.
+//
+// The plugin embeds a child window inside ours and that child selects ButtonPress and KeyPress
+// itself - measured on 2026-08-25 with a window-tree dump: yabridge's child had both masks and
+// was viewable, and the GUI rendered perfectly. What it never got was focus, which stayed on our
+// parent. A Windows plugin under Wine treats an unfocused window as inactive and ignores input,
+// so the editor drew correctly and answered nothing.
+//
+// Every embedding host does this. Walk down to the deepest first child and focus that: yabridge
+// nests one wrapper window between our parent and the plugin's own.
+void ForwardFocusLocked(Window parent)
+{
+    if (g_display == nullptr || parent == 0) {
+        return;
+    }
+    Window target = parent;
+    for (int depth = 0; depth < 8; ++depth) {
+        Window root = 0, up = 0, *children = nullptr;
+        unsigned int count = 0;
+        if (!XQueryTree(g_display, target, &root, &up, &children, &count) || children == nullptr) {
+            break;
+        }
+        const Window first = count > 0 ? children[0] : 0;
+        XFree(children);
+        if (first == 0) {
+            break;
+        }
+        target = first;
+    }
+    if (target == parent) {
+        return;  // nothing embedded yet
+    }
+    XWindowAttributes attributes;
+    if (!XGetWindowAttributes(g_display, target, &attributes) ||
+        attributes.map_state != IsViewable) {
+        return;  // focusing an unviewable window is a BadMatch
+    }
+    XSetInputFocus(g_display, target, RevertToParent, CurrentTime);
+    XFlush(g_display);
+}
+
 PluginWindow* FindLocked(Window handle)
 {
     for (PluginWindow* window : g_windows) {
@@ -69,6 +110,17 @@ void EventPump()
             while (g_display != nullptr && XPending(g_display) > 0) {
                 XEvent event;
                 XNextEvent(g_display, &event);
+
+                // The moment this window becomes current, the plugin inside it gets the focus.
+                if (event.type == FocusIn) {
+                    ForwardFocusLocked(event.xfocus.window);
+                    continue;
+                }
+                if (event.type == EnterNotify) {
+                    ForwardFocusLocked(event.xcrossing.window);
+                    continue;
+                }
+
                 if (event.type != ClientMessage ||
                     static_cast<Atom>(event.xclient.data.l[0]) != g_delete_window) {
                     continue;
@@ -124,7 +176,10 @@ PluginWindow* PluginWindowCreate(unsigned int width, unsigned int height, const 
     }
 
     XStoreName(g_display, handle, title != nullptr ? title : "Plugin");
-    XSelectInput(g_display, handle, StructureNotifyMask);
+    // FocusChange and Enter as well as Structure: the parent has to know when it becomes the
+    // focused window, so it can hand focus down to the plugin. See ForwardFocusLocked.
+    XSelectInput(g_display, handle,
+                 StructureNotifyMask | FocusChangeMask | EnterWindowMask);
     XSetWMProtocols(g_display, handle, &g_delete_window, 1);
     XMapRaised(g_display, handle);
     XFlush(g_display);
@@ -154,6 +209,7 @@ bool PluginWindowShow(PluginWindow* window)
     XMapRaised(g_display, window->handle);
     XFlush(g_display);
     window->mapped = true;
+    ForwardFocusLocked(window->handle);
     return true;
 }
 
