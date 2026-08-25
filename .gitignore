@@ -1,3 +1,5 @@
+# Note: do NOT ignore "dpf" here. A bare pattern matches third_party/dpf, which kept
+# that submodule's gitlink out of the index while .gitmodules still declared it - so a
+# fresh clone got no travesty headers and could not build.
 build/
-dpf
 tools/xtree/xtree
