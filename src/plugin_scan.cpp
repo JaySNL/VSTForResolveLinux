@@ -1,5 +1,7 @@
 #include "plugin_scan.h"
 
+#include "vst3_plugin.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
@@ -253,19 +255,84 @@ const char* FormatName(PluginFormat format)
 
 // Which formats reach the menu.
 //
-// VST3 is scanned but not listed by default, because CreateHostedPlugin cannot host it yet: an
-// entry that loads nothing is worse than an absent one. Set FXBRIDGE_SCAN_FORMATS to a list such
-// as "clap,vst2,vst3" to change that, and change the default here once the VST3 host lands.
+// All three are listed. VST3 used to be scanned but withheld, because CreateHostedPlugin could not
+// host it; that host landed on 2026-08-25 (IPlugFrame + IRunLoop for the editor, IConnectionPoint
+// to join component and controller) and Windows VST3 now loads through yabridge as well.
+//
+// Leaving the old default in place cost a whole diagnosis: Resolve started without the variable
+// set, twenty-one VST3 entries silently vanished from a menu that had listed them minutes before,
+// and the missing entries read as a regression in the scanner rather than as this switch.
+// Set FXBRIDGE_SCAN_FORMATS to a subset such as "clap,vst2" to narrow it again.
 bool FormatIsListed(PluginFormat format)
 {
     const char* const setting = std::getenv("FXBRIDGE_SCAN_FORMATS");
-    const std::string list = setting != nullptr && setting[0] != '\0' ? setting : "clap,vst2";
+    const std::string list = setting != nullptr && setting[0] != '\0' ? setting : "clap,vst2,vst3";
     switch (format) {
         case PluginFormat::Clap: return list.find("clap") != std::string::npos;
         case PluginFormat::Vst2: return list.find("vst2") != std::string::npos;
         case PluginFormat::Vst3: return list.find("vst3") != std::string::npos;
         default: return false;
     }
+}
+
+// Which plugins inside a shell reach the menu.
+//
+// A shell is one file that publishes many plugins. The Waves WaveShell publishes 718, and listing
+// all of them would bury the other fifty-five entries in the effect menu. So a shell is expanded
+// only through a filter file, one pattern per line, matched as a substring of the class name:
+//
+//   ~/.local/share/BMDAudioPlugins/fxbridge-shell-allow.txt
+//
+// A line starting with # is a comment. With no file, a shell contributes its first class only -
+// the old behaviour, and never a menu full of plugins nobody asked for. An empty file means the
+// same thing, deliberately: "allow nothing" has to be sayable.
+const std::vector<std::string>& ShellAllowList(bool& configured)
+{
+    static std::vector<std::string> patterns;
+    static bool loaded = false;
+    static bool present = false;
+    if (!loaded) {
+        loaded = true;
+        const char* const home = std::getenv("HOME");
+        if (home != nullptr) {
+            const std::string path =
+                std::string(home) + "/.local/share/BMDAudioPlugins/fxbridge-shell-allow.txt";
+            if (std::FILE* const file = std::fopen(path.c_str(), "re")) {
+                present = true;
+                char line[512];
+                while (std::fgets(line, sizeof(line), file) != nullptr) {
+                    std::string entry = line;
+                    while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r' ||
+                                              entry.back() == ' ' || entry.back() == '\t')) {
+                        entry.pop_back();
+                    }
+                    size_t start = 0;
+                    while (start < entry.size() && (entry[start] == ' ' || entry[start] == '\t')) {
+                        ++start;
+                    }
+                    entry = entry.substr(start);
+                    if (entry.empty() || entry[0] == '#') {
+                        continue;
+                    }
+                    patterns.push_back(entry);
+                }
+                std::fclose(file);
+                Log("scan: shell filter has %zu patterns", patterns.size());
+            }
+        }
+    }
+    configured = present;
+    return patterns;
+}
+
+bool ShellClassAllowed(const std::string& class_name, const std::vector<std::string>& patterns)
+{
+    for (const std::string& pattern : patterns) {
+        if (class_name.find(pattern) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::vector<ScannedPlugin> g_plugins;
@@ -327,6 +394,48 @@ void Scan()
                 name = name + suffix;
             }
         }
+        // A VST3 file may be a shell: one file, many plugins. Ask it before naming the entry,
+        // because a shell's file stem ("WaveShell1-VST3 17.1_x64") names nothing a user wants to
+        // pick. Enumeration does not create anything, so this is cheap - 718 classes came back from
+        // the WaveShell in 1.674 s, essentially all of it Wine starting behind yabridge.
+        std::vector<std::string> classes;
+        if (candidate.format == PluginFormat::Vst3) {
+            Vst3ListClasses(candidate.path.c_str(), classes);
+        }
+
+        if (classes.size() > 1) {
+            bool configured = false;
+            const std::vector<std::string>& patterns = ShellAllowList(configured);
+            int taken = 0;
+            for (const std::string& class_name : classes) {
+                if (configured) {
+                    if (!ShellClassAllowed(class_name, patterns)) {
+                        continue;
+                    }
+                } else if (taken > 0) {
+                    break;  // no filter: the first class only, never 718 menu entries
+                }
+                std::string entry = class_name;
+                if (seen.find(entry) != seen.end()) {
+                    char suffix[32];
+                    std::snprintf(suffix, sizeof(suffix), " (%d)", ++seen[entry]);
+                    entry += suffix;
+                }
+                ++seen[entry];
+                ScannedPlugin plugin;
+                plugin.path = candidate.path;
+                plugin.name = entry;
+                plugin.key = entry + kEffectIdSuffix;
+                plugin.class_name = class_name;
+                plugin.format = candidate.format;
+                g_plugins.push_back(plugin);
+                ++taken;
+            }
+            Log("scan: %s is a shell with %zu plugins, %d listed", candidate.path.c_str(),
+                classes.size(), taken);
+            continue;
+        }
+
         ++seen[name];
         ScannedPlugin plugin;
         plugin.path = candidate.path;

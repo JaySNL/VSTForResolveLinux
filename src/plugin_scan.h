@@ -20,6 +20,8 @@ struct ScannedPlugin {
     std::string path;  // what CreateHostedPlugin is given: a .clap or .so file, or a .vst3 bundle
     std::string name;  // what the menu reads, made unique across the whole scan
     std::string key;   // "<name>:1112360057" - the effect id Resolve stores in the project
+    // Which plugin inside the file, for a VST3 shell. Empty for everything else.
+    std::string class_name;
     PluginFormat format;
 };
 

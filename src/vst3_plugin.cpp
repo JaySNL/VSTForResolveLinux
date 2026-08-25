@@ -18,13 +18,16 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <poll.h>
 
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include "host_thread.h"
 #include "plugin_window.h"
 
 #include "base.h"
@@ -32,6 +35,7 @@
 #include "component.h"
 #include "audio_processor.h"
 #include "edit_controller.h"
+#include "message.h"
 #include "view.h"
 #include "host.h"
 
@@ -185,10 +189,242 @@ std::string BinaryInsideBundle(const std::string& bundle)
 constexpr v3_speaker_arrangement kArrangementMono = 1;    // front left only
 constexpr v3_speaker_arrangement kArrangementStereo = 3;  // front left and front right
 
-class Vst3Plugin final : public HostedPlugin {
+
+// --- the run loop a Linux VST3 editor needs -------------------------------------------------------
+//
+// VST3 on Linux puts the event loop in the host's hands. A plugin's editor hands the host the file
+// descriptor of its X11 connection plus its timers, and the host calls back. There is no polite
+// degradation if the host does not: DPF's attached() reads
+//
+//     DISTRHO_SAFE_ASSERT_RETURN(view->frame != nullptr, V3_INVALID_ARG);
+//     v3_cpp_obj_query_interface(view->frame, v3_run_loop_iid, &runloop);
+//     DISTRHO_SAFE_ASSERT_RETURN(runloop != nullptr, V3_INVALID_ARG);
+//
+// so a host that skips set_frame gets a refusal and an empty window. That is exactly what this
+// bridge showed on 2026-08-25: "attached() refused", and a black panel with a working audio path
+// behind it.
+//
+// The object carries two vtable pointers, the way a C++ class with two bases does. The view is
+// handed the frame face; the frame answers query_interface(IRunLoop) with the other face. Each
+// face holds a back pointer, so recovering the object never needs offsetof.
+
+class EditorRunLoop;
+
+extern const v3_plugin_frame_cpp kFrameVtable;
+extern const v3_run_loop_cpp kLoopVtable;
+
+class EditorRunLoop {
+public:
+    struct FrameFace {
+        const v3_plugin_frame_cpp* vtable;
+        EditorRunLoop* owner;
+    };
+    struct LoopFace {
+        const v3_run_loop_cpp* vtable;
+        EditorRunLoop* owner;
+    };
+
+    EditorRunLoop()
+    {
+        frame_face_.vtable = &kFrameVtable;
+        frame_face_.owner = this;
+        loop_face_.vtable = &kLoopVtable;
+        loop_face_.owner = this;
+    }
+
+    v3_plugin_frame** Frame() { return reinterpret_cast<v3_plugin_frame**>(&frame_face_); }
+
+    // Called on the host main thread with HostMainLock() held, like every other loader's tick.
+    void Service()
+    {
+        // Copy before calling out: a handler may unregister itself from inside its own callback.
+        const std::vector<Handler> handlers = handlers_;
+        if (!handlers.empty()) {
+            std::vector<pollfd> slots;
+            slots.reserve(handlers.size());
+            for (const Handler& entry : handlers) {
+                pollfd slot{};
+                slot.fd = entry.fd;
+                slot.events = POLLIN;
+                slots.push_back(slot);
+            }
+            if (poll(slots.data(), slots.size(), 0) > 0) {
+                for (size_t index = 0; index < handlers.size(); ++index) {
+                    if (slots[index].revents == 0) {
+                        continue;
+                    }
+                    auto* const vt =
+                        *reinterpret_cast<v3_event_handler_cpp**>(handlers[index].handler);
+                    vt->handler.on_fd_is_set(handlers[index].handler, handlers[index].fd);
+                }
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const std::vector<Timer> due = timers_;
+        for (const Timer& entry : due) {
+            if (entry.due > now) {
+                continue;
+            }
+            auto* const vt = *reinterpret_cast<v3_timer_handler_cpp**>(entry.handler);
+            vt->timer.on_timer(entry.handler);
+        }
+        for (Timer& entry : timers_) {
+            if (entry.due <= now) {
+                entry.due = now + entry.period;
+            }
+        }
+    }
+
+    // The plugin is expected to unregister on removed(). This is the belt for the times it does
+    // not: a stale handler is a call into a freed editor on the next tick.
+    void Forget()
+    {
+        handlers_.clear();
+        timers_.clear();
+    }
+
+    static v3_result V3_API FrameQueryInterface(void* self, const v3_tuid iid, void** obj)
+    {
+        EditorRunLoop* const loop = static_cast<FrameFace*>(self)->owner;
+        if (std::memcmp(iid, v3_funknown_iid, sizeof(v3_tuid)) == 0 ||
+            std::memcmp(iid, v3_plugin_frame_iid, sizeof(v3_tuid)) == 0) {
+            *obj = self;
+            return V3_OK;
+        }
+        if (std::memcmp(iid, v3_run_loop_iid, sizeof(v3_tuid)) == 0) {
+            *obj = &loop->loop_face_;
+            return V3_OK;
+        }
+        *obj = nullptr;
+        return V3_NO_INTERFACE;
+    }
+
+    static v3_result V3_API LoopQueryInterface(void* self, const v3_tuid iid, void** obj)
+    {
+        EditorRunLoop* const loop = static_cast<LoopFace*>(self)->owner;
+        if (std::memcmp(iid, v3_funknown_iid, sizeof(v3_tuid)) == 0 ||
+            std::memcmp(iid, v3_run_loop_iid, sizeof(v3_tuid)) == 0) {
+            *obj = self;
+            return V3_OK;
+        }
+        if (std::memcmp(iid, v3_plugin_frame_iid, sizeof(v3_tuid)) == 0) {
+            *obj = &loop->frame_face_;
+            return V3_OK;
+        }
+        *obj = nullptr;
+        return V3_NO_INTERFACE;
+    }
+
+    // The editor asks to grow or shrink. The host owns the parent window, so the host resizes it
+    // and then tells the view the size it got.
+    static v3_result V3_API FrameResizeView(void* self, v3_plugin_view** view, v3_view_rect* rect)
+    {
+        EditorRunLoop* const loop = static_cast<FrameFace*>(self)->owner;
+        if (view == nullptr || rect == nullptr) {
+            return V3_INVALID_ARG;
+        }
+        const int32_t width = rect->right - rect->left;
+        const int32_t height = rect->bottom - rect->top;
+        if (width <= 0 || height <= 0) {
+            return V3_INVALID_ARG;
+        }
+        if (loop->window != nullptr) {
+            PluginWindowResize(loop->window, static_cast<unsigned int>(width),
+                               static_cast<unsigned int>(height));
+        }
+        auto* const vt = *reinterpret_cast<v3_plugin_view_cpp**>(view);
+        vt->view.on_size(view, rect);
+        return V3_OK;
+    }
+
+    static v3_result V3_API LoopRegisterEventHandler(void* self, v3_event_handler** handler, int fd)
+    {
+        EditorRunLoop* const loop = static_cast<LoopFace*>(self)->owner;
+        if (handler == nullptr || fd < 0) {
+            return V3_INVALID_ARG;
+        }
+        loop->handlers_.push_back(Handler{handler, fd});
+        return V3_OK;
+    }
+
+    static v3_result V3_API LoopUnregisterEventHandler(void* self, v3_event_handler** handler)
+    {
+        EditorRunLoop* const loop = static_cast<LoopFace*>(self)->owner;
+        for (size_t index = 0; index < loop->handlers_.size(); ++index) {
+            if (loop->handlers_[index].handler == handler) {
+                loop->handlers_.erase(loop->handlers_.begin() + static_cast<long>(index));
+                return V3_OK;
+            }
+        }
+        return V3_INVALID_ARG;
+    }
+
+    static v3_result V3_API LoopRegisterTimer(void* self, v3_timer_handler** handler, uint64_t ms)
+    {
+        EditorRunLoop* const loop = static_cast<LoopFace*>(self)->owner;
+        if (handler == nullptr) {
+            return V3_INVALID_ARG;
+        }
+        // A zero period means "as often as you can", not "spin".
+        const auto period = std::chrono::milliseconds(ms == 0 ? 1 : ms);
+        loop->timers_.push_back(Timer{handler, period, std::chrono::steady_clock::now() + period});
+        return V3_OK;
+    }
+
+    static v3_result V3_API LoopUnregisterTimer(void* self, v3_timer_handler** handler)
+    {
+        EditorRunLoop* const loop = static_cast<LoopFace*>(self)->owner;
+        for (size_t index = 0; index < loop->timers_.size(); ++index) {
+            if (loop->timers_[index].handler == handler) {
+                loop->timers_.erase(loop->timers_.begin() + static_cast<long>(index));
+                return V3_OK;
+            }
+        }
+        return V3_INVALID_ARG;
+    }
+
+    PluginWindow* window = nullptr;
+
+private:
+    struct Handler {
+        v3_event_handler** handler;
+        int fd;
+    };
+    struct Timer {
+        v3_timer_handler** handler;
+        std::chrono::steady_clock::duration period;
+        std::chrono::steady_clock::time_point due;
+    };
+
+    FrameFace frame_face_{};
+    LoopFace loop_face_{};
+    std::vector<Handler> handlers_;
+    std::vector<Timer> timers_;
+};
+
+const v3_plugin_frame_cpp kFrameVtable = {
+    {EditorRunLoop::FrameQueryInterface, HostRef, HostUnref},
+    {EditorRunLoop::FrameResizeView},
+};
+
+const v3_run_loop_cpp kLoopVtable = {
+    {EditorRunLoop::LoopQueryInterface, HostRef, HostUnref},
+    {EditorRunLoop::LoopRegisterEventHandler, EditorRunLoop::LoopUnregisterEventHandler,
+     EditorRunLoop::LoopRegisterTimer, EditorRunLoop::LoopUnregisterTimer},
+};
+
+class Vst3Plugin final : public HostedPlugin, public HostMainClient {
 public:
     ~Vst3Plugin() override
     {
+        // Deregister first, and under the host lock: a tick that lands after the view is released
+        // calls into a freed editor. Same order as the VST2 loader, for the same reason.
+        {
+            std::lock_guard<std::mutex> held(HostMainLock());
+            HostMainUnregister(this);
+        }
+        run_loop_.Forget();
         if (view_ != nullptr) {
             auto* const vt = *reinterpret_cast<v3_plugin_view_cpp**>(view_);
             vt->view.removed(view_);
@@ -198,6 +434,16 @@ public:
             PluginWindowDestroy(window_);
             window_ = nullptr;
         }
+        // Disconnect before either side is terminated, in the reverse of the order they were
+        // joined. A connection left standing points at an object that is about to go away.
+        if (component_point_ != nullptr && controller_point_ != nullptr) {
+            auto* const a = *reinterpret_cast<v3_connection_point_cpp**>(component_point_);
+            auto* const b = *reinterpret_cast<v3_connection_point_cpp**>(controller_point_);
+            b->point.disconnect(controller_point_, component_point_);
+            a->point.disconnect(component_point_, controller_point_);
+        }
+        Release(controller_point_);
+        Release(component_point_);
         if (controller_ != nullptr) {
             auto* const vt = *reinterpret_cast<v3_edit_controller_cpp**>(controller_);
             vt->base.terminate(controller_);
@@ -221,8 +467,9 @@ public:
         // this host has no way to know whether another effect still holds one.
     }
 
-    bool Load(const char* path, double sample_rate, uint32_t max_frames)
+    bool Load(const char* path, const char* class_name, double sample_rate, uint32_t max_frames)
     {
+        wanted_class_ = class_name != nullptr ? class_name : "";
         const std::string binary = BinaryInsideBundle(path);
         if (binary.empty()) {
             Log("vst3: %s has no Contents/x86_64-linux binary", path);
@@ -302,7 +549,19 @@ public:
         data.outputs = &output;
 
         auto* const vt = *reinterpret_cast<v3_audio_processor_cpp**>(processor_);
-        return vt->proc.process(processor_, &data) == V3_OK;
+        // A bridged VST3 dies the same way a bridged VST2 does: yabridge throws when its Wine host
+        // is gone, and an exception leaving an audio callback aborts Resolve. One effect going
+        // quiet is the correct outcome.
+        try {
+            return vt->proc.process(processor_, &data) == V3_OK;
+        } catch (...) {
+            if (!threw_) {
+                threw_ = true;
+                Log("vst3: \"%s\" threw while processing - block dropped, still in the path",
+                    name_);
+            }
+            return false;
+        }
     }
 
     uint32_t ChannelCount() const override { return channel_count_; }
@@ -350,22 +609,53 @@ public:
             return false;
         }
 
-        if (vt->view.attached(view_, reinterpret_cast<void*>(handle),
-                              V3_VIEW_PLATFORM_TYPE_X11) != V3_OK) {
-            Log("vst3: attached() refused for \"%s\"", name_);
+        // set_frame comes before attached(), never after. On Linux the view uses the frame to
+        // find the host's run loop, and it looks for it inside attached() itself - so a frame
+        // handed over afterwards is handed over too late.
+        run_loop_.window = window_;
+        if (vt->view.set_frame(view_, run_loop_.Frame()) != V3_OK) {
+            Log("vst3: set_frame refused for \"%s\"", name_);
+        }
+
+        const v3_result attached = vt->view.attached(view_, reinterpret_cast<void*>(handle),
+                                                     V3_VIEW_PLATFORM_TYPE_X11);
+        if (attached != V3_OK) {
+            Log("vst3: attached() refused for \"%s\" with 0x%08x", name_,
+                static_cast<unsigned>(attached));
+            // Take the window down too. Leaving it up is the black panel this showed before.
             Release(view_);
+            run_loop_.window = nullptr;
+            PluginWindowDestroy(window_);
+            window_ = nullptr;
             return false;
         }
         PluginWindowFlush(window_);
+
+        // The editor is live now, so the run loop has to actually run. Its X11 socket and its
+        // timers were registered from inside attached(), and nothing services them until this.
+        HostMainRegister(this, 16);
+
         Log("vst3: editor open for \"%s\" at %ux%u", name_, width, height);
         return true;
     }
 
-    void CloseEditor() override { PluginWindowHide(window_); }
+    void CloseEditor() override
+    {
+        std::lock_guard<std::mutex> held(HostMainLock());
+        PluginWindowHide(window_);
+    }
+
+    // From the host main thread, with HostMainLock() already held.
+    void OnHostMainTick() override { run_loop_.Service(); }
 
 private:
-    // The first class the factory calls an Audio Module is the plugin. A bundle with several is
-    // rare outside instrument collections, and picking the first matches what the scanner named.
+    // Which Audio Module class in the file is the plugin.
+    //
+    // With no name asked for, the first one - which is right for an ordinary plugin, and is what
+    // this did before shells were supported. With a name, the class that carries it: a shell is one
+    // file that publishes many plugins, and the Waves WaveShell publishes 718 of them, so "the
+    // first class" would have meant one menu entry called "Immersive Wrapper Mono" standing in for
+    // the entire Waves catalogue.
     bool CreateComponent(const char* path)
     {
         auto* const factory_vt = *reinterpret_cast<v3_plugin_factory_cpp**>(factory_);
@@ -380,12 +670,32 @@ private:
             }
         }
 
+        // IPluginFactory3::set_host_context is deliberately NOT called here, and this is measured,
+        // not cautious. The spec makes seating the host context the host's job, so the call was
+        // added on 2026-08-25 — the factory accepted it (`set_host_context returned 0x00000000`)
+        // and then the very next call never returned. Resolve hung at "load project 100%" while
+        // restoring a saved ERA6 effect, and the project could not be opened at all. Without the
+        // call the same plugin merely refuses and its audio passes through, which is survivable.
+        //
+        // So the deadlock lives after the context is seated, not in the seating. yabridge's VST3
+        // wrapper calls back into the host context from the Wine side, and something on our side
+        // of that callback does not answer. Do not re-enable this until the callback path is
+        // understood; a hang that blocks project load is worse than a plugin that will not start.
+        // Stacks were unavailable at the time: yama ptrace_scope blocks eu-stack and gdb without
+        // root, so the next attempt needs `sudo sysctl kernel.yama.ptrace_scope=0` set first.
+        (void)v3_plugin_factory_3_iid;
+
+        bool saw_audio_module = false;
         for (int32_t index = 0; index < count; ++index) {
             v3_class_info info{};
             if (factory_vt->v1.get_class_info(factory_, index, &info) != V3_OK) {
                 continue;
             }
             if (std::strcmp(info.category, "Audio Module Class") != 0) {
+                continue;
+            }
+            saw_audio_module = true;
+            if (!wanted_class_.empty() && wanted_class_ != info.name) {
                 continue;
             }
 
@@ -399,8 +709,11 @@ private:
             component_ = static_cast<v3_component**>(created);
 
             auto* const vt = *reinterpret_cast<v3_component_cpp**>(component_);
-            if (vt->base.initialize(component_, g_host_context) != V3_OK) {
-                Log("vst3: initialize refused for \"%s\"", info.name);
+            const v3_result started = vt->base.initialize(component_, g_host_context);
+            if (started != V3_OK) {
+                // Print the code. "Refused" alone sent one diagnosis down the wrong path already.
+                Log("vst3: initialize refused for \"%s\" with 0x%08x", info.name,
+                    static_cast<unsigned>(started));
                 Release(component_);
                 continue;
             }
@@ -417,7 +730,17 @@ private:
             return true;
         }
 
-        Log("vst3: %s exposes no Audio Module class", path);
+        // Say which of the two happened. The old message claimed the bundle had no audio class even
+        // when a class was found and then rejected, which reads as a scanner fault instead of a
+        // host fault.
+        if (!wanted_class_.empty()) {
+            Log("vst3: %s publishes no Audio Module class called \"%s\"", path,
+                wanted_class_.c_str());
+        } else if (saw_audio_module) {
+            Log("vst3: %s has an Audio Module class but no instance would start", path);
+        } else {
+            Log("vst3: %s exposes no Audio Module class", path);
+        }
         return false;
     }
 
@@ -537,6 +860,41 @@ private:
             Log("vst3: controller initialize answered false for \"%s\"", name_);
         }
         vt->ctrl.set_component_handler(controller_, g_component_handler);
+        ConnectComponentAndController();
+    }
+
+    // In most plugins the component and the controller are two separate objects, and joining them
+    // is the host's job, not theirs. A controller that was never connected has never heard from its
+    // component - and a plugin in that state is entitled to refuse to build an editor, which is
+    // exactly what Accentize SpectralBalance2 did on 2026-08-25:
+    //
+    //     vst3: create_view returned nothing for "SpectralBalance2"
+    //
+    // A single-object plugin answers both queries with the same pointer. Connecting that to itself
+    // is not a no-op, it is a loop, so it is skipped.
+    void ConnectComponentAndController()
+    {
+        void* from_component = nullptr;
+        void* from_controller = nullptr;
+        if (!Query(component_, v3_connection_point_iid, &from_component) ||
+            !Query(controller_, v3_connection_point_iid, &from_controller)) {
+            return;  // one object, or a plugin that does not use messages at all
+        }
+        if (from_component == from_controller) {
+            Unknown(static_cast<v3_funknown**>(from_component))->unref(from_component);
+            Unknown(static_cast<v3_funknown**>(from_controller))->unref(from_controller);
+            return;
+        }
+
+        component_point_ = static_cast<v3_connection_point**>(from_component);
+        controller_point_ = static_cast<v3_connection_point**>(from_controller);
+
+        auto* const component_vt = *reinterpret_cast<v3_connection_point_cpp**>(component_point_);
+        auto* const controller_vt = *reinterpret_cast<v3_connection_point_cpp**>(controller_point_);
+        const v3_result one = component_vt->point.connect(component_point_, controller_point_);
+        const v3_result two = controller_vt->point.connect(controller_point_, component_point_);
+        Log("vst3: connected the component and the controller (0x%08x, 0x%08x)",
+            static_cast<unsigned>(one), static_cast<unsigned>(two));
     }
 
     v3_plugin_factory** factory_ = nullptr;
@@ -544,13 +902,19 @@ private:
     v3_audio_processor** processor_ = nullptr;
     v3_edit_controller** controller_ = nullptr;
     v3_plugin_view** view_ = nullptr;
+    v3_connection_point** component_point_ = nullptr;
+    v3_connection_point** controller_point_ = nullptr;
     PluginWindow* window_ = nullptr;
+    EditorRunLoop run_loop_;
 
+    // Only so the first throw is logged and the rest are not. It never disables the plugin.
+    bool threw_ = false;
     bool active_ = false;
     bool processing_ = false;
     uint32_t channel_count_ = 0;
     uint32_t max_frames_ = 0;
     char name_[128] = {0};
+    std::string wanted_class_;
     v3_tuid class_id_{};
 
     std::vector<float> scratch_;
@@ -559,14 +923,83 @@ private:
 
 }  // namespace
 
-HostedPlugin* CreateVst3Plugin(const char* path, double sample_rate, uint32_t max_frames)
+HostedPlugin* CreateVst3Plugin(const char* path, const char* class_name, double sample_rate,
+                               uint32_t max_frames)
 {
     auto* const plugin = new Vst3Plugin();
-    if (plugin->Load(path, sample_rate, max_frames)) {
+    if (plugin->Load(path, class_name, sample_rate, max_frames)) {
         return plugin;
     }
     delete plugin;
     return nullptr;
+}
+
+bool Vst3ListClasses(const char* path, std::vector<std::string>& out)
+{
+    out.clear();
+    if (path == nullptr) {
+        return false;
+    }
+
+    const std::string binary = BinaryInsideBundle(path);
+    if (binary.empty()) {
+        Log("vst3: %s has no Contents/x86_64-linux binary", path);
+        return false;
+    }
+
+    // The module is opened and deliberately never closed.
+    //
+    // dlclose on a yabridge module tears down the Wine host behind it, and the plugin the user then
+    // picks from the menu would have to start a second one. Leaving it mapped costs a file handle
+    // and makes the later load cheap. The scan runs once per Resolve start, so this cannot grow.
+    void* const handle = dlopen(binary.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        Log("vst3: dlopen(%s) failed: %s", binary.c_str(), dlerror());
+        return false;
+    }
+
+    using ModuleEntryFn = bool (*)(void*);
+    if (auto* const enter = reinterpret_cast<ModuleEntryFn>(dlsym(handle, "ModuleEntry"))) {
+        if (!enter(handle)) {
+            // Not fatal for the caller and not a fault in this file: yabridge refuses here when the
+            // bundle holds no Windows module, which is what a native Linux VST3 in the yabridge
+            // directory looks like.
+            Log("vst3: ModuleEntry refused for %s", binary.c_str());
+            return false;
+        }
+    }
+
+    using GetFactoryFn = v3_plugin_factory** (*)(void);
+    auto* const get_factory = reinterpret_cast<GetFactoryFn>(dlsym(handle, "GetPluginFactory"));
+    if (get_factory == nullptr) {
+        Log("vst3: %s exports no GetPluginFactory", binary.c_str());
+        return false;
+    }
+    v3_plugin_factory** const factory = get_factory();
+    if (factory == nullptr) {
+        Log("vst3: GetPluginFactory returned null for %s", binary.c_str());
+        return false;
+    }
+
+    auto* const factory_vt = *reinterpret_cast<v3_plugin_factory_cpp**>(factory);
+    const int32_t count = factory_vt->v1.num_classes(factory);
+    for (int32_t index = 0; index < count; ++index) {
+        v3_class_info info{};
+        if (factory_vt->v1.get_class_info(factory, index, &info) != V3_OK) {
+            continue;
+        }
+        if (std::strcmp(info.category, "Audio Module Class") != 0) {
+            continue;
+        }
+        // The name is a fixed-width field and is not required to be terminated.
+        char name[sizeof(info.name) + 1];
+        std::memcpy(name, info.name, sizeof(info.name));
+        name[sizeof(info.name)] = '\0';
+        if (name[0] != '\0') {
+            out.push_back(name);
+        }
+    }
+    return !out.empty();
 }
 
 void Vst3PluginSetLogger(void (*logger)(const char*)) { g_logger = logger; }

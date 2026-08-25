@@ -118,7 +118,14 @@ public:
             std::snprintf(name_, sizeof(name_), "%s", slash != nullptr ? slash + 1 : path);
         }
 
-        channels_ = effect_->numOutputs > 0 ? static_cast<uint32_t>(effect_->numOutputs) : 0;
+        // Take the plugin's own bus counts, not a guess. soothe2 declares 4 in and 2 out - two
+        // main inputs and a sidechain pair - and a host that sizes the input array from the
+        // OUTPUT count hands it two pointers where it will read four. That crashed Resolve on
+        // 2026-08-25, inside a memcpy in yabridge, on the ALSA audio thread.
+        in_count_ = effect_->numInputs > 0 ? static_cast<uint32_t>(effect_->numInputs) : 0;
+        out_count_ = effect_->numOutputs > 0 ? static_cast<uint32_t>(effect_->numOutputs) : 0;
+
+        channels_ = out_count_;
         if (channels_ > 2) {
             channels_ = 2;  // Resolve hands this effect a stereo pair
         }
@@ -128,7 +135,11 @@ public:
             return false;
         }
 
-        scratch_.assign(static_cast<size_t>(channels_) * max_frames_, 0.0f);
+        // One block per declared channel, inputs then outputs. The plugin works entirely inside
+        // this, so neither side of it can reach Resolve's memory.
+        scratch_.assign(static_cast<size_t>(in_count_ + out_count_) * max_frames_, 0.0f);
+        in_ptrs_.assign(in_count_, nullptr);
+        out_ptrs_.assign(out_count_, nullptr);
         Log("vst2: loaded \"%s\", %d in, %d out, %d parameters, %s editor",
             name_, effect_->numInputs, effect_->numOutputs, effect_->numParams,
             (effect_->flags & kEffFlagsHasEditor) != 0 ? "has an" : "no");
@@ -137,25 +148,67 @@ public:
 
     bool Process(float** buffers, uint32_t channel_count, uint32_t frames) override
     {
-        if (effect_ == nullptr || effect_->processReplacing == nullptr || buffers == nullptr ||
-            frames == 0 || frames > max_frames_) {
+        if (effect_ == nullptr || effect_->processReplacing == nullptr ||
+            buffers == nullptr || frames == 0 || frames > max_frames_) {
             return false;
         }
-        const uint32_t channels = channel_count < channels_ ? channel_count : channels_;
-        if (scratch_.size() < static_cast<size_t>(channels) * max_frames_) {
+        const uint32_t usable = channel_count < channels_ ? channel_count : channels_;
+        if (usable == 0 ||
+            scratch_.size() < static_cast<size_t>(in_count_ + out_count_) * max_frames_) {
             return false;
         }
 
-        // processReplacing may not read and write the same buffer, so the input is copied aside.
-        // The buffer belongs to this instance, which is why two effects no longer collide.
-        float* input[2] = {nullptr, nullptr};
-        for (uint32_t channel = 0; channel < channels && channel < 2; ++channel) {
-            float* const slot = &scratch_[static_cast<size_t>(channel) * max_frames_];
-            std::memcpy(slot, buffers[channel], frames * sizeof(float));
-            input[channel] = slot;
+        const size_t block = max_frames_;
+        const size_t bytes = static_cast<size_t>(frames) * sizeof(float);
+
+        // VST2 does not say which inputs are main and which are sidechain. The convention every
+        // plugin follows is that the first pair is the programme, so Resolve's audio goes there
+        // and every remaining input is fed silence. A sidechain fed a copy of the programme is
+        // not neutral - it is a plugin listening to itself.
+        const uint32_t main_in = in_count_ < 2 ? in_count_ : 2;
+        for (uint32_t channel = 0; channel < in_count_; ++channel) {
+            float* const slot = &scratch_[static_cast<size_t>(channel) * block];
+            if (channel < main_in) {
+                // Mono from Resolve feeds both main inputs, so a stereo plugin is not half fed.
+                const uint32_t source = channel < usable ? channel : 0;
+                std::memcpy(slot, buffers[source], bytes);
+            } else {
+                std::memset(slot, 0, bytes);
+            }
+            in_ptrs_[channel] = slot;
         }
 
-        effect_->processReplacing(effect_, input, buffers, static_cast<int32_t>(frames));
+        // processReplacing may not read and write the same buffer, so the outputs are separate.
+        for (uint32_t channel = 0; channel < out_count_; ++channel) {
+            float* const slot = &scratch_[static_cast<size_t>(in_count_ + channel) * block];
+            std::memset(slot, 0, bytes);
+            out_ptrs_[channel] = slot;
+        }
+
+        // A bridged plugin lives in another process, and yabridge reports its death by THROWING.
+        // An exception unwinding out of an audio callback into Resolve's C code reaches
+        // std::terminate, and the whole application aborts - which is how one dead Wine host took
+        // Resolve down on 2026-08-25. One broken effect must go quiet, not end the session.
+        try {
+            effect_->processReplacing(effect_, in_ptrs_.data(), out_ptrs_.data(),
+                                      static_cast<int32_t>(frames));
+        } catch (...) {
+            // Caught so it cannot reach std::terminate, but NOT latched off. A throw here is not
+            // proof the plugin is finished, and silently disabling a working effect is worse than
+            // the block it just lost. Logged once so the log does not fill at block rate.
+            if (!threw_) {
+                threw_ = true;
+                Log("vst2: \"%s\" threw while processing - block dropped, still in the path",
+                    name_);
+            }
+            return false;
+        }
+
+        // Only what Resolve actually gave us goes back. usable is capped by channels_, which is
+        // capped by out_count_, so this cannot read past the outputs the plugin wrote.
+        for (uint32_t channel = 0; channel < usable; ++channel) {
+            std::memcpy(buffers[channel], out_ptrs_[channel], bytes);
+        }
         return true;
     }
 
@@ -237,7 +290,18 @@ private:
         if (effect_ == nullptr || effect_->dispatcher == nullptr) {
             return 0;
         }
-        return effect_->dispatcher(effect_, opcode, index, value, ptr, opt);
+        // Same reason as Process: a dead Wine host is reported by throwing, and an exception that
+        // escapes into Resolve is an abort. Editor opens and closes travel this path too.
+        try {
+            return effect_->dispatcher(effect_, opcode, index, value, ptr, opt);
+        } catch (...) {
+            if (!threw_) {
+                threw_ = true;
+                Log("vst2: \"%s\" threw on opcode %d - call dropped, still in the path", name_,
+                    opcode);
+            }
+            return 0;
+        }
     }
 
     // Answering "I do not know" to an unknown opcode is correct. Claiming a capability we do not
@@ -245,8 +309,6 @@ private:
     static intptr_t HostCallback(AEffect* effect, int32_t opcode, int32_t index, intptr_t value,
                                  void* ptr, float opt)
     {
-        (void)index;
-        (void)value;
         (void)opt;
         auto* const self =
             effect != nullptr ? static_cast<Vst2Plugin*>(effect->user) : nullptr;
@@ -279,7 +341,18 @@ private:
                     }
                 }
                 return 0;
+            // index is the width the plugin wants, value is the height. Answering 1 without
+            // resizing is worse than answering 0: the plugin lays itself out for a size it never
+            // got, so it draws over the old frame and hit-tests against coordinates that are not
+            // on screen. Smooth Operator Pro showed both symptoms on 2026-08-25 - two stacked
+            // copies of its UI, and not one control that could be clicked.
             case kAudioMasterSizeWindow:
+                if (self != nullptr && self->window_ != nullptr && index > 0 && value > 0) {
+                    PluginWindowResize(self->window_, static_cast<unsigned int>(index),
+                                       static_cast<unsigned int>(value));
+                    return 1;
+                }
+                return 0;
             case kAudioMasterUpdateDisplay:
             case kAudioMasterIdle:
             case kAudioMasterBeginEdit:
@@ -294,7 +367,13 @@ private:
     AEffect* effect_ = nullptr;
     double sample_rate_ = 48000.0;
     uint32_t max_frames_ = 8192;
-    uint32_t channels_ = 0;
+    // Only so the first throw is logged and the rest are not. It never disables the plugin.
+    bool threw_ = false;
+    uint32_t channels_ = 0;   // what Resolve is told, capped at a stereo pair
+    uint32_t in_count_ = 0;   // what the plugin declares - never assume it matches out_count_
+    uint32_t out_count_ = 0;
+    std::vector<float*> in_ptrs_;
+    std::vector<float*> out_ptrs_;
     bool editor_open_ = false;
     PluginWindow* window_ = nullptr;
     char name_[128] = {0};
@@ -318,8 +397,8 @@ PluginFormat FormatFromPath(const char* path)
     return PluginFormat::Unknown;
 }
 
-HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, double sample_rate,
-                                 uint32_t max_frames)
+HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, const char* class_name,
+                                 double sample_rate, uint32_t max_frames)
 {
     if (format == PluginFormat::Vst2) {
         auto* const plugin = new Vst2Plugin();
@@ -333,7 +412,7 @@ HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, double s
         return CreateClapPlugin(path, sample_rate, max_frames);
     }
     if (format == PluginFormat::Vst3) {
-        return CreateVst3Plugin(path, sample_rate, max_frames);
+        return CreateVst3Plugin(path, class_name, sample_rate, max_frames);
     }
     Log("plugin: %s is a format this build cannot host yet", path != nullptr ? path : "(null)");
     return nullptr;

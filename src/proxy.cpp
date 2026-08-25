@@ -26,6 +26,7 @@
 
 #include "carla_host.h"
 #include "plugin_instance.h"
+#include "fx_categories.h"
 #include "plugin_scan.h"
 
 #include <dlfcn.h>
@@ -686,6 +687,7 @@ struct Clone {
     std::string key;   // "<plugin name>:1112360057"
     std::string name;  // what the menu reads
     std::string path;  // the plugin file this entry loads
+    std::string class_name;  // which plugin inside that file, for a VST3 shell; empty otherwise
     PluginFormat format;
     StaticQtString key_string;
     StaticQtString name_string;
@@ -709,6 +711,7 @@ const std::vector<Clone*>& Catalogue()
         clone->key = scanned.key;
         clone->name = scanned.name;
         clone->path = scanned.path;
+        clone->class_name = scanned.class_name;
         clone->format = scanned.format;
         InitStaticQtString(clone->key_string, clone->key.c_str());
         InitStaticQtString(clone->name_string, clone->name.c_str());
@@ -1248,6 +1251,12 @@ void LoadConfiguredPlugin()
     // Scan now, at library load, rather than on the first QueryPluginList call. The scan touches
     // the filesystem, and QueryPluginList runs while Resolve builds its effect menu.
     ScannedPlugins();
+
+    // Then give those entries a category. This has to run after the scan, because the table it
+    // writes has one row per scanned plugin, and before Fairlight reads the resource to build the
+    // menu - which is why it sits here at library load and not in the QueryPluginList hook.
+    FxCategoriesSetLogger([](const char* line) { Log("%s", line); });
+    FxCategoriesApply();
 }
 
 }  // namespace
@@ -2293,12 +2302,19 @@ int ClaimInstance(void* instance)
         const PluginFormat format =
             chosen != nullptr ? chosen->format : FormatFromPath(path);
         SetEffectLabel(entry, chosen != nullptr ? chosen->name.c_str() : MenuNameFromPath(path));
-        entry->plugin = CreateHostedPlugin(format, path, 48000.0, kMaxFrames);
+        const char* const class_name =
+            chosen != nullptr && !chosen->class_name.empty() ? chosen->class_name.c_str() : nullptr;
+        entry->plugin = CreateHostedPlugin(format, path, class_name, 48000.0, kMaxFrames);
         if (entry->plugin != nullptr) {
             entry->dry.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
             entry->spare.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
             g_focused_effect.store(entry);
-            Log("effect: hosting \"%s\" from %s", entry->plugin->Name(), path);
+            if (class_name != nullptr) {
+                Log("effect: hosting \"%s\" - class \"%s\" from %s", entry->plugin->Name(),
+                    class_name, path);
+            } else {
+                Log("effect: hosting \"%s\" from %s", entry->plugin->Name(), path);
+            }
         } else {
             Log("effect: no plugin for %s - audio passes through", path);
         }

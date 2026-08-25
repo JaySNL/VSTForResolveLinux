@@ -2,10 +2,26 @@
 #ifndef FXBRIDGE_VST3_PLUGIN_H
 #define FXBRIDGE_VST3_PLUGIN_H
 
+#include <string>
+#include <vector>
+
 #include "plugin_instance.h"
 
 // `path` is the .vst3 bundle directory the scanner recorded, or a flat .vst3 file.
-HostedPlugin* CreateVst3Plugin(const char* path, double sample_rate, uint32_t max_frames);
+//
+// `class_name` picks which Audio Module class inside the file to load, and matters only for a shell
+// - one file that publishes many plugins. The Waves WaveShell publishes 718. An empty or null name
+// keeps the old behaviour and takes the first class, which is right for an ordinary plugin.
+HostedPlugin* CreateVst3Plugin(const char* path, const char* class_name, double sample_rate,
+                               uint32_t max_frames);
+
+// Lists the Audio Module classes a VST3 file publishes, in factory order.
+//
+// Nothing is instantiated: this is num_classes plus get_class_info, and it costs what the dlopen
+// costs. Measured on the WaveShell, all 718 classes came back in 1.674 s, of which the enumeration
+// itself was 0 ms - the whole bill is Wine starting behind yabridge. Carla needs fifteen minutes on
+// the same file because it *creates* every plugin to report its bus counts. We do not.
+bool Vst3ListClasses(const char* path, std::vector<std::string>& out);
 
 void Vst3PluginSetLogger(void (*logger)(const char*));
 

@@ -40,8 +40,12 @@ public:
 };
 
 // Builds one, or returns null with the reason logged. `path` is what the scanner recorded.
-HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, double sample_rate,
-                                 uint32_t max_frames);
+//
+// `class_name` is used by VST3 only, and only for a shell - one file that publishes many plugins,
+// the way the Waves WaveShell publishes 718. Null or empty means "the first class in the file",
+// which is what every ordinary plugin wants.
+HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, const char* class_name,
+                                 double sample_rate, uint32_t max_frames);
 
 void PluginInstanceSetLogger(void (*logger)(const char*));
 
