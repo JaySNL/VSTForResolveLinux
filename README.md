@@ -13,6 +13,16 @@ Four plugins open at once, on one track. Look at the **Effects** column in the m
 `soothe2…`, `Clarity V…`, `NS1` — each effect carries its own name, and each is a real plugin
 processing real audio.
 
+### Sixty seconds of it, warts included
+
+![Loading several plugins in a row and driving smartEQ4's controls inside Resolve](docs/media/demo.gif)
+
+[Full recording (66s, with audio)](docs/media/demo.mp4) — several plugins loaded one after another,
+ending with smartEQ4 running a live spectrum analyser while its controls are driven.
+
+It is not a clean take, deliberately. **One plugin opens with an empty editor and only draws after
+the effect is removed and undone**, and the recording keeps that in. The others open first time.
+
 ## It works
 
 **Plugins land in Resolve's own categories**, mixed in with the built-in Fairlight FX. `De-Esser`,
@@ -45,6 +55,8 @@ single Waves shell.
 - **Two plugins draw a GUI but take no mouse input** — Smooth Operator Pro (VST2) and Accentize
   SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. Everything else tested
   is fully interactive.
+- **A plugin editor sometimes opens empty**, and fills only after the effect is removed and the
+  removal undone. Visible in the recording above. Not diagnosed; it is not tied to one format.
 - **Resolve sometimes does not exit cleanly.** Undiagnosed.
 - **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
   *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
@@ -54,9 +66,6 @@ single Waves shell.
 > **Not a supported product.** It patches structures inside Resolve's own process at run time and
 > can take Resolve down mid-edit. Save often.
 
-<!-- A screen recording belongs here: add a plugin from the menu, open its GUI, move a control, and
-     play the timeline so the change is audible. Drop it in docs/media/demo.mp4 (GitHub plays mp4
-     inline if you drag it into a comment; otherwise export a gif) and reference it below. -->
 
 ## Install
 
