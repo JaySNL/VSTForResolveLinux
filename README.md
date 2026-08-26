@@ -53,7 +53,7 @@ single Waves shell.
 ## It does not work, or not yet
 
 - **Two plugins draw a GUI but take no mouse input** — Smooth Operator Pro (VST2) and Accentize
-  SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. YMMV, i haven't been able to text EVERY vst yet.
+  SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. YMMV, i haven't been able to test EVERY vst yet.
 - **A plugin editor sometimes opens empty**, and fills only after the effect is removed and the
   removal undone. Visible in the recording above. Not diagnosed; it is not tied to one format.
 - **Resolve sometimes does not exit cleanly.** Undiagnosed.
