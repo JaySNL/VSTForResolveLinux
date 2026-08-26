@@ -3,3 +3,4 @@
 # fresh clone got no travesty headers and could not build.
 build/
 tools/xtree/xtree
+graphify-out/

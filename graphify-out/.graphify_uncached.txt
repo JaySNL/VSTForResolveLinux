@@ -1,3 +1,0 @@
-/home/jooshua/apps/resolve-fx-bridge/README.md
-/home/jooshua/apps/resolve-fx-bridge/docs/2026-08-25-what-changed.md
-/home/jooshua/apps/resolve-fx-bridge/third_party/clap/conventions/extension-id.md
