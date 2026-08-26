@@ -687,3 +687,43 @@ editor from it. Our timer thread had neither a lock nor an honest answer from
 `clap_host_thread_check` - it reported itself as the *audio* thread - and Resolve died six frames
 inside pp-track's GUI code. One mutex per plugin around every main-thread call, and the timer thread
 answers as main.
+
+
+## A library that builds clean and will not load (2026-08-26)
+
+`build.sh` ends by refusing to install a library with undefined symbols, because a shared object
+links happily without them and only fails at `dlopen`. That guard has one blind spot: it runs
+against the build machine, never the target.
+
+glibc 2.34 merged `libpthread` into `libc`. This machine runs 2.44, so `pthread_create` resolved out
+of `libc`, the guard passed, and the missing `-lpthread` on the link line was invisible. Below glibc
+2.34 the guard still passes -- it is the same machine -- and the resulting file then fails to load.
+Ubuntu 20.04, Debian 11 and Rocky 8 all sit under that line.
+
+Found by compiling in an Ubuntu 20.04 rootfs under `bwrap`, unprivileged, no daemon and no root:
+
+```
+undefined symbol: pthread_create   (/out/libfxbridge.so)
+```
+
+Adding `-lpthread` takes that to zero. `libpthread.so.0` survives as a stub on glibc 2.34+, so the
+flag costs nothing here.
+
+The same build changed what the binary asks of a system, which is why releases are built that way
+now:
+
+| Symbol set | built on glibc 2.44 | built on glibc 2.31 |
+|---|---|---|
+| `GLIBC_` | 2.38 | **2.16** |
+| `GLIBCXX_` | 3.4.22 | 3.4.22 |
+| `CXXABI_` | 1.3.15 | **1.3.9** |
+
+Three checks, because each proves something the others cannot. `ldd -r` inside the old rootfs proves
+every symbol resolves against the old glibc. `objdump -T` gives the version floor, which is
+mechanical and names the distributions that can load it. Loading it under Resolve here proves it
+actually hosts plugins -- 130 listed, categories patched, audio processed -- and that check only
+works in this direction, because glibc is backward compatible and this box has no old glibc to test
+on.
+
+What none of it proves is that **Resolve itself** runs on a distribution that old. The bridge was
+tested there, the host application was not, and the release notes say so.

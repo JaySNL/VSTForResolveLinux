@@ -167,6 +167,9 @@ other forges, or a patch in a forum post. If you got here first, say so and you 
 
 MIT — see [`LICENSE`](LICENSE). Third-party notices in [`THIRD-PARTY.md`](THIRD-PARTY.md).
 
+Parts of this were written with an LLM in the loop. The source and a working binary are both here,
+free of cost, so anyone can check what it does rather than take the description on trust.
+
 **Nothing from Blackmagic Design is copied, redistributed or modified on disk.** This loads through
 Resolve's own plugin path and patches structures in its own process memory. Uninstalling is deleting
 one file.
