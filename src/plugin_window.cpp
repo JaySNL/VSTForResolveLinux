@@ -15,6 +15,7 @@
 // Owned by proxy.cpp: the one place that decides whether an editor should be on screen.
 extern "C" void BridgeEditorWasClosedByUser();
 extern "C" void BridgeArmEditorTrace();
+extern "C" void BridgeEditorReassert();
 
 struct PluginWindow {
     // Last size we told the child about. A drag emits ConfigureNotify continuously, and resizing
@@ -114,6 +115,9 @@ void EventPump()
                 BridgeArmEditorTrace();
             }
         }
+        // Outside the lock, always: opening an editor calls back into this file and takes g_lock
+        // again. Also outside Resolve's main thread, which is the point - see BridgeEditorReassert.
+        BridgeEditorReassert();
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 }

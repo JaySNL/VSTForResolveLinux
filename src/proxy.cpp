@@ -334,14 +334,16 @@ extern "C" void BridgeEditorWasClosedByUser()
     }
 }
 
-// Called from the idle tick. Puts the window back if it should be there and is not.
+// Opens any editor that is wanted and not shown. Called from the window pump thread, never from
+// Resolve's main thread: this is what keeps a stalled plugin from freezing the application, and it
+// is also the only path that opens an editor at all once an effect is claimed.
 extern "C" void BridgeEditorReassert()
 {
     const size_t count = g_effect_count.load();
     for (size_t index = 0; index < count; ++index) {
         ClaimedEffect& effect = g_effects[index];
         if (effect.editor_wanted.load() && !effect.editor_shown.load()) {
-            BridgeEditorShowFor(&effect, "re-asserted");
+            BridgeEditorShowFor(&effect, "the effect wants a window");
         }
     }
 }
@@ -2331,9 +2333,22 @@ int ClaimInstance(void* instance)
 
     // With no control tree there is no panel, and Resolve never calls InitializeEffectEdit - the
     // editor path is gated on the panel existing. Verified on 2026-08-24: with the panel suppressed
-    // the log carries no InitializeEffectEdit line at all. So the window is opened here instead.
-    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
-        BridgeEditorShowFor(entry, "the effect was added");
+    // the log carries no InitializeEffectEdit line at all. So the bridge has to open the window.
+    //
+    // It must not open it HERE. This runs inside Resolve's LoadPlugin, and on a project switch that
+    // whole chain sits under StudioModel::Deserialize on the main thread. Opening a bridged Windows
+    // plugin's editor from there enters libyabridge-vst3, which waits on a condition variable for
+    // its Wine host - and the thread that would service the answer is the one being stood on.
+    //
+    // Caught live on 2026-08-26: two projects open, switch between them, Resolve frozen with a
+    // black editor. The main thread sat in pthread_cond_wait, eleven frames above
+    // StudioModel::Deserialize, with Vst3Plugin::OpenEditor in between. All 329 threads sleeping,
+    // nothing logged after "window: created". It never recovers.
+    //
+    // Only the want is recorded now. BridgeEditorReassert opens it from the window pump thread, so
+    // a plugin that stalls costs its own editor rather than the whole application.
+    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true) && entry != nullptr) {
+        entry->editor_wanted.store(true);
     }
 
     return claimed;
