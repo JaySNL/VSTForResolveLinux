@@ -1,42 +1,62 @@
 # VST for Resolve on Linux
 
-**Run VST2, VST3 and CLAP audio plugins inside DaVinci Resolve on Linux.**
-
-They appear in Fairlight's effect menu under their own names, sit in the right categories, load on a
-track, open their own editor windows, and process audio live on the timeline. No bouncing a clip out
-to an external editor and back.
+**VST2, VST3 and CLAP plugins running inside DaVinci Resolve on Linux.** Not bounced out to an
+external editor — loaded on the track, with their own GUIs, live on the timeline.
 
 Blackmagic does not support this. Their manual lists VST as macOS and Windows only, and the Linux
 build ships no VST host at all — there is not one occurrence of `VSTPluginMain` or
-`GetPluginFactory` anywhere under `/opt/resolve`. This adds one.
+`GetPluginFactory` anywhere under `/opt/resolve`.
 
-> **Not a supported product.** It patches structures inside Resolve's own process at run time. It
-> can take Resolve down mid-edit. Save often, and do not put it on a machine you cannot afford to
-> have crash.
+![Four plugins open at once inside Resolve: PodcastPlugins TRACK, Waves NS1, Waves Clarity Vx DeReverb and soothe2, with the mixer showing the effect chain](docs/media/plugins-running.png)
 
-## What works
+Four plugins open at once, on one track. Look at the **Effects** column in the mixer: `pp-track`,
+`soothe2…`, `Clarity V…`, `NS1` — each effect carries its own name, and each is a real plugin
+processing real audio.
 
-| | |
+## It works
+
+**Plugins land in Resolve's own categories**, mixed in with the built-in Fairlight FX. `De-Esser`,
+`De-Hummer`, `Noise Reduction`, `Limiter`, `Multiband Compressor` and `Soft Clipper` below are
+Blackmagic's; everything else is ours.
+
+| Restoration | Dynamics | Metering |
+|---|---|---|
+| ![](docs/media/category-restoration.png) | ![](docs/media/category-dynamics.png) | ![](docs/media/category-metering.png) |
+
+| What | Status |
 |---|---|
 | **CLAP** | audio + editor |
 | **VST3**, native Linux | audio + editor |
 | **VST3**, Windows via yabridge | audio + editor |
 | **VST2**, Windows via yabridge | audio + editor |
-| **Plugin names** | each effect carries its own name on the track, not "Delay" |
-| **Categories** | Dynamics, EQ, Restoration, Reverb, Metering, Pitch, Guitar… alongside Resolve's own |
-| **Shell plugins** | one file publishing hundreds — the Waves WaveShell exposes 718 — with a filter to pick which appear |
-| Audio Units | not applicable, Apple-only format |
+| **Plugin names** | each effect named on the track, not "Delay" |
+| **Categories** | Dynamics, EQ, Restoration, Reverb, Metering, Pitch, Guitar… |
+| **Shell plugins** | one file publishing hundreds — the Waves WaveShell exposes 718 — with a filter to choose which appear |
+| **Several at once** | four plugins on one track in the shot above; no shared state between effects |
 
-A scan on the development machine lists **130 plugins**, of which 75 come from one Waves shell.
+**Verified working:** soothe2 · smartEQ4 · smartComp3 · the ERA6 suite (14) · CrumplePop Complete
+(9) · Accentize SpectralBalance2 and dxRevivePro · Dragonfly reverbs · Airwindows Consolidated ·
+Waves (Clarity Vx, NS1, RVox, DeBreath, F6, Vocal Rider, MaxxVolume, PAZ, Sibilance and more) ·
+Carla · custom CLAP plugins. **130 plugins listed** on the development machine, 75 of them from a
+single Waves shell.
 
-**Verified working:** soothe2 · smartEQ4 · smartComp3 · Smooth Operator Pro · the ERA6 suite (14) ·
-CrumplePop Complete (9) · Accentize SpectralBalance2 and dxRevivePro · Dragonfly reverbs ·
-Airwindows Consolidated · Waves (Clarity Vx, RVox, DeBreath, F6, Vocal Rider, NS1, MaxxVolume,
-Sibilance and more) · Carla · custom CLAP plugins.
+## It does not work, or not yet
 
-**Known caveats:** two plugins draw their GUI but take no mouse input — Smooth Operator Pro (VST2)
-and Accentize SpectralBalance2 (VST3). Carla reproduces both, so it is not this bridge. Resolve also
-sometimes fails to exit cleanly; that one is undiagnosed.
+- **Two plugins draw a GUI but take no mouse input** — Smooth Operator Pro (VST2) and Accentize
+  SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. Everything else tested
+  is fully interactive.
+- **Resolve sometimes does not exit cleanly.** Undiagnosed.
+- **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
+  *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
+- **Audio Units** — not applicable, Apple-only format.
+- **Tested on one machine**, DaVinci Resolve Studio 21. No idea how it behaves elsewhere.
+
+> **Not a supported product.** It patches structures inside Resolve's own process at run time and
+> can take Resolve down mid-edit. Save often.
+
+<!-- A screen recording belongs here: add a plugin from the menu, open its GUI, move a control, and
+     play the timeline so the change is audible. Drop it in docs/media/demo.mp4 (GitHub plays mp4
+     inline if you drag it into a comment; otherwise export a gif) and reference it below. -->
 
 ## Install
 
@@ -49,19 +69,17 @@ cd VSTForResolveLinux
 ./build.sh
 ```
 
-Then point Resolve at it once, in
-`~/.local/share/DaVinciResolve/configs/config-fairlight.dat`:
+Point Resolve at it once, in `~/.local/share/DaVinciResolve/configs/config-fairlight.dat`:
 
 ```
 BMDPlugins.Path  ~/.local/share/BMDAudioPlugins
 ```
 
-Restart Resolve. Your plugins are in the Audio FX panel.
+Restart Resolve. The plugins are in the Audio FX panel.
 
-**For Windows plugins you need a patched yabridge.** The version in your distribution's
-repositories draws plugin GUIs correctly and then takes almost no mouse input — read
-[`docs/yabridge.md`](docs/yabridge.md) before concluding this project is broken. Native Linux CLAP
-and VST3 plugins need nothing extra.
+**Windows plugins need a patched yabridge.** The version in your distribution's repositories draws
+plugin GUIs correctly and then takes almost no mouse input — read [`docs/yabridge.md`](docs/yabridge.md)
+before concluding this project is broken. Native Linux CLAP and VST3 plugins need nothing extra.
 
 ## Choosing which plugins appear
 
@@ -81,15 +99,15 @@ DeBreath
 
 **Categories** — edit `CategoryFor()` in `src/fx_categories.cpp`.
 
-Edits to the filter file take effect on the next Resolve start. No rebuild.
+Both take effect on the next Resolve start. No rebuild.
 
 ## How it works
 
 Resolve on Linux loads its own Fairlight FX through a private Blackmagic plugin ABI, named by a
-`BMDPlugins.Path` setting that nothing documents. This library registers itself through that ABI,
-clones a stock effect's menu definition once per scanned plugin, and claims the instance Resolve
-creates — then hosts a real VST2, VST3 or CLAP plugin behind it, with its own audio buffers, its own
-editor window and no state shared between effects.
+`BMDPlugins.Path` setting that nothing documents. This library registers through that ABI, clones a
+stock effect's menu definition once per scanned plugin, and claims the instance Resolve creates —
+then hosts a real VST2, VST3 or CLAP plugin behind it, with its own audio buffers, its own editor
+window and no state shared between effects.
 
 - [`docs/categories.md`](docs/categories.md) — how a category is decided, and how it is set
 - [`docs/yabridge.md`](docs/yabridge.md) — Windows plugins, and the branch you need
