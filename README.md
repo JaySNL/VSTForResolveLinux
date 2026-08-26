@@ -116,13 +116,47 @@ cd VSTForResolveLinux
 
 ### Then, either way
 
-Point Resolve at it once, in `~/.local/share/DaVinciResolve/configs/config-fairlight.dat`:
+**`build.sh` now points Resolve at the library for you.** It writes one line to
+`~/.local/share/DaVinciResolve/configs/config-fairlight.dat`, keeps a timestamped copy of the file
+first, and refuses if Resolve is running. `FXBRIDGE_NO_CONFIGURE=1` skips it and prints the line
+instead.
+
+If you downloaded the binary rather than building, add it by hand:
 
 ```
-BMDPlugins.Path  ~/.local/share/BMDAudioPlugins
+BMDPlugins.Path = /home/you/.local/share/BMDAudioPlugins/libfxbridge.so
 ```
+
+Three details matter, and **none of them announce themselves when wrong**:
+
+- The value is the path to the **`.so` file**, not the directory holding it.
+- Write the path out in full. `~` is not expanded.
+- The key only takes effect in **`config-fairlight.dat`**. Resolve keeps it in `config.dat` across
+  restarts and ignores it there.
+
+Get any of them wrong and there is no error message. Resolve quietly loads its own plugin library
+and the Audio FX panel looks exactly as it did before. This readme published the wrong form until
+2026-08-26 — the directory, no `=`, and a `~` — which is three failures out of three.
+
+**Close Resolve before editing that file.** It owns it and rewrites it on quit, so an edit made
+while it runs is thrown away.
 
 Restart Resolve. The plugins are in the Audio FX panel.
+
+### Nothing appeared?
+
+Ask whether the bridge was loaded at all:
+
+```sh
+grep -c fxbridge ~/.local/share/DaVinciResolve/logs/ResolveDebug.txt
+```
+
+**Zero** means Resolve never loaded it: the config line is wrong, or this is the free version rather
+than Studio. Anything above zero means it loaded, and these lines say what it found:
+
+```sh
+grep 'fxbridge.*scan:' ~/.local/share/DaVinciResolve/logs/ResolveDebug.txt | head
+```
 
 **Windows plugins need a patched yabridge.** The version in your distribution's repositories draws
 plugin GUIs correctly and then takes almost no mouse input — read [`docs/yabridge.md`](docs/yabridge.md)
