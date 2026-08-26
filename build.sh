@@ -10,12 +10,6 @@ g++ -std=c++17 -shared -fPIC -O2 -Wall -Wextra \
     -I /usr/include/carla/includes \
     -o "$out/libfxbridge.so" \
     "$root/src/proxy.cpp" "$root/src/carla_host.cpp" "$root/src/vst2_plugin.cpp" "$root/src/clap_plugin.cpp" "$root/src/host_thread.cpp" "$root/src/vst3_plugin.cpp" "$root/src/plugin_scan.cpp" "$root/src/fx_categories.cpp" "$root/src/plugin_window.cpp" -ldl -lX11 -lz
-# The category shim is a separate library on purpose: it has to be loaded before Resolve starts, so
-# that its qRegisterResourceData is the one libFairlightPage calls. See src/category_shim.cpp.
-g++ -std=c++17 -shared -fPIC -O2 -Wall -Wextra \
-    -o "$out/libfxcategoryshim.so" \
-    "$root/src/category_shim.cpp" -ldl -lz
-
 # Refuse to install a library Resolve cannot load.
 #
 # A shared library links happily with unresolved symbols, so a missing source file still produces a
@@ -38,7 +32,4 @@ install_dir="$HOME/.local/share/BMDAudioPlugins"
 mkdir -p "$install_dir"
 cp "$out/libfxbridge.so" "$install_dir/libfxbridge.so"
 
-cp "$out/libfxcategoryshim.so" "$install_dir/libfxcategoryshim.so"
-
 echo "built and installed $install_dir/libfxbridge.so"
-echo "built and installed $install_dir/libfxcategoryshim.so"
