@@ -69,14 +69,43 @@ single Waves shell.
 
 ## Install
 
-Requires **DaVinci Resolve Studio 21** on Linux (the free version does not load this ABI), zlib,
-Xlib and a C++17 compiler.
+Requires **DaVinci Resolve Studio 21** on Linux. The free version does not load this ABI.
+
+### Either download the binary
+
+Every release carries a prebuilt `libfxbridge.so`, free of cost, next to the source it was built
+from.
+
+```sh
+mkdir -p ~/.local/share/BMDAudioPlugins
+curl -L -o ~/.local/share/BMDAudioPlugins/libfxbridge.so \
+  https://github.com/JaySNL/VSTForResolveLinux/releases/latest/download/libfxbridge.so
+```
+
+It is compiled on Ubuntu 20.04, so it asks for `GLIBC_2.16`, `GLIBCXX_3.4.22` and `CXXABI_1.3.9` at
+most — libstdc++ from GCC 6.1 onward, which covers Ubuntu 18.04, Debian 9, Rocky 8 and Fedora 25 and
+newer. Read the floor yourself with:
+
+```sh
+objdump -T libfxbridge.so | grep -o 'GLIBC[X]*_[0-9.]*' | sort -uV | tail -3
+```
+
+Whether **Resolve itself** runs on distributions that old is a separate question, and one this
+project has not tested.
+
+### Or build it
+
+Needs zlib, Xlib and a C++17 compiler.
 
 ```sh
 git clone --recurse-submodules https://github.com/JaySNL/VSTForResolveLinux.git
 cd VSTForResolveLinux
 ./build.sh
 ```
+
+`build.sh` compiles and installs in one step, so the file on disk is always the one just built.
+
+### Then, either way
 
 Point Resolve at it once, in `~/.local/share/DaVinciResolve/configs/config-fairlight.dat`:
 
