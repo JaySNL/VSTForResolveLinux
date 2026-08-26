@@ -94,7 +94,17 @@ project has not tested.
 
 ### Or build it
 
-Needs zlib, Xlib and a C++17 compiler.
+Needs zlib, Xlib, a C++17 compiler, and the **Carla development headers**.
+
+`build.sh` compiles `src/carla_host.cpp` against `/usr/include/carla/includes`, so without those
+headers the build stops at `fatal error: CarlaNative.h`. Install them first:
+
+| Distribution | Package |
+|---|---|
+| Arch, CachyOS, Manjaro | `carla` (tested against 2.5.10-4.1) |
+| Debian, Ubuntu, Linux Mint | `carla-dev`, from the [KXStudio repositories](https://kx.studio/Repositories) |
+
+Reported on Linux Mint 22.3 by u/slangbein, who also supplied the fix.
 
 ```sh
 git clone --recurse-submodules https://github.com/JaySNL/VSTForResolveLinux.git
