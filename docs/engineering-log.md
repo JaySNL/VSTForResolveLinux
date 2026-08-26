@@ -1,5 +1,14 @@
 # Fairlight FX bridge (DaVinci Resolve Studio 21, Linux)
 
+> **This is a chronological engineering log, not documentation.**
+>
+> Each entry was true on the day it was written, and several were later overtaken by work further
+> down. Sections that no longer describe the code carry a **SUPERSEDED** note. For what the project
+> actually does today, read [`../README.md`](../README.md).
+>
+> The dead ends are deliberately kept. They are most of the value here.
+
+
 Goal: run our own audio effects **inside** Resolve's Fairlight page, tunable live on the timeline,
 instead of bouncing a clip out to an external process.
 
@@ -154,6 +163,12 @@ Verified 2026-08-24: `inserted "Bridge Test", cloned from "Delay:1112360057"`, R
 
 ## The menu category is not the CategoryMask
 
+> **SUPERSEDED.** The conclusion here — that the category is not the `CategoryMask` — is right, and
+> the reason is now known: a category is a lookup in a compressed table compiled into
+> `libFairlightPage.so`, keyed by `"<name>:<id>"`. The bridge patches that table in memory and
+> plugins now appear under Dynamics, EQ, Restoration and the rest. See
+> [`categories.md`](categories.md).
+
 `FairlightFXConfiguration.xml` holds `<ID>Delay:1112360057</ID><CategoryMask>4</CategoryMask>`, so it
 reads like the source of the submenu. **It is not.** Adding our own ID to that file with mask 4, with
 Resolve closed, left the entry under *Uncategorized* on the next start — and the line survived the
@@ -231,6 +246,9 @@ not, and the logged samples halve exactly (-0.011735 → -0.005867). Our code pr
 inside Fairlight.
 
 ## Remaining work
+
+> **SUPERSEDED.** This list is from an early evening and most of it is done. See the README's
+> status table for the current position.
 
 1. **Restrict the hook to our own effect.** It is on the `BMDStereoDelay` class, so it currently
    touches every Delay in the project. Filter per instance.
@@ -380,6 +398,11 @@ The assembly trampolines now carry `.cfi_startproc` / `.cfi_endproc`. Without un
 crash handler that walks the stack dies in `_Unwind_Find_FDE` instead of reporting the fault.
 
 ## Why the effect is still called Delay, and what it would take not to be
+
+> **SUPERSEDED.** Effects now carry their own names. `SetEffectLabel` writes the menu entry's name
+> onto the claimed instance, so a track shows `soothe2_x64` or `RVox Mono`, not `Delay`. The
+> analysis below of the second map and the creation function pointer at value offset `0x38` is still
+> accurate and still the reason the create hook substitutes Delay's key.
 
 The effect rides on `BMDStereoDelay`. The stock DSP is now kept out of the sound — see the Process
 trampoline below — but the identity is still Delay: the mixer's Effects slot reads `Delay`, and the
