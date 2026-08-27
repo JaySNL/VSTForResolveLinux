@@ -28,6 +28,8 @@
 #include "plugin_instance.h"
 #include "fx_categories.h"
 #include "plugin_scan.h"
+#include "plugin_state.h"
+#include "host_thread.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -203,6 +205,12 @@ struct ClaimedEffect {
 
     // The BMDAudioPluginImpl base, which is where Resolve keeps this effect's channel counts.
     void* primary_base = nullptr;
+
+    // Where this effect's settings are stored, and what was last written there. Both are
+    // empty unless FXBRIDGE_STATE_STORE=1. The copy is what makes the periodic save cheap:
+    // an unchanged plugin costs one comparison and no file.
+    std::string state_key;
+    std::vector<uint8_t> state_last;
 };
 
 // Fills both encodings from one name.
@@ -222,6 +230,46 @@ void SetEffectLabel(ClaimedEffect* effect, const char* name)
 
 ClaimedEffect g_effects[kMaxClaimedEffects];
 std::atomic<size_t> g_effect_count{0};
+
+// Saves every effect's settings on the host main thread, about every ten seconds.
+//
+// There is no moment to save at. Resolve never tells the bridge that an effect is going
+// away - g_effect_count only ever grows - so a project close, a project switch and a quit
+// all look the same from here: nothing. A snapshot on a timer is what remains, and it has
+// one property the hooks would not: it survives a Resolve that crashes.
+//
+// It runs on the host main thread rather than the window pump because that is the thread
+// this bridge already treats as a plugin's main thread - VST2 effEditIdle goes out on it.
+class StateSaver final : public HostMainClient {
+public:
+    void OnHostMainTick() override
+    {
+        if (++ticks_ < kTicksBetweenSaves) {
+            return;
+        }
+        ticks_ = 0;
+        const size_t count = g_effect_count.load();
+        for (size_t index = 0; index < count; ++index) {
+            ClaimedEffect& effect = g_effects[index];
+            if (effect.plugin == nullptr || effect.state_key.empty()) {
+                continue;
+            }
+            std::vector<uint8_t> current;
+            if (!effect.plugin->SaveState(current) || current == effect.state_last) {
+                continue;
+            }
+            if (StateStoreWrite(effect.state_key, current)) {
+                effect.state_last.swap(current);
+            }
+        }
+    }
+
+private:
+    static constexpr int kTicksBetweenSaves = 600;  // the tick is 16 ms, so about ten seconds
+    int ticks_ = 0;
+};
+
+StateSaver g_state_saver;
 std::mutex g_effect_append_lock;
 
 // The effect whose editor Resolve last opened. The window is shared, so one editor shows at a time.
@@ -321,13 +369,30 @@ extern "C" void BridgeEditorHideFor(ClaimedEffect* effect, const char* because)
 
 // The host telling us a window is gone. Not a request to bring it back.
 //
-// The window pump knows which X11 window closed but not which effect owns it, so every effect is
-// marked closed. Nothing acts on the flag on its own - there is no re-assert loop - so the cost is
-// that closing one editor also forgets that another was open, and Resolve's next
-// InitializeEffectEdit opens the right one anyway.
-extern "C" void BridgeEditorWasClosedByUser()
+// Only the effect that owns the window is marked closed. Every effect used to be marked, and the
+// comment here said that was harmless because nothing acted on the flag by itself. That stopped
+// being true in v0.1.1, when the window pump gained BridgeEditorReassert: from then on, closing
+// one editor made the re-assert loop forget every other open editor as well, and the flags never
+// came back on their own. Reported by Delirio on 2026-08-27 as an editor that will not
+// reopen until the plugin is deleted and added again.
+//
+// A window with no owner still clears everything. The alternative is a wanted flag left set on an
+// effect whose window is already gone, and the re-assert loop would then reopen it against the
+// user - the one failure here that cannot be clicked away.
+extern "C" void BridgeEditorWasClosedByUser(unsigned long window)
 {
     const size_t count = g_effect_count.load();
+    for (size_t index = 0; index < count; ++index) {
+        ClaimedEffect& effect = g_effects[index];
+        if (window == 0 || effect.plugin == nullptr || effect.plugin->EditorWindow() != window) {
+            continue;
+        }
+        effect.editor_wanted.store(false);
+        effect.editor_shown.store(false);
+        return;
+    }
+
+    Log("editor: window 0x%lx closed and no effect owns it - all editors marked closed", window);
     for (size_t index = 0; index < count; ++index) {
         g_effects[index].editor_wanted.store(false);
         g_effects[index].editor_shown.store(false);
@@ -1249,6 +1314,7 @@ void LoadConfiguredPlugin()
     CarlaHostSetLogger([](const char* line) { Log("%s", line); });
     PluginInstanceSetLogger([](const char* line) { Log("%s", line); });
     PluginScanSetLogger([](const char* line) { Log("%s", line); });
+    StateStoreSetLogger([](const char* line) { Log("%s", line); });
 
     // Scan now, at library load, rather than on the first QueryPluginList call. The scan touches
     // the filesystem, and QueryPluginList runs while Resolve builds its effect menu.
@@ -1866,6 +1932,10 @@ BRIDGE_HIDDEN2 void* g_trace_original_22 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk22();
 BRIDGE_HIDDEN2 void* g_trace_original_23 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk23();
+BRIDGE_HIDDEN2 void* g_trace_original_24 = nullptr;
+BRIDGE_HIDDEN2 void BridgeTraceThunk24();
+BRIDGE_HIDDEN2 void* g_trace_original_25 = nullptr;
+BRIDGE_HIDDEN2 void BridgeTraceThunk25();
 BRIDGE_HIDDEN2 void* g_trace_original_0 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk0();
 BRIDGE_HIDDEN2 void* g_trace_original_1 = nullptr;
@@ -1924,6 +1994,8 @@ asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk20", "g_trace_original_20", "20"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk21", "g_trace_original_21", "21"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk22", "g_trace_original_22", "22"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk23", "g_trace_original_23", "23"));
+asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk24", "g_trace_original_24", "24"));
+asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk25", "g_trace_original_25", "25"));
 
 namespace {
 
@@ -1960,6 +2032,16 @@ TraceSlot g_trace_slots[] = {
     { 0x2c8, "GetNumberOfParameters", &g_trace_original_21, reinterpret_cast<void*>(&BridgeTraceThunk21) },
     { 0x2d0, "GetParameterName", &g_trace_original_22, reinterpret_cast<void*>(&BridgeTraceThunk22) },
     { 0x2d8, "GetControlType", &g_trace_original_23, reinterpret_cast<void*>(&BridgeTraceThunk23) },
+    // The two that decide whether settings can be saved at all.
+    //
+    // AudioPluginPreset is the object Resolve carries an effect in: AudioPluginHost::
+    // AddPlaceholderPlugin takes one when it restores a plugin that is not loaded yet. If
+    // these fire on project save and project open, the preset is the channel a hosted
+    // plugin's state can travel through, and SaveState/LoadState have somewhere to go. If
+    // they only fire when a user picks a preset from the menu, they are not, and the state
+    // needs its own store. Nothing here answers that question - the log does, once.
+    { 0x380, "StorePreset", &g_trace_original_24, reinterpret_cast<void*>(&BridgeTraceThunk24) },
+    { 0x388, "LoadPreset", &g_trace_original_25, reinterpret_cast<void*>(&BridgeTraceThunk25) },
 };
 
 constexpr int kTraceCap = 6;
@@ -2316,6 +2398,19 @@ int ClaimInstance(void* instance)
                     class_name, path);
             } else {
                 Log("effect: hosting \"%s\" from %s", entry->plugin->Name(), path);
+            }
+
+            // Settings from the last run, if the store is on and this plugin left any.
+            if (StateStoreEnabled()) {
+                entry->state_key = StateStoreKey(path, class_name);
+                std::vector<uint8_t> saved;
+                if (StateStoreRead(entry->state_key, saved) &&
+                    entry->plugin->LoadState(saved.data(), saved.size())) {
+                    entry->state_last = saved;
+                    Log("state: restored %zu bytes into \"%s\"", saved.size(),
+                        entry->plugin->Name());
+                }
+                HostMainRegister(&g_state_saver, 1000);
             }
         } else {
             Log("effect: no plugin for %s - audio passes through", path);

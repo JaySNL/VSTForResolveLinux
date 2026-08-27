@@ -56,11 +56,21 @@ single Waves shell.
   SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. YMMV, i haven't been able to test EVERY vst yet.
 - **A plugin editor sometimes opens empty**, and fills only after the effect is removed and the
   removal undone. Visible in the recording above. Not diagnosed; it is not tied to one format.
+- **Settings are not saved per instance.** Reopening a project restores the right plugin at its
+  defaults. Resolve stores an effect's own parameters in the project and knows nothing about what
+  a hosted plugin keeps inside, so there is nowhere to put them yet. `FXBRIDGE_STATE_STORE=1` is
+  an opt-in stopgap — see *Settings between sessions*.
+- **Higher idle CPU than stock Resolve** — reported as 20–25% against 0–3%, on a machine where
+  Reaper hosting the same plugins is quiet. Not reproduced here and not diagnosed. The three
+  threads this library starts are named, so `top -H -p $(pgrep -f /opt/resolve/bin/resolve)` shows
+  which one is busy: `fxb-xpump` (X11 events, 30 ms), `fxb-tick` (plugin idle, 16 ms), `fxb-carla`.
+- **A plugin's GUI is a separate window**, not a panel inside Resolve. The inspector panel for a
+  bridged effect stays black on purpose. Under Wayland both windows go through XWayland.
 - **Resolve sometimes does not exit cleanly.** Undiagnosed.
 - **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
   *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
 - **Audio Units** — not applicable, Apple-only format.
-- **Tested on one machine**, DaVinci Resolve Studio 21. No idea how it behaves elsewhere.
+- **Tested on two machines**, both DaVinci Resolve Studio 21. One of them is mine.
 
 > **Not a supported product.** It patches structures inside Resolve's own process at run time and
 > can take Resolve down mid-edit. Save often.
@@ -218,6 +228,26 @@ DeBreath
 **Categories** — edit `CategoryFor()` in `src/fx_categories.cpp`.
 
 Both take effect on the next Resolve start. No rebuild.
+
+## Settings between sessions
+
+Off by default. `FXBRIDGE_STATE_STORE=1` makes the bridge ask each plugin for its own state about
+every ten seconds, and hand it back the next time that plugin is loaded.
+
+    FXBRIDGE_STATE_STORE=1 /opt/resolve/bin/resolve
+
+One file per plugin, under `~/.local/share/BMDAudioPlugins/state/`. Delete a file to get that
+plugin's defaults back.
+
+**Read this before turning it on.** The store is keyed by the plugin, not by the effect. Two
+instances of the same plugin in one project share one file, so both come back with whichever set
+of settings was saved last. That is wrong, and it is why this is opt-in rather than the default.
+
+The right place for the state is Resolve's own `AudioPluginPreset` — the object it hands to
+`AudioPluginHost::AddPlaceholderPlugin` when it restores a plugin that is not loaded yet. Whether
+Resolve fills one on a project save is now traced in the log (`trace: AudioPlugin::StorePreset`)
+but has not been measured. Until it is, the store above is what there is.
+
 
 ## How it works
 

@@ -727,3 +727,79 @@ on.
 
 What none of it proves is that **Resolve itself** runs on a distribution that old. The bridge was
 tested there, the host application was not, and the release notes say so.
+
+
+## 2026-08-27 — the first outside report
+
+`Delirio` installed v0.1.3 on their own machine and reported four things. Three of them
+have an answer in the source; the fourth does not, and saying which is which is the point of this
+entry.
+
+### An editor that will not reopen
+
+Their words: *"sometimes, after i insert a plugin then i try to open it, the GUI doesn't open
+anymore, i have to restart resolve or delete and add it again."*
+
+`BridgeEditorWasClosedByUser` cleared `editor_wanted` and `editor_shown` on **every** effect, and
+the comment above it said why that was safe:
+
+> Nothing acts on the flag on its own - there is no re-assert loop
+
+That was true when it was written and stopped being true in v0.1.1, which added
+`BridgeEditorReassert` on the window pump — the fix for the project-switch deadlock. From that
+release on, closing one editor made the re-assert loop forget every other one, and nothing set the
+flag again. The comment aged into a bug.
+
+The pump knows which X11 window the window manager closed, so the fix is to pass it: `HostedPlugin`
+gained `EditorWindow()`, and only the effect that owns that window is marked closed. A window with
+no owner still clears everything — a `wanted` flag left set on an effect whose window is gone would
+have the pump reopen it against the user, and that is the one failure here that cannot be clicked
+away.
+
+### Idle CPU: not diagnosed, now measurable
+
+Their words: *"Cpu usage with NO plugin added is 20-25% on my system, 0 to 3% with the normal
+resolve."*
+
+Every loop in this library was read. Three threads exist: the X11 pump at 30 ms, the host tick at
+16 ms, and Carla's idle loop — and `CarlaHostLoad` has **zero callers**, so the third never starts.
+The trace hooks are capped at six reports per slot, so it is not a log flood either. Nothing in the
+source accounts for a quarter of a core, and no attempt was made to invent one.
+
+What was missing is the ability to ask. No thread called `pthread_setname_np`, so `top -H` against
+Resolve showed all 300-odd threads as `GUI`. They are now `fxb-xpump`, `fxb-tick` and `fxb-carla`,
+which turns the next report into a measurement.
+
+### Settings do not survive a project reload
+
+Their words: *"they works but it doesn't retain settings when i close and open the project again,
+this is another big issue."*
+
+Verified, and the cause is that the feature did not exist: `grep -rn "etChunk|IBStream|etState"
+src/` returned nothing. The bridge never asked a plugin for its state.
+
+That half is now written and is format-side only: `SaveState`/`LoadState` on `HostedPlugin`, VST2
+via `effGetChunk`/`effSetChunk` with a parameter-sweep fallback for plugins that publish no chunk,
+VST3 via `IComponent::get_state`/`set_state` over a `v3_bstream` implemented on a byte vector, CLAP
+via `clap.state`. Every blob carries eight bytes of magic and a four-byte format tag, because a
+VST3 state handed to a VST2 plugin's `setChunk` is not a restore that fails — it is a plugin
+parsing a foreign buffer as its own.
+
+**Where the bytes should live is not yet measured.** Resolve saves an effect and its parameters in
+the project; there is no blob channel a built-in effect can use, and this bridge impersonates a
+built-in effect. The candidate is `AudioPluginPreset`: `rmap vtable BMDStereoDelay` puts
+`StorePreset` at `+0x380` and `LoadPreset` at `+0x388`, and
+`AudioPluginHost::AddPlaceholderPlugin(wchar_t const*, unsigned long, AudioPluginPreset const&, …)`
+takes one when Resolve restores a plugin that is not loaded yet. Its copy constructor copies two
+`std::string`, one `std::wstring` and one `vector<string>`, so it has room. Both slots are now
+traced. One project save with a plugin on a track will say whether they fire.
+
+Until that is read, `FXBRIDGE_STATE_STORE=1` is the stopgap: one file per plugin under
+`~/.local/share/BMDAudioPlugins/state/`, snapshotted on the host main thread about every ten
+seconds. It is opt-in because it is keyed by the plugin rather than by the effect, so two instances
+of one plugin in a project share a file. Shipping that as the default would trade a visible bug for
+a silent one.
+
+There is no moment to save at, which is why it is a timer. Resolve never tells the bridge that an
+effect is going away — `g_effect_count` only grows — so a project close, a project switch and a
+quit all look identical from here: nothing at all.

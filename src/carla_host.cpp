@@ -1,6 +1,7 @@
 #include "carla_host.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include <atomic>
 #include <chrono>
@@ -123,6 +124,7 @@ intptr_t HostDispatcher(NativeHostHandle, NativeHostDispatcherOpcode opcode, int
 // Carla's window needs regular idle calls to stay alive and to pump its own events.
 void IdleLoop()
 {
+    pthread_setname_np(pthread_self(), "fxb-carla");
     while (g_idle_running.load()) {
         if (g_ui_open && g_descriptor != nullptr && g_descriptor->ui_idle != nullptr &&
             g_plugin != nullptr) {

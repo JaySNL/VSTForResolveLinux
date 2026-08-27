@@ -3,6 +3,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
+#include <pthread.h>
 
 #include <atomic>
 #include <chrono>
@@ -13,7 +14,7 @@
 #include <vector>
 
 // Owned by proxy.cpp: the one place that decides whether an editor should be on screen.
-extern "C" void BridgeEditorWasClosedByUser();
+extern "C" void BridgeEditorWasClosedByUser(unsigned long window);
 extern "C" void BridgeArmEditorTrace();
 extern "C" void BridgeEditorReassert();
 
@@ -76,6 +77,10 @@ PluginWindow* FindLocked(Window handle)
 // never fights a close the user performed.
 void EventPump()
 {
+    // A named thread is what makes a CPU report actionable. Until this existed, `top -H`
+    // against Resolve showed all 300-odd threads as "GUI", so a user reporting that the
+    // bridge burns a quarter of a core had no way to say which part of it does.
+    pthread_setname_np(pthread_self(), "fxb-xpump");
     while (g_pump_running.load()) {
         {
             std::lock_guard<std::mutex> held(g_lock);
@@ -111,7 +116,7 @@ void EventPump()
                 XFlush(g_display);
                 window->mapped = false;
                 Log("window: the window manager closed an editor");
-                BridgeEditorWasClosedByUser();
+                BridgeEditorWasClosedByUser(static_cast<unsigned long>(window->handle));
                 BridgeArmEditorTrace();
             }
         }

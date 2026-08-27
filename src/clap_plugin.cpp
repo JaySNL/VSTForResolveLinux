@@ -128,6 +128,39 @@ struct PendingParameter {
     double maximum{1.0};
 };
 
+// CLAP streams, over a byte vector. Both carry the vector and a cursor in their ctx field, which
+// is what that field is for.
+struct StateCursor {
+    std::vector<uint8_t>* bytes;
+    size_t position;
+};
+
+int64_t CLAP_ABI StateWrite(const clap_ostream_t* stream, const void* buffer, uint64_t size)
+{
+    auto* const cursor = stream != nullptr ? static_cast<StateCursor*>(stream->ctx) : nullptr;
+    if (cursor == nullptr || cursor->bytes == nullptr || buffer == nullptr) {
+        return -1;
+    }
+    const auto* const bytes = static_cast<const uint8_t*>(buffer);
+    cursor->bytes->insert(cursor->bytes->end(), bytes, bytes + size);
+    return static_cast<int64_t>(size);
+}
+
+int64_t CLAP_ABI StateRead(const clap_istream_t* stream, void* buffer, uint64_t size)
+{
+    auto* const cursor = stream != nullptr ? static_cast<StateCursor*>(stream->ctx) : nullptr;
+    if (cursor == nullptr || cursor->bytes == nullptr || buffer == nullptr) {
+        return -1;
+    }
+    const size_t left = cursor->bytes->size() - cursor->position;
+    const size_t take = size < left ? static_cast<size_t>(size) : left;
+    if (take > 0) {
+        std::memcpy(buffer, cursor->bytes->data() + cursor->position, take);
+        cursor->position += take;
+    }
+    return static_cast<int64_t>(take);  // zero is end of file, which is not an error
+}
+
 class ClapPlugin final : public HostedPlugin, public HostMainClient {
 public:
     ~ClapPlugin() override
@@ -296,6 +329,40 @@ public:
     uint32_t ChannelCount() const override { return channel_count_; }
     const char* Name() const override { return name_[0] != '\0' ? name_ : nullptr; }
     PluginFormat Format() const override { return PluginFormat::Clap; }
+    unsigned long EditorWindow() const override { return PluginWindowHandle(window_); }
+
+    bool SaveState(std::vector<uint8_t>& out) override
+    {
+        const auto* const state = static_cast<const clap_plugin_state_t*>(
+            plugin_ != nullptr ? plugin_->get_extension(plugin_, CLAP_EXT_STATE) : nullptr);
+        if (state == nullptr || state->save == nullptr) {
+            return false;
+        }
+        std::vector<uint8_t> raw;
+        StateCursor cursor{&raw, 0};
+        clap_ostream_t stream{&cursor, StateWrite};
+        if (!state->save(plugin_, &stream)) {
+            return false;
+        }
+        StateBegin(out, kStateTagClap);
+        out.insert(out.end(), raw.begin(), raw.end());
+        return true;
+    }
+
+    bool LoadState(const uint8_t* data, size_t size) override
+    {
+        size_t body = 0;
+        const uint8_t* const payload = StateBody(data, size, kStateTagClap, &body);
+        const auto* const state = static_cast<const clap_plugin_state_t*>(
+            plugin_ != nullptr ? plugin_->get_extension(plugin_, CLAP_EXT_STATE) : nullptr);
+        if (payload == nullptr || state == nullptr || state->load == nullptr) {
+            return false;
+        }
+        std::vector<uint8_t> raw(payload, payload + body);
+        StateCursor cursor{&raw, 0};
+        clap_istream_t stream{&cursor, StateRead};
+        return state->load(plugin_, &stream);
+    }
 
     bool OpenEditor() override
     {

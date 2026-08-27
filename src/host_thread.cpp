@@ -1,5 +1,7 @@
 #include "host_thread.h"
 
+#include <pthread.h>
+
 #include <atomic>
 #include <cstdio>
 #include <chrono>
@@ -28,6 +30,7 @@ void (*g_logger)(const char*) = nullptr;
 void TickThread()
 {
     t_is_host_main = true;
+    pthread_setname_np(pthread_self(), "fxb-tick");
     while (g_running.load()) {
         const unsigned int period = g_period.load();
         std::this_thread::sleep_for(std::chrono::milliseconds(period != 0 ? period : 16));

@@ -57,6 +57,7 @@ constexpr int32_t kEffectMagic = 0x56737450;
 // Flags.
 constexpr int32_t kEffFlagsHasEditor = 1 << 0;
 constexpr int32_t kEffFlagsCanReplacing = 1 << 4;
+constexpr int32_t kEffFlagsProgramChunks = 1 << 5;  // settings travel as one opaque blob
 constexpr int32_t kEffFlagsIsSynth = 1 << 8;
 
 // Opcodes the host sends to the plugin. Only what a host must send to run an effect.
@@ -71,6 +72,8 @@ constexpr int32_t kEffEditGetRect = 13;
 constexpr int32_t kEffEditOpen = 14;       // ptr = the native parent window handle
 constexpr int32_t kEffEditClose = 15;
 constexpr int32_t kEffEditIdle = 19;
+constexpr int32_t kEffGetChunk = 23;       // ptr receives the plugin's own buffer
+constexpr int32_t kEffSetChunk = 24;       // ptr is our buffer, value is its length
 constexpr int32_t kEffGetEffectName = 45;
 constexpr int32_t kEffGetVendorString = 47;
 constexpr int32_t kEffGetProductString = 48;

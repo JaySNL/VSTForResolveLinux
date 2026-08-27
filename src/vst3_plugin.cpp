@@ -32,6 +32,7 @@
 
 #include "base.h"
 #include "factory.h"
+#include "bstream.h"
 #include "component.h"
 #include "audio_processor.h"
 #include "edit_controller.h"
@@ -414,6 +415,105 @@ const v3_run_loop_cpp kLoopVtable = {
      EditorRunLoop::LoopRegisterTimer, EditorRunLoop::LoopUnregisterTimer},
 };
 
+// A v3_bstream over a byte vector.
+//
+// VST3 never hands its state back as a buffer. get_state writes into a stream the host supplies,
+// so being the host means owning one. This is the whole of it: no file, no growth policy, no
+// reference counting that means anything - the object lives for one call and dies on the stack.
+struct MemoryStream {
+    const v3_bstream_cpp* vtable;
+    std::vector<uint8_t>* bytes;
+    int64_t position;
+};
+
+v3_result V3_API StreamQueryInterface(void* self, const v3_tuid iid, void** obj)
+{
+    if (std::memcmp(iid, v3_funknown_iid, sizeof(v3_tuid)) == 0 ||
+        std::memcmp(iid, v3_bstream_iid, sizeof(v3_tuid)) == 0) {
+        *obj = self;
+        return V3_OK;
+    }
+    *obj = nullptr;
+    return V3_NO_INTERFACE;
+}
+
+v3_result V3_API StreamRead(void* self, void* buffer, int32_t num_bytes, int32_t* bytes_read)
+{
+    auto* const stream = static_cast<MemoryStream*>(self);
+    if (stream == nullptr || stream->bytes == nullptr || buffer == nullptr || num_bytes < 0) {
+        return V3_INVALID_ARG;
+    }
+    const int64_t left = static_cast<int64_t>(stream->bytes->size()) - stream->position;
+    const int64_t take = left < num_bytes ? (left > 0 ? left : 0) : num_bytes;
+    if (take > 0) {
+        std::memcpy(buffer, stream->bytes->data() + stream->position, static_cast<size_t>(take));
+        stream->position += take;
+    }
+    if (bytes_read != nullptr) {
+        *bytes_read = static_cast<int32_t>(take);
+    }
+    return V3_OK;
+}
+
+v3_result V3_API StreamWrite(void* self, void* buffer, int32_t num_bytes, int32_t* bytes_written)
+{
+    auto* const stream = static_cast<MemoryStream*>(self);
+    if (stream == nullptr || stream->bytes == nullptr || buffer == nullptr || num_bytes < 0) {
+        return V3_INVALID_ARG;
+    }
+    const size_t at = static_cast<size_t>(stream->position);
+    if (at + static_cast<size_t>(num_bytes) > stream->bytes->size()) {
+        stream->bytes->resize(at + static_cast<size_t>(num_bytes));
+    }
+    std::memcpy(stream->bytes->data() + at, buffer, static_cast<size_t>(num_bytes));
+    stream->position += num_bytes;
+    if (bytes_written != nullptr) {
+        *bytes_written = num_bytes;
+    }
+    return V3_OK;
+}
+
+v3_result V3_API StreamSeek(void* self, int64_t pos, int32_t mode, int64_t* result)
+{
+    auto* const stream = static_cast<MemoryStream*>(self);
+    if (stream == nullptr || stream->bytes == nullptr) {
+        return V3_INVALID_ARG;
+    }
+    const int64_t end = static_cast<int64_t>(stream->bytes->size());
+    int64_t target = pos;
+    if (mode == V3_SEEK_CUR) {
+        target = stream->position + pos;
+    } else if (mode == V3_SEEK_END) {
+        target = end + pos;
+    }
+    if (target < 0) {
+        target = 0;
+    }
+    if (target > end) {
+        target = end;
+    }
+    stream->position = target;
+    if (result != nullptr) {
+        *result = target;
+    }
+    return V3_OK;
+}
+
+v3_result V3_API StreamTell(void* self, int64_t* pos)
+{
+    auto* const stream = static_cast<MemoryStream*>(self);
+    if (stream == nullptr || pos == nullptr) {
+        return V3_INVALID_ARG;
+    }
+    *pos = stream->position;
+    return V3_OK;
+}
+
+const v3_bstream_cpp g_stream_vtable = {
+    {StreamQueryInterface, HostRef, HostUnref},
+    {StreamRead, StreamWrite, StreamSeek, StreamTell},
+};
+
 class Vst3Plugin final : public HostedPlugin, public HostMainClient {
 public:
     ~Vst3Plugin() override
@@ -567,6 +667,55 @@ public:
     uint32_t ChannelCount() const override { return channel_count_; }
     const char* Name() const override { return name_[0] != '\0' ? name_ : nullptr; }
     PluginFormat Format() const override { return PluginFormat::Vst3; }
+    unsigned long EditorWindow() const override { return PluginWindowHandle(window_); }
+
+    // The component's state - the processor half, which is the half that carries the settings.
+    //
+    // The controller keeps its own state as well, but only for things the processor does not need,
+    // and a controller that is fed the component state through set_component_state ends up in
+    // step. That is the order used on restore below, and it is the order the SDK's own host uses.
+    bool SaveState(std::vector<uint8_t>& out) override
+    {
+        if (component_ == nullptr) {
+            return false;
+        }
+        std::vector<uint8_t> raw;
+        MemoryStream stream{&g_stream_vtable, &raw, 0};
+        auto* const vt = *reinterpret_cast<v3_component_cpp**>(component_);
+        if (vt->comp.get_state == nullptr ||
+            vt->comp.get_state(component_, reinterpret_cast<v3_bstream**>(&stream)) != V3_OK) {
+            return false;
+        }
+        StateBegin(out, kStateTagVst3);
+        out.insert(out.end(), raw.begin(), raw.end());
+        return true;
+    }
+
+    bool LoadState(const uint8_t* data, size_t size) override
+    {
+        size_t body = 0;
+        const uint8_t* const payload = StateBody(data, size, kStateTagVst3, &body);
+        if (payload == nullptr || component_ == nullptr) {
+            return false;
+        }
+        std::vector<uint8_t> raw(payload, payload + body);
+
+        MemoryStream to_component{&g_stream_vtable, &raw, 0};
+        auto* const vt = *reinterpret_cast<v3_component_cpp**>(component_);
+        if (vt->comp.set_state == nullptr ||
+            vt->comp.set_state(component_, reinterpret_cast<v3_bstream**>(&to_component)) != V3_OK) {
+            return false;
+        }
+        if (controller_ != nullptr) {
+            MemoryStream to_controller{&g_stream_vtable, &raw, 0};
+            auto* const ctrl = *reinterpret_cast<v3_edit_controller_cpp**>(controller_);
+            if (ctrl->ctrl.set_component_state != nullptr) {
+                ctrl->ctrl.set_component_state(
+                    controller_, reinterpret_cast<v3_bstream**>(&to_controller));
+            }
+        }
+        return true;
+    }
 
     bool OpenEditor() override
     {

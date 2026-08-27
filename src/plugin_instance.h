@@ -17,6 +17,8 @@
 #define FXBRIDGE_PLUGIN_INSTANCE_H
 
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 enum class PluginFormat { Unknown, Clap, Vst2, Vst3 };
 
@@ -36,8 +38,63 @@ public:
     virtual bool OpenEditor() = 0;
     virtual void CloseEditor() = 0;
 
+    // The X11 id of that window, or zero when there is none. The window pump knows which
+    // window the user closed but not which effect owns it, and this is how it finds out.
+    virtual unsigned long EditorWindow() const { return 0; }
+
+    // The plugin's own settings, serialised by the plugin itself.
+    //
+    // Resolve saves the effect and the carrier's parameters in the project. It knows nothing
+    // about what a hosted plugin keeps inside, so a reopened project restored the right
+    // plugin at its defaults - reported by Delirio on 2026-08-27.
+    //
+    // A format that cannot produce a blob returns false rather than an empty one. Empty is a
+    // legitimate state for a plugin with nothing to say, and restoring it must stay possible.
+    virtual bool SaveState(std::vector<uint8_t>& out) { (void)out; return false; }
+    virtual bool LoadState(const uint8_t* data, size_t size)
+    {
+        (void)data;
+        (void)size;
+        return false;
+    }
+
     virtual PluginFormat Format() const = 0;
 };
+
+// Eight bytes of magic, then four naming the format that wrote the payload.
+//
+// The tag is not decoration. A VST3 component state handed to a VST2 plugin's setChunk is not
+// a restore that fails, it is a plugin parsing a foreign buffer as its own - and that is a
+// crash inside Resolve with our name on it.
+constexpr size_t kStateHeaderSize = 12;
+constexpr char kStateMagic[8] = {'F', 'X', 'B', 'S', 'T', 'A', 'T', '1'};
+constexpr const char* kStateTagVst2Chunk = "V2CK";
+constexpr const char* kStateTagVst2Params = "V2PM";
+constexpr const char* kStateTagVst3 = "V3CS";
+constexpr const char* kStateTagClap = "CLST";
+
+inline void StateBegin(std::vector<uint8_t>& out, const char* tag)
+{
+    out.clear();
+    out.insert(out.end(), kStateMagic, kStateMagic + sizeof(kStateMagic));
+    out.insert(out.end(), tag, tag + 4);
+}
+
+// The payload, or null when the blob is not ours or was written by a different format.
+inline const uint8_t* StateBody(const uint8_t* data, size_t size, const char* tag, size_t* body)
+{
+    if (data == nullptr || body == nullptr || size < kStateHeaderSize) {
+        return nullptr;
+    }
+    if (std::memcmp(data, kStateMagic, sizeof(kStateMagic)) != 0) {
+        return nullptr;
+    }
+    if (std::memcmp(data + sizeof(kStateMagic), tag, 4) != 0) {
+        return nullptr;
+    }
+    *body = size - kStateHeaderSize;
+    return data + kStateHeaderSize;
+}
 
 // Builds one, or returns null with the reason logged. `path` is what the scanner recorded.
 //

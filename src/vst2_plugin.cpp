@@ -215,6 +215,76 @@ public:
     uint32_t ChannelCount() const override { return effect_ != nullptr ? channels_ : 0; }
     const char* Name() const override { return name_; }
     PluginFormat Format() const override { return PluginFormat::Vst2; }
+    unsigned long EditorWindow() const override { return PluginWindowHandle(window_); }
+
+    // Settings, the way VST2 defines them: one opaque blob when the plugin says it keeps one,
+    // and otherwise the parameter values read out one at a time.
+    //
+    // effGetChunk hands back a pointer into the PLUGIN's own memory. It stays valid only until the
+    // plugin is called again, so the bytes are copied here and now.
+    bool SaveState(std::vector<uint8_t>& out) override
+    {
+        if (effect_ == nullptr) {
+            return false;
+        }
+        if ((effect_->flags & kEffFlagsProgramChunks) != 0) {
+            void* chunk = nullptr;
+            const intptr_t size = Dispatch(kEffGetChunk, 0, 0, &chunk, 0.0f);
+            if (chunk != nullptr && size > 0) {
+                StateBegin(out, kStateTagVst2Chunk);
+                const auto* const bytes = static_cast<const uint8_t*>(chunk);
+                out.insert(out.end(), bytes, bytes + static_cast<size_t>(size));
+                return true;
+            }
+        }
+        if (effect_->numParams <= 0 || effect_->getParameter == nullptr) {
+            return false;
+        }
+        StateBegin(out, kStateTagVst2Params);
+        for (int32_t index = 0; index < effect_->numParams; ++index) {
+            float value = 0.0f;
+            try {
+                value = effect_->getParameter(effect_, index);
+            } catch (...) {
+                return false;  // a dead Wine host throws; a half-written state is worse than none
+            }
+            const auto* const raw = reinterpret_cast<const uint8_t*>(&value);
+            out.insert(out.end(), raw, raw + sizeof(value));
+        }
+        return true;
+    }
+
+    bool LoadState(const uint8_t* data, size_t size) override
+    {
+        if (effect_ == nullptr) {
+            return false;
+        }
+        size_t body = 0;
+        if (const uint8_t* const chunk = StateBody(data, size, kStateTagVst2Chunk, &body)) {
+            Dispatch(kEffSetChunk, 0, static_cast<intptr_t>(body),
+                     const_cast<uint8_t*>(chunk), 0.0f);
+            return true;
+        }
+        if (const uint8_t* const values = StateBody(data, size, kStateTagVst2Params, &body)) {
+            if (effect_->setParameter == nullptr) {
+                return false;
+            }
+            const size_t count = body / sizeof(float);
+            const size_t limit = effect_->numParams > 0
+                                     ? static_cast<size_t>(effect_->numParams) : 0;
+            for (size_t index = 0; index < count && index < limit; ++index) {
+                float value = 0.0f;
+                std::memcpy(&value, values + index * sizeof(float), sizeof(value));
+                try {
+                    effect_->setParameter(effect_, static_cast<int32_t>(index), value);
+                } catch (...) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
 
     bool OpenEditor() override
     {
