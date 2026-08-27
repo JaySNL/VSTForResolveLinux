@@ -2166,7 +2166,23 @@ extern "C" void BridgeReportSlot(unsigned int slot, void* self)
     if (entry.offset == kUpdateEffectEditTitleOffset) {
         BridgeEditorShowFor(EffectOrFocused(self), "UpdateEffectEditTitle");
     } else if (entry.offset == kHideSubWindowsOffset) {
-        BridgeEditorHideFor(EffectOrFocused(self), "HideSubWindows");
+        ClaimedEffect* const effect = EffectOrFocused(self);
+
+        // A hide that arrives while the window is already gone is Resolve's own toggle out of
+        // phase, not a hide. Closing the editor with the window manager tells this bridge, and
+        // there is no way to tell Resolve: its editor object still believes it is showing, so
+        // the first press of the panel button afterwards spends itself hiding nothing and the
+        // window appears not to come back at all.
+        //
+        // Measured on Delirio's log, 2026-08-27: one "editor: shown" in the whole
+        // session, then "window: the window manager closed an editor", and the next thing
+        // through this slot is HideSubWindows. Re-reading it as a show puts the phase back in
+        // one press instead of two, and the log line says which reading was used.
+        if (effect != nullptr && !effect->editor_shown.load()) {
+            BridgeEditorShowFor(effect, "a hide arrived with the window already closed");
+        } else {
+            BridgeEditorHideFor(effect, "HideSubWindows");
+        }
     }
 }
 
