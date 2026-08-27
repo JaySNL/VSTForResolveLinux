@@ -70,34 +70,22 @@ single Waves shell.
 
 Requires **DaVinci Resolve Studio 21** on Linux. The free version does not load this ABI.
 
-### Either download the binary
+There are two ways in. **Pick one and follow it to the end** — they do not interleave.
 
-Every release carries a prebuilt `libfxbridge.so`, free of cost, next to the source it was built
-from.
+| | Method 1 — build it | Method 2 — download the binary |
+|---|---|---|
+| You need | the Carla dev headers, zlib, Xlib, a C++17 compiler | nothing but `curl` |
+| Config file | written for you | you add one line |
+| Best when | you want the newest code | you want it working in a minute |
 
-```sh
-mkdir -p ~/.local/share/BMDAudioPlugins
-curl -L -o ~/.local/share/BMDAudioPlugins/libfxbridge.so \
-  https://github.com/JaySNL/VSTForResolveLinux/releases/latest/download/libfxbridge.so
-```
+---
 
-It is compiled on Ubuntu 20.04, so it asks for `GLIBC_2.16`, `GLIBCXX_3.4.22` and `CXXABI_1.3.9` at
-most — libstdc++ from GCC 6.1 onward, which covers Ubuntu 18.04, Debian 9, Rocky 8 and Fedora 25 and
-newer. Read the floor yourself with:
+### Method 1 — build it
 
-```sh
-objdump -T libfxbridge.so | grep -o 'GLIBC[X]*_[0-9.]*' | sort -uV | tail -3
-```
+`build.sh` compiles, installs **and** writes Resolve's config line for you.
 
-Whether **Resolve itself** runs on distributions that old is a separate question, and one this
-project has not tested.
-
-### Or build it
-
-Needs zlib, Xlib, a C++17 compiler, and the **Carla development headers**.
-
-`build.sh` compiles `src/carla_host.cpp` against `/usr/include/carla/includes`, so without those
-headers the build stops at `fatal error: CarlaNative.h`. Install them first:
+**Step 1. Install the Carla development headers.** `build.sh` compiles `src/carla_host.cpp` against
+`/usr/include/carla/includes`; without them it stops at `fatal error: CarlaNative.h`.
 
 | Distribution | Package |
 |---|---|
@@ -106,53 +94,102 @@ headers the build stops at `fatal error: CarlaNative.h`. Install them first:
 
 Reported on Linux Mint 22.3 by u/slangbein, who also supplied the fix.
 
+**Step 2. Close DaVinci Resolve.** Resolve owns its config file and rewrites it on quit, so an edit
+made while it runs is thrown away. `build.sh` refuses to touch the file while Resolve is open.
+
+**Step 3. Build.**
+
 ```sh
 git clone --recurse-submodules https://github.com/JaySNL/VSTForResolveLinux.git
 cd VSTForResolveLinux
 ./build.sh
 ```
 
-`build.sh` compiles and installs in one step, so the file on disk is always the one just built.
+That compiles, installs to `~/.local/share/BMDAudioPlugins/libfxbridge.so`, and adds the
+`BMDPlugins.Path` line to `~/.local/share/DaVinciResolve/configs/config-fairlight.dat` — keeping a
+timestamped copy of your file first. Run it twice and nothing is duplicated.
 
-### Then, either way
+`FXBRIDGE_NO_CONFIGURE=1 ./build.sh` skips the config step and prints the line instead.
 
-**`build.sh` now points Resolve at the library for you.** It writes one line to
-`~/.local/share/DaVinciResolve/configs/config-fairlight.dat`, keeps a timestamped copy of the file
-first, and refuses if Resolve is running. `FXBRIDGE_NO_CONFIGURE=1` skips it and prints the line
-instead.
+**Step 4. Start Resolve.** The plugins are in the Audio FX panel.
 
-If you downloaded the binary rather than building, add it by hand:
+That is the whole method. Nothing below Step 4 applies to you.
+
+---
+
+### Method 2 — download the binary
+
+Every release carries a prebuilt `libfxbridge.so`, free of cost, next to the source it was built
+from.
+
+**Step 1. Download it.**
+
+```sh
+mkdir -p ~/.local/share/BMDAudioPlugins
+curl -L -o ~/.local/share/BMDAudioPlugins/libfxbridge.so \
+  https://github.com/JaySNL/VSTForResolveLinux/releases/latest/download/libfxbridge.so
+```
+
+**Step 2. Close DaVinci Resolve.** It owns the config file and rewrites it on quit, so an edit made
+while it runs is thrown away. This step is not optional.
+
+**Step 3. Add one line to the config file.** Open
 
 ```
-BMDPlugins.Path = /home/you/.local/share/BMDAudioPlugins/libfxbridge.so
+~/.local/share/DaVinciResolve/configs/config-fairlight.dat
 ```
 
-Three details matter, and **none of them announce themselves when wrong**:
+in a text editor, and add this line anywhere in it:
 
-- The value is the path to the **`.so` file**, not the directory holding it.
-- Write the path out in full. `~` is not expanded.
-- The key only takes effect in **`config-fairlight.dat`**. Resolve keeps it in `config.dat` across
-  restarts and ignores it there.
+```
+BMDPlugins.Path = /home/YOU/.local/share/BMDAudioPlugins/libfxbridge.so
+```
 
-Get any of them wrong and there is no error message. Resolve quietly loads its own plugin library
-and the Audio FX panel looks exactly as it did before. This readme published the wrong form until
-2026-08-26 — the directory, no `=`, and a `~` — which is three failures out of three.
+**Replace `YOU` with your own username.** `whoami` prints it. The path has to be written out in
+full: `~` and `$HOME` are not expanded here.
 
-**Close Resolve before editing that file.** It owns it and rewrites it on quit, so an edit made
-while it runs is thrown away.
+**Step 4. Start Resolve.** The plugins are in the Audio FX panel.
 
-Restart Resolve. The plugins are in the Audio FX panel.
+#### If Step 3 goes wrong, nothing tells you
+
+Resolve quietly loads its own plugin library and the Audio FX panel looks exactly as it did before.
+No error, no warning. Three things have to be right:
+
+- The value is the path to the **`.so` file**, not the folder it sits in.
+- The path is **absolute**, with your real username.
+- The key only works in **`config-fairlight.dat`**. Resolve keeps it in `config.dat` across restarts
+  and ignores it there.
+
+This readme published the wrong form until 2026-08-26 — the folder, no `=`, and a `~` — which is
+three failures out of three. Reported by Delirio, who also asked for these two methods to be
+pulled apart.
+
+#### What the prebuilt binary asks of your system
+
+Compiled on Ubuntu 20.04, so it asks for `GLIBC_2.16`, `GLIBCXX_3.4.22` and `CXXABI_1.3.9` at most —
+libstdc++ from GCC 6.1 onward, which covers Ubuntu 18.04, Debian 9, Rocky 8 and Fedora 25 and newer.
+Read the floor back rather than trusting it:
+
+```sh
+objdump -T ~/.local/share/BMDAudioPlugins/libfxbridge.so \
+  | grep -o 'GLIBC[X]*_[0-9.]*' | sort -uV | tail -3
+```
+
+Whether **Resolve itself** runs on distributions that old is a separate question, and one this
+project has not tested.
+
+---
 
 ### Nothing appeared?
 
-Ask whether the bridge was loaded at all:
+Either method. Ask whether the bridge was loaded at all:
 
 ```sh
 grep -c fxbridge ~/.local/share/DaVinciResolve/logs/ResolveDebug.txt
 ```
 
 **Zero** means Resolve never loaded it: the config line is wrong, or this is the free version rather
-than Studio. Anything above zero means it loaded, and these lines say what it found:
+than Studio. **Above zero** means it loaded, and these lines say what it found:
 
 ```sh
 grep 'fxbridge.*scan:' ~/.local/share/DaVinciResolve/logs/ResolveDebug.txt | head
