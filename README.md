@@ -60,17 +60,23 @@ single Waves shell.
   defaults. Resolve stores an effect's own parameters in the project and knows nothing about what
   a hosted plugin keeps inside, so there is nowhere to put them yet. `FXBRIDGE_STATE_STORE=1` is
   an opt-in stopgap — see *Settings between sessions*.
-- **Higher idle CPU than stock Resolve** — reported as 20–25% against 0–3%, on a machine where
-  Reaper hosting the same plugins is quiet. Not reproduced here and not diagnosed. The three
-  threads this library starts are named, so `top -H -p $(pgrep -f /opt/resolve/bin/resolve)` shows
-  which one is busy: `fxb-xpump` (X11 events, 30 ms), `fxb-tick` (plugin idle, 16 ms), `fxb-carla`.
+- **Higher idle CPU than stock Resolve on one machine** — reported as 20–25% against 0–3%, where
+  Reaper hosting the same plugins is quiet. **Not reproduced.** Measured here with five plugins
+  loaded and the timeline idle, the one bridge thread that runs costs **0.31 s of CPU over 321 s
+  alive — 0.10% of a core**. With no plugin loaded the bridge starts no threads at all. The three
+  it can start are named, so `top -H -p $(pgrep -f /opt/resolve/bin/resolve)` names the culprit
+  instead of guessing: `fxb-xpump` (X11 events, 30 ms), `fxb-tick` (plugin idle, 16 ms), and
+  `fxb-carla`, which cannot start at all in this build.
 - **A plugin's GUI is a separate window**, not a panel inside Resolve. The inspector panel for a
   bridged effect stays black on purpose. Under Wayland both windows go through XWayland.
 - **Resolve sometimes does not exit cleanly.** Undiagnosed.
 - **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
   *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
 - **Audio Units** — not applicable, Apple-only format.
-- **Tested on two machines**, both DaVinci Resolve Studio 21. One of them is mine.
+- **Tested on three machines**, all DaVinci Resolve Studio 21, and only one of them is mine. The
+  other two each found a bug this release fixes — an editor that would not reopen after the window
+  manager closed it, and an editor that never opened at all. Neither fix has been confirmed by the
+  person who reported it yet.
 
 > **Not a supported product.** It patches structures inside Resolve's own process at run time and
 > can take Resolve down mid-edit. Save often.
