@@ -240,11 +240,23 @@ std::atomic<size_t> g_effect_count{0};
 //
 // It runs on the host main thread rather than the window pump because that is the thread
 // this bridge already treats as a plugin's main thread - VST2 effEditIdle goes out on it.
+//
+// A project switch does force a pass, but indirectly, and the indirection is the point. The
+// switch is visible here: Resolve closes the old project and then claims the new project's
+// effects. Saving from that claim would be saving from Resolve's main thread, underneath
+// StudioModel::Deserialize - and a synchronous round trip into a yabridge plugin from that
+// thread is the deadlock that cost v0.1.1. So the claim only raises a flag, and this thread
+// does the work on its next tick, about 16 ms later. The outgoing project's effects are
+// still in the array with their final settings, because nothing ever removes them.
+// Set when a project is loading. The pass that follows catches the outgoing project's
+// settings before its plugins are forgotten - see the note on StateSaver.
+std::atomic<bool> g_state_flush{false};
+
 class StateSaver final : public HostMainClient {
 public:
     void OnHostMainTick() override
     {
-        if (++ticks_ < kTicksBetweenSaves) {
+        if (!g_state_flush.exchange(false) && ++ticks_ < kTicksBetweenSaves) {
             return;
         }
         ticks_ = 0;
@@ -2418,6 +2430,7 @@ int ClaimInstance(void* instance)
 
             // Settings from the last run, if the store is on and this plugin left any.
             if (StateStoreEnabled()) {
+                g_state_flush.store(true);
                 entry->state_key = StateStoreKey(path, class_name);
                 std::vector<uint8_t> saved;
                 if (StateStoreRead(entry->state_key, saved) &&

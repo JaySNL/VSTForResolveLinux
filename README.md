@@ -239,6 +239,12 @@ every ten seconds, and hand it back the next time that plugin is loaded.
 One file per plugin, under `~/.local/share/BMDAudioPlugins/state/`. Delete a file to get that
 plugin's defaults back.
 
+**When it saves.** On a timer, and on the load of any project — the second one is what makes a
+project switch keep the settings you just made, since the timer alone would lose up to ten seconds
+of them. Resolve never says that a project is closing, so there is no save at the close itself:
+the save happens as the *next* project loads, while the outgoing project's plugins are still
+there. Quitting Resolve straight from a project loses whatever changed in the last ten seconds.
+
 **Read this before turning it on.** The store is keyed by the plugin, not by the effect. Two
 instances of the same plugin in one project share one file, so both come back with whichever set
 of settings was saved last. That is wrong, and it is why this is opt-in rather than the default.
