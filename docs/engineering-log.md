@@ -803,3 +803,57 @@ a silent one.
 There is no moment to save at, which is why it is a timer. Resolve never tells the bridge that an
 effect is going away — `g_effect_count` only grows — so a project close, a project switch and a
 quit all look identical from here: nothing at all.
+
+### 2026-08-29 — the preset is not the channel
+
+Measured, in one session, on this machine: five plugins loaded (CLAP, VST2 and VST3, the last two
+through yabridge), settings changed, project saved, project reloaded.
+
+```
+editor trace installed on 26 slots
+trace: AudioPlugin::GetNumberOfParameters   6
+trace: AudioPlugin::UpdateParameterList     6
+trace: AudioPlugin::Update                  6
+trace: AudioPlugin::OnEditorIdle            6
+trace: AudioPlugin::HideSubWindows          4
+trace: AudioPlugin::GetResourcePath         3
+trace: AudioPlugin::GetEffectRect           3
+trace: AudioPlugin::UpdateEffectEditTitle   1
+trace: AudioPlugin::StorePreset             0
+trace: AudioPlugin::LoadPreset              0
+```
+
+The zero is a real zero. The slot count says 26, so both new entries were patched in, and
+`GetNumberOfParameters` is a `BMDAudioPluginImpl` method reached through the same vtable copy by
+the same mechanism — it fired. The trace cap only limits how many calls are *logged*, never how
+many happen, and the first six always log. `AudioPluginPreset` is the preset menu's object.
+Resolve does not put an effect through it to save a project.
+
+The file store is therefore not a stopgap for a better channel that exists. It is what exists.
+
+What the same log does hand over is the next lead: `GetNumberOfParameters` fired, so Resolve asks
+our effect about its parameters. If the values it reads are what lands in the project, then
+publishing the hosted plugin's parameters as the effect's own is the per-instance channel — and it
+would bring automation, which the file store never can. Measuring that means overriding four slots
+(`GetNumberOfParameters` +0x2c8, `GetParameterName` +0x2d0, `GetParameterValue` +0x318,
+`SetParameterValue` +0x310) and reading a saved project back. Not attempted yet.
+
+The other half of the same session: save and restore work end to end, first time, for all three
+formats.
+
+```
+state: restored 216 bytes into "PodcastPlugins TRACK"
+state: restored 2517 bytes into "soothe2"
+state: restored 3311 bytes into "Clarity Vx - DeReverb Mono"
+state: restored 3477 bytes into "NS1 Mono"
+state: restored 2320768 bytes into "smartEQ4"
+```
+
+Two classes out of one WaveShell got two files, so the path-plus-class key holds. smartEQ4's state
+is 2.3 MB, which is a 2.3 MB write every ten seconds while somebody is actively tweaking it.
+
+Idle cost, same session, five plugins hosted and no editor open: one bridge thread exists,
+`fxb-tick`, at **0.31 s of CPU over 321 s alive — 0.10% of one core**. `fxb-xpump` had not started
+because no editor was open, and `fxb-carla` cannot start at all. With no plugin instance at all,
+the bridge starts no threads: the tick is registered by a plugin wrapper's constructor. So the
+20-25% idle CPU reported from another machine is not one of these loops.

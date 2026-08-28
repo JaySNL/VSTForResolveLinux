@@ -249,10 +249,16 @@ there. Quitting Resolve straight from a project loses whatever changed in the la
 instances of the same plugin in one project share one file, so both come back with whichever set
 of settings was saved last. That is wrong, and it is why this is opt-in rather than the default.
 
-The right place for the state is Resolve's own `AudioPluginPreset` — the object it hands to
-`AudioPluginHost::AddPlaceholderPlugin` when it restores a plugin that is not loaded yet. Whether
-Resolve fills one on a project save is now traced in the log (`trace: AudioPlugin::StorePreset`)
-but has not been measured. Until it is, the store above is what there is.
+`AudioPluginPreset` looked like the right place for it — Resolve hands one to
+`AudioPluginHost::AddPlaceholderPlugin` when it restores a plugin that is not loaded yet. **It is
+not.** Both of its vtable slots were traced and run through a full session with five plugins,
+project saves and a reload: `StorePreset` and `LoadPreset` were called zero times, while eight
+other traced slots on the same object fired normally. That object serves the preset menu, not the
+project.
+
+So the file store is what there is. The lead that remains is the parameter model: Resolve does ask
+our effect for `GetNumberOfParameters`, and if it saves those values in the project then publishing
+the plugin's parameters as the effect's own is the per-instance channel — and automation with it.
 
 
 ## How it works
