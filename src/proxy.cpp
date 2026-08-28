@@ -28,6 +28,7 @@
 #include "plugin_instance.h"
 #include "fx_categories.h"
 #include "plugin_scan.h"
+#include "plugin_window.h"
 #include "plugin_state.h"
 #include "host_thread.h"
 
@@ -2473,6 +2474,12 @@ int ClaimInstance(void* instance)
     // a plugin that stalls costs its own editor rather than the whole application.
     if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true) && entry != nullptr) {
         entry->editor_wanted.store(true);
+        // And the thread that acts on that want. Until this call existed the pump started
+        // inside PluginWindowCreate, so the only thread that could open the first editor was
+        // one that a window had to exist to start. Every editor that did open was opened by
+        // Resolve's own panel button instead, which hid the hole on any machine where that
+        // button is used. Reported by u/Stroomer0 on 2026-08-28: plugins listed, no window.
+        PluginWindowStartPump();
     }
 
     return claimed;

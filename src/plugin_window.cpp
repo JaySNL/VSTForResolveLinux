@@ -238,10 +238,15 @@ PluginWindow* PluginWindowCreate(unsigned int width, unsigned int height, const 
     window->mapped = true;
     g_windows.push_back(window);
 
+    PluginWindowStartPump();
+    return window;
+}
+
+void PluginWindowStartPump()
+{
     if (!g_pump_running.exchange(true)) {
         g_pump = std::thread(EventPump);
     }
-    return window;
 }
 
 unsigned long PluginWindowHandle(const PluginWindow* window)

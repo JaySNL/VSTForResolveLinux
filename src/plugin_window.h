@@ -43,4 +43,11 @@ void* PluginWindowDisplay();
 
 void PluginWindowSetLogger(void (*logger)(const char*));
 
+// Starts the X event pump without a window to pump.
+//
+// The pump is also what re-asserts a wanted editor, and that is a thread away from Resolve's
+// main thread on purpose. Starting it only when a window is created made the first editor
+// unreachable: nothing could create the window that starts the thread that opens it.
+void PluginWindowStartPump();
+
 #endif
