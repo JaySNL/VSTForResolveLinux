@@ -471,6 +471,10 @@ ClaimedEffect* EffectOrFocused(void* self)
     return effect != nullptr ? effect : g_focused_effect.load();
 }
 
+// Defined further down, next to the state saver that also needs it. Declared here because the
+// editor pump has to know whether an effect still exists before it keeps a window open for it.
+bool EffectIsLive(const ClaimedEffect& effect);
+
 extern "C" void BridgeEditorShowFor(ClaimedEffect* effect, const char* because)
 {
     if (effect == nullptr || effect->plugin == nullptr) {
@@ -541,6 +545,16 @@ extern "C" void BridgeEditorReassert()
     const size_t count = g_effect_count.load();
     for (size_t index = 0; index < count; ++index) {
         ClaimedEffect& effect = g_effects[index];
+
+        // An effect that Resolve has deleted keeps no window. Its vtable pointer is no longer
+        // ours, so the object behind that editor is gone, and a window left on screen is both a
+        // confusing artefact and a pointer waiting to be used. Reported by the tester on
+        // 2026-08-29: deleting a plugin from a clip or a track leaves its GUI open from time to
+        // time. This runs on the pump thread, which owns our windows, and closes only ours.
+        if (effect.editor_shown.load() && !EffectIsLive(effect)) {
+            BridgeEditorHideFor(&effect, "the effect is gone from the project");
+            continue;
+        }
         if (effect.editor_wanted.load() && !effect.editor_shown.load()) {
             BridgeEditorShowFor(&effect, "the effect wants a window");
         }
@@ -2333,23 +2347,21 @@ extern "C" void BridgeReportSlot(unsigned int slot, void* self)
     if (entry.offset == kUpdateEffectEditTitleOffset) {
         BridgeEditorShowFor(EffectOrFocused(self), "UpdateEffectEditTitle");
     } else if (entry.offset == kHideSubWindowsOffset) {
-        ClaimedEffect* const effect = EffectOrFocused(self);
-
-        // A hide that arrives while the window is already gone is Resolve's own toggle out of
-        // phase, not a hide. Closing the editor with the window manager tells this bridge, and
-        // there is no way to tell Resolve: its editor object still believes it is showing, so
-        // the first press of the panel button afterwards spends itself hiding nothing and the
-        // window appears not to come back at all.
+        // A hide is a hide. This used to re-read a hide that arrived while the window was already
+        // gone as a show, to put Resolve's toggle back in phase after the window manager closed
+        // one of our windows - Resolve's editor object still believes it is showing and there is
+        // no way to tell it otherwise.
         //
-        // Measured on Delirio's log, 2026-08-27: one "editor: shown" in the whole
-        // session, then "window: the window manager closed an editor", and the next thing
-        // through this slot is HideSubWindows. Re-reading it as a show puts the phase back in
-        // one press instead of two, and the log line says which reading was used.
-        if (effect != nullptr && !effect->editor_shown.load()) {
-            BridgeEditorShowFor(effect, "a hide arrived with the window already closed");
-        } else {
-            BridgeEditorHideFor(effect, "HideSubWindows");
-        }
+        // That guess cost more than it paid. Close a plugin window, then close the modal, and the
+        // window came straight back: the modal's own hide arrived with our window already gone and
+        // was read as a request to open it. Reported by the tester on 2026-08-29, at 00:53 of the
+        // recording.
+        //
+        // The guess is not needed any more, because there is a real signal now: clicking the
+        // effect in the Audio FX panel calls InitializeEffectEdit and opens the window. A press of
+        // the panel toggle that spends itself hiding nothing is a cheap failure next to a window
+        // that reopens against the user.
+        BridgeEditorHideFor(EffectOrFocused(self), "HideSubWindows");
     }
 }
 
@@ -2863,9 +2875,8 @@ int ClaimInstance(void* instance)
     NameInstance(audio_plugin_subobject, entry);
     RenameInstance(primary_base, entry);
 
-    // With no control tree there is no panel, and Resolve never calls InitializeEffectEdit - the
-    // editor path is gated on the panel existing. Verified on 2026-08-24: with the panel suppressed
-    // the log carries no InitializeEffectEdit line at all. So the bridge has to open the window.
+    // RETRACTED. This said that with no control tree Resolve never calls InitializeEffectEdit, on a
+    // 2026-08-24 reading of the log. It does call it - see the note below the deadlock warning.
     //
     // It must not open it HERE. This runs inside Resolve's LoadPlugin, and on a project switch that
     // whole chain sits under StudioModel::Deserialize on the main thread. Opening a bridged Windows
@@ -2879,8 +2890,25 @@ int ClaimInstance(void* instance)
     //
     // Only the want is recorded now. BridgeEditorReassert opens it from the window pump thread, so
     // a plugin that stalls costs its own editor rather than the whole application.
+    //
+    // OFF by default since v0.2.4, and the paragraph above it was wrong. Resolve DOES call
+    // InitializeEffectEdit with the panel suppressed - measured 2026-08-29, one click on the effect
+    // in the Audio FX panel logs "editor: shown (AudioPlugin::InitializeEffectEdit)". The
+    // 2026-08-24 measurement that said otherwise watched the primary slot; the one that fires is
+    // the AudioPlugin base at +0x7b0.
+    //
+    // So there is a real open signal and the bridge does not have to open every editor to be sure
+    // one can be opened. Opening them all was the worst thing this bridge did to a large project:
+    // every plugin GUI constructed during the project load, for effects the user may never touch.
+    // Reported as the biggest issue by the tester on 2026-08-29.
+    //
+    // The pump still starts here. It has to: it is the only thread that opens an editor, and until
+    // it existed the first window could never appear - u/Stroomer0, 2026-08-28, plugins listed and
+    // no window.
     if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true) && entry != nullptr) {
-        entry->editor_wanted.store(true);
+        if (EnabledByEnvironment("FXBRIDGE_OPEN_ON_CLAIM")) {
+            entry->editor_wanted.store(true);
+        }
         // And the thread that acts on that want. Until this call existed the pump started
         // inside PluginWindowCreate, so the only thread that could open the first editor was
         // one that a window had to exist to start. Every editor that did open was opened by
