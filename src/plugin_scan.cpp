@@ -699,10 +699,24 @@ void Scan()
     // Read what previous starts already learned. Every module found here is one Wine host that
     // does not have to be started to answer a question it answered before.
     ScanCacheLoad();
+
+    // The escape hatch is written BEFORE the loop it is an escape from.
+    //
+    // It used to be written after, from the list the loop had built. That is exactly backwards:
+    // a scan that finishes does not need a deny list, and a scan that hangs never wrote one. A
+    // tester on v0.2.5 hung here, looked in the directory, and found nothing but the library -
+    // no deny file to edit, no cache, and so no way past the module that stopped him. Nothing in
+    // this list needs the loop: every path is known from the candidate scan above.
+    std::vector<std::string> offered;
+    offered.reserve(candidates.size());
+    for (const Candidate& candidate : candidates) {
+        offered.push_back(candidate.path);
+    }
+    ScanDenyTemplateWrite(offered);
+
     int from_cache = 0;
     int opened = 0;
     int denied = 0;
-    std::vector<std::string> offered;
 
     // Said out loud before the work starts, because the work is invisible while it happens.
     // Opening one Windows VST3 through yabridge starts a Wine host, asks it, and shuts it down
@@ -730,8 +744,6 @@ void Scan()
     }
 
     for (const Candidate& candidate : candidates) {
-        offered.push_back(candidate.path);
-
         // Before anything is opened. That is the whole point of this list: a plugin that hangs the
         // scan has to be stoppable without being opened first.
         if (ScanDenied(candidate.path)) {
@@ -848,7 +860,6 @@ void Scan()
               [](const ScannedPlugin& a, const ScannedPlugin& b) { return a.name < b.name; });
 
     ScanCacheStore();
-    ScanDenyTemplateWrite(offered);
     Log("scan: %d modules answered from the cache, %d had to be opened, %d denied", from_cache,
         opened, denied);
     Log("scan: %zu plugins will be listed", g_plugins.size());
