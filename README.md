@@ -1,11 +1,24 @@
 # VST for Resolve on Linux
 
+[![Latest release](https://img.shields.io/github/v/release/JaySNL/VSTForResolveLinux?label=release&color=2b7489)](https://github.com/JaySNL/VSTForResolveLinux/releases)
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20Resolve%20Studio%2021-informational)](#install)
+[![Changelog](https://img.shields.io/badge/changelog-read-lightgrey)](CHANGELOG.md)
+
 **VST2, VST3 and CLAP plugins running inside DaVinci Resolve on Linux.** Not bounced out to an
 external editor — loaded on the track, with their own GUIs, live on the timeline.
 
-Blackmagic does not support this. Their manual lists VST as macOS and Windows only, and the Linux
-build ships no VST host at all — there is not one occurrence of `VSTPluginMain` or
-`GetPluginFactory` anywhere under `/opt/resolve`.
+Blackmagic does not support this. Their manual lists VST as macOS and Windows only, and nothing in
+the Linux interface loads a VST.
+
+The binary is a different story. `libFairlightPage.so` carries a complete VST2 host — 198 symbols
+under `VSTPlugin`, including the chunk calls a plugin uses to save its state. Reading that host is
+what taught this project how Resolve stores plugin settings, and it is why your settings now live
+in the project file. Whether that code can be reached from the Linux interface at all is a separate
+question, and one this project has not answered.
+
+*(An earlier version of this readme said the Linux build ships no VST host. That was wrong, and the
+correction is worth more than the original claim was.)*
 
 ![Four plugins open at once inside Resolve: PodcastPlugins TRACK, Waves NS1, Waves Clarity Vx DeReverb and soothe2, with the mixer showing the effect chain](docs/media/plugins-running.png)
 
@@ -49,48 +62,6 @@ Blackmagic's; everything else is ours.
 Waves (Clarity Vx, NS1, RVox, DeBreath, F6, Vocal Rider, MaxxVolume, PAZ, Sibilance and more) ·
 Carla · custom CLAP plugins. **130 plugins listed** on the development machine, 75 of them from a
 single Waves shell.
-
-## It does not work, or not yet
-
-- **Two plugins draw a GUI but take no mouse input** — Smooth Operator Pro (VST2) and Accentize
-  SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. YMMV, i haven't been able to test EVERY vst yet.
-- **A plugin editor sometimes opens empty**, and fills only after the effect is removed and the
-  removal undone. Visible in the recording above. Not diagnosed; it is not tied to one format.
-- **A plugin-only change does not make the project dirty.** Settings themselves are kept now, in
-  the project — see *Settings between sessions*. What is missing is the nudge: Resolve serialises
-  the effects model only when it already thinks something changed, and an edit made inside a
-  hosted plugin's own window is invisible to it. The settings are not lost, they are written on
-  the next thing you do that Resolve can see. `FXBRIDGE_STATE_STORE=1` closes the gap for a
-  session that changes nothing else at all.
-- **Higher idle CPU than stock Resolve on one machine** — reported as 20–25% against 0–3%, where
-  Reaper hosting the same plugins is quiet. **Not reproduced.** Measured here with five plugins
-  loaded and the timeline idle, the one bridge thread that runs costs **0.31 s of CPU over 321 s
-  alive — 0.10% of a core**. With no plugin loaded the bridge starts no threads at all. The three
-  it can start are named, so `top -H -p $(pgrep -f /opt/resolve/bin/resolve)` names the culprit
-  instead of guessing: `fxb-xpump` (X11 events, 30 ms), `fxb-tick` (plugin idle, 16 ms), and
-  `fxb-carla`, which cannot start at all in this build.
-- **A plugin's GUI is a separate window**, not a panel inside Resolve. The inspector panel for a
-  bridged effect stays black on purpose. Under Wayland both windows go through XWayland. It is
-  listed in the window switcher and takes the keyboard when it opens; `FXBRIDGE_WINDOW_TYPE`
-  accepts `dialog` (the default), `utility` and `normal` if your window manager wants otherwise.
-- **An editor opens when you click the effect**, not when the project loads. Every plugin GUI used
-  to be constructed during the project load, which is the last thing a large project needs.
-  `FXBRIDGE_OPEN_ON_CLAIM=1` brings that back if a machine turns out to have no other way to open
-  a window.
-- **Resolve sometimes does not exit cleanly.** Undiagnosed.
-- **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
-  *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
-- **Audio Units** — not applicable, Apple-only format.
-- **Tested on three machines**, all DaVinci Resolve Studio 21, and only one of them is mine. The
-  other two each found a bug this release fixes — an editor that would not reopen after the window
-  manager closed it, and an editor that never opened at all. Neither fix has been confirmed by the
-  person who reported it yet.
-
-> **Not a supported product.** It patches structures inside Resolve's own process at run time and
-> can take Resolve down mid-edit. Save often.
-
-
-Every release, and what changed in it, is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -247,115 +218,62 @@ Both take effect on the next Resolve start. No rebuild.
 
 ## Settings between sessions
 
-**Your settings live in the Resolve project.** On by default since v0.2.3. A hosted plugin's own
-state travels inside the effect's `AudioPluginPreset`, so it belongs to that effect, it moves with
-the project, and it does not depend on a file sitting beside it. Nothing to turn on.
+**Your plugin settings live in the Resolve project.** On by default since v0.2.3, nothing to turn
+on. They belong to the effect, they move with the project, and they survive a chain that gets
+rearranged.
 
-Measured on 2026-08-29, eight effects on one timeline with the file store switched **off** so that
-nothing else could have supplied them: all eight attached on save and all eight came back on load,
-smartEQ4's 2,320,783-byte chunk included. Zero faults on either half.
+Verified with eight effects on one timeline: all eight saved and all eight restored, including a
+2.3 MB smartEQ4 chunk.
 
-**How it rides.** Resolve's own VST host does exactly this, and reading it is what made the fix
-possible. `VSTPlugin::StorePreset` picks between two payload shapes on one `AEffect` flag — a
-parameter table when the plugin has no chunk, the plugin's opaque chunk when it has one — and both
-travel in the same two fields, the pointer at `+0x00` and the length at `+0x08`, with a type tag at
-`+0x10` saying which. `EffectPresetHeader2` copies that length and that tag into the serialised
-header and `LoadAudioPluginPreset` copies both back, so an opaque blob round-trips through a
-project file. The length is a `uint32` on the way through: the ceiling is 4 GiB.
+**One thing to know.** Resolve writes the effects model only when it already thinks the project
+changed, and an edit made inside a plugin's own window is invisible to it. Nothing is lost — your
+change is written on the next thing you do that Resolve *can* see, a fader or a clip. If you want a
+session that changes nothing else to be covered too, start Resolve with `FXBRIDGE_STATE_STORE=1`.
 
-The bridge does not claim the tag. `BMDAudioPluginImpl::LoadPreset` never reads it — it checks only
-that the pointer is not null, the length is not zero and the first word of the buffer is at least
-2. So the carrier's payload is left exactly as it is and the chunk is appended behind a footer:
+The full account — how the channel was found, what it cannot do, and the two claims this project got
+wrong on the way — is in [`docs/settings.md`](docs/settings.md).
 
-    [ the carrier's own payload ][ the chunk ][ uint64 stamp ][ uint64 length ][ "FXBRIDG2" ]
+## It does not work, or not yet
 
-On the way back in, the length is set to the carrier's own for the duration of the stock call and
-restored afterwards, so the stock parser never sees a byte it did not write.
+- **Two plugins draw a GUI but take no mouse input** — Smooth Operator Pro (VST2) and Accentize
+  SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. YMMV, i haven't been able to test EVERY vst yet.
+- **A plugin editor sometimes opens empty**, and fills only after the effect is removed and the
+  removal undone. Visible in the recording above. Not diagnosed; it is not tied to one format.
+- **A plugin-only change does not make the project dirty.** Settings themselves are kept now, in
+  the project — see *Settings between sessions*. What is missing is the nudge: Resolve serialises
+  the effects model only when it already thinks something changed, and an edit made inside a
+  hosted plugin's own window is invisible to it. The settings are not lost, they are written on
+  the next thing you do that Resolve can see. `FXBRIDGE_STATE_STORE=1` closes the gap for a
+  session that changes nothing else at all.
+- **Higher idle CPU than stock Resolve on one machine** — reported as 20–25% against 0–3%, where
+  Reaper hosting the same plugins is quiet. **Not reproduced.** Measured here with five plugins
+  loaded and the timeline idle, the one bridge thread that runs costs **0.31 s of CPU over 321 s
+  alive — 0.10% of a core**. With no plugin loaded the bridge starts no threads at all. The three
+  it can start are named, so `top -H -p $(pgrep -f /opt/resolve/bin/resolve)` names the culprit
+  instead of guessing: `fxb-xpump` (X11 events, 30 ms), `fxb-tick` (plugin idle, 16 ms), and
+  `fxb-carla`, which cannot start at all in this build.
+- **A plugin's GUI is a separate window**, not a panel inside Resolve. The inspector panel for a
+  bridged effect stays black on purpose. Under Wayland both windows go through XWayland. It is
+  listed in the window switcher and takes the keyboard when it opens; `FXBRIDGE_WINDOW_TYPE`
+  accepts `dialog` (the default), `utility` and `normal` if your window manager wants otherwise.
+- **An editor opens when you click the effect**, not when the project loads. Every plugin GUI used
+  to be constructed during the project load, which is the last thing a large project needs.
+  `FXBRIDGE_OPEN_ON_CLAIM=1` brings that back if a machine turns out to have no other way to open
+  a window.
+- **Resolve sometimes does not exit cleanly.** Undiagnosed.
+- **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
+  *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
+- **Audio Units** — not applicable, Apple-only format.
+- **Tested on three machines**, all DaVinci Resolve Studio 21, and only one of them is mine. The
+  other two each found a bug this release fixes — an editor that would not reopen after the window
+  manager closed it, and an editor that never opened at all. Neither fix has been confirmed by the
+  person who reported it yet.
 
-**What it still needs from you.** Resolve serialises the effects model only when it already thinks
-the project changed, and an edit inside a hosted plugin's own window is invisible to it. Measured
-on 2026-08-29: a plugin-only change followed by Ctrl+S produced **zero** `StorePreset` calls, while
-moving a fader on a track carrying no effects at all produced **eight**, one for every effect in
-the project. The gate is project-wide, not per effect — so nothing is lost, it waits for the next
-thing you do that Resolve can see.
+> **Not a supported product.** It patches structures inside Resolve's own process at run time and
+> can take Resolve down mid-edit. Save often.
 
-Closing that gate properly is a door we cannot open yet. The path a real knob takes is
-`EDLEffectImpl::CreateEffectUndo` → `LoadPresetEDLPluginIncrementalChange` →
-`UndoManager::AddIncrementalChange`, and pushing an undo entry is what marks the project modified.
-That method is a no-op on every other class in the chain — `BMDChainFX::CreateEffectUndo` and
-`Effect::CreateEffectUndo` are 36 bytes each and contain nothing but a stack canary and `ret` — and
-reaching the `EDLEffectImpl` needs a clip id that `BMDAudioPluginImpl::GetClipID` reports as zero on
-every track effect.
 
-**The file store, for the one session the project cannot cover.** `FXBRIDGE_STATE_STORE=1` keeps
-the old behaviour running alongside: every plugin is asked for its state about every ten seconds
-and it goes to a file under `~/.local/share/BMDAudioPlugins/state/`. It does not care what Resolve
-thinks, so it covers the case above — a session whose only change is inside a plugin window, ended
-without touching anything else.
-
-    FXBRIDGE_STATE_STORE=1 /opt/resolve/bin/resolve
-
-The two are reconciled by time. Both carry a stamp — the project in its footer, the file in its
-mtime — and the newer one wins. A project chunk with no stamp, written before v0.2.3, counts as
-newer: the project is the store with real per-instance identity and the file store is the fallback.
-Getting that backwards loaded settings from an earlier session over the ones the project held, and
-cost a restart to notice.
-
-**Read this before turning the file store on.** It identifies an instance by its position among the
-effects hosting the same plugin, in the order Resolve loads them, because a file has nothing better
-to go on. So **rearranging a chain shuffles its settings**. The project path does not have this
-problem: a preset belongs to one effect. That difference is why the file store stayed opt-in.
-
-**How the channel was found.** The earlier answer here was that a project save asks the effect
-nothing at all, on the evidence that `StorePreset` and `LoadPreset` fired zero times across a
-session. **That was measured on the wrong vtable slots** — `+0x380` and `+0x388`, the primary ones.
-Resolve holds an `AudioPlugin*` and calls the thunks at `+0x990` and `+0x998`. Watching the right
-pair:
-
-* `LoadPreset` fires once per effect on every project load, and returns true;
-* `StorePreset` fires on a save for every effect that answers `IsDirty` true;
-* the payload is a parameter table — a version, a count, then a 64-byte name and a float each.
-
-`VSTPlugin` in `libFairlightPage.so` overrides exactly those two calls. An earlier note in the
-engineering log said no VST host class exists in the Linux build; it does — 198 symbols — and that
-note is retracted where it stands.
-
-The gate is `AudioPlugin::IsDirty()`, one byte at `AudioPlugin+0x99`, and Resolve clears it once it
-has taken the preset. Our effects answer it true unconditionally, because the alternative is to
-detect a change, and detection is exactly what does not work: two Waves F6-RTA edited by hand both
-returned a byte-identical state blob while smartEQ4 returned a changed one. Answering true costs
-one preset per save and removes that blind spot entirely. `FXBRIDGE_ALWAYS_DIRTY=0` turns it off.
-
-**Publishing the plugin's parameters was tried, and it does not work.** The idea was to report the
-hosted plugin's parameters as the effect's own, so the settings would live in the project and bring
-automation with them. It was measured on 2026-08-29 with a probe that reported four parameters more
-than the carrier owns, gave them values and names, and watched what came back after a save and a
-restart. Resolve plays along further than expected and stops short of the only step that matters:
-
-* it accepts a count no built-in effect has, and enumerates every index;
-* it calls `GetParameterName` on each one and takes the string;
-* it reads every value through `GetParameterValue`;
-* it saves the project, and stores **none** of them.
-
-Two full save-and-restart cycles, once with the four unnamed and once named `FXB Probe 0..3`, and
-neither pushed a single value back through `SetParameterValue` — while the carrier's own seven came
-back on every load, which is what proves the hook was live and listening. What Resolve persists is
-tied to the real `BMDControlParameter` objects in the vector at `this+0x2c8`; a count is not a
-parameter. `ExposeControl`, `HideControl`, `UpdateParameterList` and `BindParameterByName` are all
-exported and are the real way in, but no constructor and no vtable for `BMDControlParameter` is, so
-that is a much larger job than a vtable override. **The file store is what there is.**
-
-**One thing that raising the count will do is crash the project load.** `GetControlType` at `+0x2d8`
-is the one accessor in `BMDAudioPluginImpl` that indexes the control vector with no bounds check —
-one of twenty-nine, every other one branches first — and Fairlight calls it for every index while
-deserialising. Anyone repeating this experiment must override that slot and its thunk at `+0x900`
-first, or lose the project load to a null dereference at `+0x24`.
-
-**One known miss.** Some plugin editors do not tell the host when a single control is dragged.
-Waves F6-RTA pushes all 84 of its parameters on a preset recall — which is saved correctly — and
-reported nothing for one band moved by hand. Where the editor stays silent, nothing on this side
-can see the change.
-
+Every release, and what changed in it, is in [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 
