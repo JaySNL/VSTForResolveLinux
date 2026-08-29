@@ -55,6 +55,50 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.2.5 — 2026-08-29
+
+**Startup stops opening every plugin you own.**
+
+### Fixed
+
+- **A Wine host was started for every Windows VST3 on the machine, and kept alive for the whole
+  session.** This is the high-CPU report, and it was ours. Reading a VST3's class names means
+  opening the module, and for a Windows plugin that means yabridge starting a Wine host — which
+  the scan then kept open on purpose, on a note that said it "costs a file handle". Measured on a
+  tester's machine by turning the bridge off and on, with no project open:
+
+  | | disabled | enabled |
+  |---|---|---|
+  | Resolve threads | 229 | **706** |
+  | Memory in use | 9.5 GB | **22.8 GB** |
+  | Busiest thread | 4.9% | **3 × ~100%** |
+  | `pgrep -fc yabridge-host` | — | **336** |
+
+  Modules are closed after the scan reads them, and what they answered is cached. Measured here:
+  first start opens 21 modules, every start after opens **none**, with the same 130 plugins listed.
+- **A module that answers nothing is remembered too.** Leaving those out reopened ten of
+  twenty-one modules on every start — and a native Linux bundle sitting in a yabridge folder,
+  which answers nothing, is most of what a large collection has.
+
+### Added
+
+- **A plugin can file itself into a category.** A VST3 publishes its own subcategory through
+  `IPluginFactory2` — `Fx|EQ`, `Fx|Restoration` — and that is used when the hand-written name
+  table has no rule for it. Reported by a tester who saw 98% of his plugins land in the fallback,
+  because every rule in that table came from one person's collection. On a machine the table has
+  never heard of, this files about 45% of them: VST2 cannot answer without being instantiated, and
+  CLAP publishes `features` that the scan does not yet read.
+- `FXBRIDGE_SCAN_KEEP_OPEN=1` restores the old keep-everything-open behaviour.
+
+### Known
+
+- **The first start after installing or updating a plugin is still slow**, because that is when the
+  scan has to open it. The cache lives at `~/.local/share/BMDAudioPlugins/fxbridge-scan-cache.tsv`,
+  is keyed on each library's size and modification time, repairs itself if truncated, and can be
+  deleted at any time to force a rescan.
+
+---
+
 ## v0.2.4 — 2026-08-29
 
 **The editor opens when you ask for it.**
