@@ -1208,3 +1208,80 @@ open at once would probably be lost.
 ### Still open
 
 What marks the *project* modified from inside a plugin instance. See the clip-id problem above.
+
+---
+
+## 2026-08-29, evening — the scan can stop a start, and a stopped start left nothing to read
+
+A tester on v0.2.5 reported Resolve hanging on startup, then dying. The log he sent stopped four
+lines into Resolve's own startup and contained no `[fxbridge]` line at all. His plugin directory
+held `libfxbridge.so` and nothing else — no cache, no deny list.
+
+That absence is the finding. Both files are written *after* the scan loop, so their absence says
+the loop never reached its end. The hang is inside it.
+
+### Two things in the close path are outside the VST3 contract
+
+v0.2.5 started closing each module after the scan read it, which took the same tester's yabridge
+host count from 336 to zero. The close was right; how it closed was not.
+
+`GetPluginFactory` hands the caller a reference. The host side of `vst3_plugin.cpp` has always
+given it back — `Release(factory_)` in the destructor. `Vst3ListClasses` never did, and then
+called `ModuleExit` underneath it. On yabridge `ModuleExit` tears down the Wine host, so the
+reference still held pointed into a process that no longer existed.
+
+`ModuleExit` also ran on every path out, including the one where `ModuleEntry` had refused. Every
+native Linux VST3 sitting in the yabridge directory takes that path, and the comment in the file
+says so.
+
+Both are fixed. **Neither reproduces here**: a harness built against the v0.2.5 source, run over
+this machine's twelve yabridge bundles, returned exit 0 with the host count back where it started,
+and the Waves shell answered 718 classes in 1.606 s. They are fixed because they are wrong, not
+because they are proven to be his fault. Saying which of those two it is matters more than the fix.
+
+### The escape hatch was written after the thing it escapes
+
+The deny list is the only way past a plugin that hangs the scan. It was written from inside the
+loop, after the loop finished. A scan that finishes does not need it; a scan that hangs never wrote
+one. Nothing in the template needs the loop — every path comes from the candidate scan, which is
+already complete — so it is now written before the first module opens.
+
+This one came from Jay asking whether `build.sh` should write the file to stop it crashing on a
+no-op. It does not crash on a missing file: `ScanDenyList()` returns empty and `ScanDenied()`
+returns false, verified in the source. The question was aimed one step off a real defect, and the
+real defect was the ordering.
+
+### A module that does not come back is now skipped
+
+Reading a plugin's name runs that plugin's code inside Resolve. Before this, a plugin that hung or
+faulted there was permanent: every start opened the same modules in the same order and stopped in
+the same place, so everything after it was never seen. The scan could not get past its worst
+plugin.
+
+The scan now writes the module it is about to open to `fxbridge-scan-open.txt`, closed before the
+plugin's code runs, and unlinks it when the module answers. A name still there at the next start
+belongs to a module that did not come back: it goes to `fxbridge-scan-crashed.txt`, is skipped from
+then on, and is named in the log.
+
+Verified end to end, not by reading:
+
+| step | result |
+|---|---|
+| `timeout -s KILL 0.6` mid-scan | exit 137, note left naming the Waves shell |
+| next start | blamed it, wrote the file, `1 skipped`, scan completed, 55 plugins listed |
+| start after that | still skipped, `0 had to be opened` |
+| delete the file, start again | Waves shell answered 718 classes in 1.013 s |
+
+The kill lands on the Waves shell because it is the slowest module — about a second, against 0–1 ms
+for a native Linux plugin. That is the same reason a first start with a large Windows collection
+looks like a hang: the count of modules that have to be opened is now logged before the loop, and
+each module is named before it opens rather than after it answers.
+
+**A start killed by hand blames whatever was open at that moment.** That is the price of not being
+able to tell one dead process from another. It is why the skip is one line in a file the log names,
+and one delete away from being undone, and why it is never silent.
+
+### Still open
+
+Whether any of this is the tester's actual hang. His log had no bridge line in it, so the module
+that stopped him is still unnamed. v0.2.6 is the instrument that would name it.

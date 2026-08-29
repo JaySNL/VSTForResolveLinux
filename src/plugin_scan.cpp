@@ -12,6 +12,7 @@
 #include <map>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 
 namespace {
 
@@ -479,6 +480,127 @@ void ScanDenyTemplateWrite(const std::vector<std::string>& paths)
     Log("scan: wrote a deny-list template with %zu plugins, all commented out", paths.size());
 }
 
+// --- the module that did not come back ---------------------------------------------------------
+//
+// Opening a plugin runs the plugin's own code inside Resolve. A plugin that hangs or faults there
+// takes the whole start down with it, and every later start opens the same module again, in the
+// same order, and dies in the same place. The scan can never get past its worst plugin, so the
+// plugins after it are never seen either.
+//
+// So the scan writes down which module it is about to open, and rubs it out when that module
+// answers. A name still written down at the next start belongs to a module that did not come
+// back. It is recorded and skipped from then on, out loud - never silently, and never on a
+// plugin that merely returned nothing.
+//
+// A start killed by hand while the scan is running blames whichever module was open at that
+// moment. That is the price of not being able to tell one dead process from another, and it is
+// why the skip is one line in a file the log names, and one delete away from being undone.
+
+std::string ScanInFlightPath() { return ConfigPath("fxbridge-scan-open.txt"); }
+
+std::string ScanBadPath() { return ConfigPath("fxbridge-scan-crashed.txt"); }
+
+std::vector<std::string>& ScanBadList()
+{
+    static std::vector<std::string> bad;
+    return bad;
+}
+
+// Written and closed before the module opens, so it survives a process that never returns.
+void ScanInFlightMark(const std::string& path)
+{
+    const std::string file = ScanInFlightPath();
+    if (file.empty()) {
+        return;
+    }
+    if (std::FILE* const out = std::fopen(file.c_str(), "we")) {
+        std::fprintf(out, "%s\n", path.c_str());
+        std::fclose(out);
+    }
+}
+
+void ScanInFlightClear()
+{
+    const std::string file = ScanInFlightPath();
+    if (!file.empty()) {
+        ::unlink(file.c_str());
+    }
+}
+
+// Reads the note the previous start left, and the list of everything blamed before it.
+void ScanBadLoad()
+{
+    std::vector<std::string>& bad = ScanBadList();
+    bad.clear();
+
+    const std::string list = ScanBadPath();
+    if (!list.empty()) {
+        if (std::FILE* const in = std::fopen(list.c_str(), "re")) {
+            char line[1024];
+            while (std::fgets(line, sizeof(line), in) != nullptr) {
+                std::string entry = line;
+                while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r')) {
+                    entry.pop_back();
+                }
+                if (!entry.empty() && entry[0] != '#') {
+                    bad.push_back(entry);
+                }
+            }
+            std::fclose(in);
+        }
+    }
+
+    const std::string flight = ScanInFlightPath();
+    if (flight.empty()) {
+        return;
+    }
+    std::string stranded;
+    if (std::FILE* const in = std::fopen(flight.c_str(), "re")) {
+        char line[1024];
+        if (std::fgets(line, sizeof(line), in) != nullptr) {
+            stranded = line;
+            while (!stranded.empty() && (stranded.back() == '\n' || stranded.back() == '\r')) {
+                stranded.pop_back();
+            }
+        }
+        std::fclose(in);
+    }
+    ::unlink(flight.c_str());
+    if (stranded.empty()) {
+        return;
+    }
+
+    Log("scan: the last start stopped while it was opening %s. It is skipped from now on.",
+        stranded.c_str());
+    if (std::find(bad.begin(), bad.end(), stranded) == bad.end()) {
+        bad.push_back(stranded);
+        if (!list.empty()) {
+            const bool fresh = std::fopen(list.c_str(), "re") == nullptr;
+            if (std::FILE* const out = std::fopen(list.c_str(), "ae")) {
+                if (fresh) {
+                    std::fprintf(out, "%s",
+                                 "# Plugins that stopped a Resolve start while they were being\n"
+                                 "# opened. Each one was skipped from the scan after that.\n"
+                                 "#\n"
+                                 "# A start you killed by hand blames whatever was open at that\n"
+                                 "# moment, so a line here is not proof of a broken plugin.\n"
+                                 "# Delete a line to have that plugin tried again, or delete the\n"
+                                 "# whole file to try all of them.\n");
+                }
+                std::fprintf(out, "%s\n", stranded.c_str());
+                std::fclose(out);
+            }
+        }
+    }
+    Log("scan: delete %s to try it again", list.c_str());
+}
+
+bool ScanIsBad(const std::string& path)
+{
+    const std::vector<std::string>& bad = ScanBadList();
+    return std::find(bad.begin(), bad.end(), path) != bad.end();
+}
+
 std::string ScanCachePath()
 {
     const char* const home = std::getenv("HOME");
@@ -699,6 +821,7 @@ void Scan()
     // Read what previous starts already learned. Every module found here is one Wine host that
     // does not have to be started to answer a question it answered before.
     ScanCacheLoad();
+    ScanBadLoad();
 
     // The escape hatch is written BEFORE the loop it is an escape from.
     //
@@ -717,6 +840,7 @@ void Scan()
     int from_cache = 0;
     int opened = 0;
     int denied = 0;
+    int stopped = 0;
 
     // Said out loud before the work starts, because the work is invisible while it happens.
     // Opening one Windows VST3 through yabridge starts a Wine host, asks it, and shuts it down
@@ -726,7 +850,8 @@ void Scan()
     // cache and open nothing.
     int to_open = 0;
     for (const Candidate& candidate : candidates) {
-        if (candidate.format != PluginFormat::Vst3 || ScanDenied(candidate.path)) {
+        if (candidate.format != PluginFormat::Vst3 || ScanDenied(candidate.path) ||
+            ScanIsBad(candidate.path)) {
             continue;
         }
         unsigned long long size = 0;
@@ -748,6 +873,10 @@ void Scan()
         // scan has to be stoppable without being opened first.
         if (ScanDenied(candidate.path)) {
             ++denied;
+            continue;
+        }
+        if (ScanIsBad(candidate.path)) {
+            ++stopped;
             continue;
         }
         std::string name = Stem(candidate.path);
@@ -789,8 +918,12 @@ void Scan()
                 // or takes the process down with it writes nothing of its own, so the last line
                 // in the log has to be the one that says which module was being asked.
                 Log("scan: opening %s", candidate.path.c_str());
+                // On disk before the plugin's own code runs, and gone again the moment it
+                // answers. Nothing between these two lines is allowed to assume it returns.
+                ScanInFlightMark(candidate.path);
                 const auto started = std::chrono::steady_clock::now();
                 Vst3ListClasses(candidate.path.c_str(), classes, &declared);
+                ScanInFlightClear();
                 const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::steady_clock::now() - started)
                                        .count();
@@ -860,8 +993,9 @@ void Scan()
               [](const ScannedPlugin& a, const ScannedPlugin& b) { return a.name < b.name; });
 
     ScanCacheStore();
-    Log("scan: %d modules answered from the cache, %d had to be opened, %d denied", from_cache,
-        opened, denied);
+    Log("scan: %d modules answered from the cache, %d had to be opened, %d denied, %d skipped "
+        "after stopping a previous start",
+        from_cache, opened, denied, stopped);
     Log("scan: %zu plugins will be listed", g_plugins.size());
     for (const ScannedPlugin& plugin : g_plugins) {
         Log("scan:   %-5s %s", FormatName(plugin.format), plugin.path.c_str());

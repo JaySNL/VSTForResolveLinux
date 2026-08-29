@@ -7,7 +7,62 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
-## v0.2.5 — 2026-08-29
+## v0.2.6 — 2026-08-29
+
+**A plugin can no longer take the start down with it, and cannot block it twice.**
+
+v0.2.5 is withdrawn. A tester's Resolve hung on startup with it and left nothing behind to read:
+no bridge line in the log, no cache, no deny list — only the library. Every fix below follows from
+that one report.
+
+### Fixed
+
+- **The VST3 factory reference was never given back.** `GetPluginFactory` hands the caller a
+  reference. The host side of the bridge has always released it; the scan never did, and then
+  called `ModuleExit` underneath it. On yabridge `ModuleExit` shuts the Wine host down, so the
+  reference that was still held pointed into a process that no longer existed. Introduced in
+  v0.2.5, which is when the scan started closing modules at all.
+
+- **`ModuleExit` ran on modules that were never entered.** Every native Linux VST3 sitting in the
+  yabridge directory refuses `ModuleEntry` — and the close path told it to exit anyway. Also
+  introduced in v0.2.5.
+
+  Neither of these reproduces on the development machine: both Waves shells survive the old code
+  and the new. They are fixed because they are wrong, not because they are proven to be the cause
+  of the tester's hang.
+
+- **The deny list was written after the loop it exists to escape.** A scan that finishes does not
+  need a deny list; a scan that hangs never wrote one. The one person who needed the escape hatch
+  was the only one who could not have it. It is now written before the first module opens, from
+  the candidate list, which is complete by then. An edited file is still never overwritten.
+
+### Added
+
+- **A plugin that stops a start is skipped on the next one.** Reading a plugin's name runs that
+  plugin's code inside Resolve. Before v0.2.6, a plugin that hung or faulted there was permanent:
+  every start opened the same modules in the same order and stopped in the same place, so nothing
+  after it was ever reached.
+
+  The scan now writes down which module it is about to open and rubs the note out when that module
+  answers. A note still there at the next start names a module that did not come back. It goes
+  into `fxbridge-scan-crashed.txt`, is skipped from then on, and is named in the log — never
+  silently. A start killed by hand blames whatever was open at that moment, so delete a line to
+  try that plugin again, or the file to try all of them.
+
+  Verified by killing the scan with `SIGKILL` mid-module: the note survived and named the Waves
+  shell, the next start blamed it and got past it, the start after that still skipped it, and
+  deleting the file brought it back (718 classes, 1.013 s).
+
+- **The scan says what it is doing.** Each module is named *before* it is opened, so a module that
+  hangs or faults is the last line in the log instead of an absence. That absence is exactly what
+  the v0.2.5 report produced. The number of modules that have to be opened is logged before the
+  loop starts, because opening one Windows VST3 through yabridge costs about a second — 987 ms and
+  792 ms for the two Waves shells here — so a first start with a large collection is a minute of a
+  splash screen that does not move, and a tester reasonably read that as the program being stuck.
+
+---
+
+## v0.2.5 — 2026-08-29 (withdrawn)
 
 **Startup stops starting a Wine host for every plugin you own.**
 

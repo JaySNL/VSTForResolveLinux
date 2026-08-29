@@ -217,9 +217,9 @@ Vocal Rider
 DeBreath
 ```
 
-**Plugins to skip entirely** — `~/.local/share/BMDAudioPlugins/fxbridge-scan-deny.txt`. Written for
-you on the first run, listing every plugin found on the machine, all commented out. Delete the
-`# ` in front of a line to stop that plugin being opened at all:
+**Plugins to skip entirely** — `~/.local/share/BMDAudioPlugins/fxbridge-scan-deny.txt`. Written
+before the first plugin is opened, listing every plugin found on the machine, all commented out.
+Delete the `# ` in front of a line to stop that plugin being opened at all:
 
 ```
 # /home/you/.vst3/SomethingThatHangs.vst3
@@ -234,6 +234,17 @@ current scan.
 
 This matters mainly for the **first** start after installing a plugin, which is the one that has to
 open it, and for a plugin that hangs the scan — the check runs before anything is opened.
+
+**Plugins that stopped a start** — `~/.local/share/BMDAudioPlugins/fxbridge-scan-crashed.txt`. You
+do not write this one. Reading a plugin's name runs that plugin's code inside Resolve, so a plugin
+that hangs or faults there takes the start down with it — and without this, every later start would
+open the same module, in the same order, and stop in the same place. The scan notes which module it
+is about to open and rubs the note out when that module answers. A note still there at the next
+start names a module that did not come back: it is written to this file, skipped from then on, and
+named in the log.
+
+A start you kill by hand blames whatever was open at that moment, so a line here is not proof of a
+broken plugin. Delete a line to have that plugin tried again, or delete the file to try all of them.
 
 **Categories** — a VST3's own subcategory is used when the name table has no rule for it. To add a
 rule, edit `CategoryFor()` in `src/fx_categories.cpp`.
