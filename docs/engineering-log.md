@@ -739,7 +739,7 @@ tested there, the host application was not, and the release notes say so.
 
 ## 2026-08-27 — the first outside report
 
-`Delirio` installed v0.1.3 on their own machine and reported four things. Three of them
+Delirio installed v0.1.3 on their own machine and reported four things. Three of them
 have an answer in the source; the fourth does not, and saying which is which is the point of this
 entry.
 
