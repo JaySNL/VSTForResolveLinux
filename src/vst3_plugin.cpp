@@ -20,10 +20,12 @@
 #include <dirent.h>
 #include <poll.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -142,8 +144,37 @@ v3_result V3_API HandlerQueryInterface(void* self, const v3_tuid iid, void** obj
     return V3_NO_INTERFACE;
 }
 
+// The editor talks to the host, and the host is the only thing that reaches the processor.
+//
+// VST3 splits a plugin in two. The controller draws the editor; the component does the audio; they
+// are not required to share so much as a variable. When the user drags a band, the controller
+// calls performEdit on the host and stops there. The host has to carry that value to the processor
+// as a parameter change on the next process call - nothing else will.
+//
+// This used to be `return V3_OK` and nothing else, and one global handler shared by every effect,
+// which could not have said which plugin was speaking even if it had wanted to. Measured on
+// 2026-08-29: two F6-RTA editors set to visibly different curves, and both state files stayed
+// byte-identical to the moment they were created. The processor never heard a thing.
+class Vst3Plugin;
+void PluginParameterEdited(Vst3Plugin* plugin, v3_param_id id, double value);
+
+// One per effect, carrying the back-pointer the global handler never had.
+struct EditorHandler {
+    const v3_component_handler_cpp* vtable;
+    Vst3Plugin* owner;
+};
+
 v3_result V3_API HandlerBeginEdit(void*, v3_param_id) { return V3_OK; }
-v3_result V3_API HandlerPerformEdit(void*, v3_param_id, double) { return V3_OK; }
+
+v3_result V3_API HandlerPerformEdit(void* self, v3_param_id id, double value)
+{
+    auto* const handler = static_cast<EditorHandler*>(self);
+    if (handler != nullptr && handler->owner != nullptr) {
+        PluginParameterEdited(handler->owner, id, value);
+    }
+    return V3_OK;
+}
+
 v3_result V3_API HandlerEndEdit(void*, v3_param_id) { return V3_OK; }
 v3_result V3_API HandlerRestart(void*, int32_t) { return V3_OK; }
 
@@ -151,9 +182,96 @@ const v3_component_handler_cpp g_handler_vtable = {
     {HandlerQueryInterface, HostRef, HostUnref},
     {HandlerBeginEdit, HandlerPerformEdit, HandlerEndEdit, HandlerRestart},
 };
-const v3_component_handler_cpp* g_handler_vtable_pointer = &g_handler_vtable;
-v3_component_handler** const g_component_handler = reinterpret_cast<v3_component_handler**>(
-    const_cast<v3_component_handler_cpp**>(&g_handler_vtable_pointer));
+
+// The parameter changes handed to one process call.
+//
+// Both objects live inside the effect and are refilled per block, so the audio thread allocates
+// nothing. A queue carries a single point at offset zero: this is a knob being turned now, not an
+// automation curve being played back.
+constexpr int32_t kMaxQueuedParams = 128;
+
+struct ParamQueue {
+    const v3_param_value_queue_cpp* vtable;
+    v3_param_id id;
+    double value;
+};
+
+struct ParamChanges {
+    const v3_param_changes_cpp* vtable;
+    ParamQueue* queues;
+    int32_t count;
+};
+
+v3_result V3_API QueueQueryInterface(void* self, const v3_tuid iid, void** obj)
+{
+    if (std::memcmp(iid, v3_funknown_iid, sizeof(v3_tuid)) == 0 ||
+        std::memcmp(iid, v3_param_value_queue_iid, sizeof(v3_tuid)) == 0) {
+        *obj = self;
+        return V3_OK;
+    }
+    *obj = nullptr;
+    return V3_NO_INTERFACE;
+}
+
+v3_param_id V3_API QueueGetParamId(void* self)
+{
+    return static_cast<ParamQueue*>(self)->id;
+}
+
+int32_t V3_API QueueGetPointCount(void*) { return 1; }
+
+v3_result V3_API QueueGetPoint(void* self, int32_t index, int32_t* offset, double* value)
+{
+    if (index != 0 || offset == nullptr || value == nullptr) {
+        return V3_INVALID_ARG;
+    }
+    *offset = 0;
+    *value = static_cast<ParamQueue*>(self)->value;
+    return V3_OK;
+}
+
+v3_result V3_API QueueAddPoint(void*, int32_t, double, int32_t*) { return V3_NOT_IMPLEMENTED; }
+
+const v3_param_value_queue_cpp g_queue_vtable = {
+    {QueueQueryInterface, HostRef, HostUnref},
+    {QueueGetParamId, QueueGetPointCount, QueueGetPoint, QueueAddPoint},
+};
+
+v3_result V3_API ChangesQueryInterface(void* self, const v3_tuid iid, void** obj)
+{
+    if (std::memcmp(iid, v3_funknown_iid, sizeof(v3_tuid)) == 0 ||
+        std::memcmp(iid, v3_param_changes_iid, sizeof(v3_tuid)) == 0) {
+        *obj = self;
+        return V3_OK;
+    }
+    *obj = nullptr;
+    return V3_NO_INTERFACE;
+}
+
+int32_t V3_API ChangesGetParamCount(void* self)
+{
+    return static_cast<ParamChanges*>(self)->count;
+}
+
+v3_param_value_queue** V3_API ChangesGetParamData(void* self, int32_t index)
+{
+    auto* const changes = static_cast<ParamChanges*>(self);
+    if (index < 0 || index >= changes->count) {
+        return nullptr;
+    }
+    return reinterpret_cast<v3_param_value_queue**>(&changes->queues[index]);
+}
+
+// Input changes are ours to fill and the plugin's to read.
+v3_param_value_queue** V3_API ChangesAddParamData(void*, const v3_param_id*, int32_t*)
+{
+    return nullptr;
+}
+
+const v3_param_changes_cpp g_changes_vtable = {
+    {ChangesQueryInterface, HostRef, HostUnref},
+    {ChangesGetParamCount, ChangesGetParamData, ChangesAddParamData},
+};
 
 // --- the bundle ----------------------------------------------------------------------------------
 
@@ -514,6 +632,9 @@ const v3_bstream_cpp g_stream_vtable = {
     {StreamRead, StreamWrite, StreamSeek, StreamTell},
 };
 
+// Tells two effects of the same plugin apart in the log.
+int g_plugin_serial = 0;
+
 class Vst3Plugin final : public HostedPlugin, public HostMainClient {
 public:
     ~Vst3Plugin() override
@@ -648,6 +769,39 @@ public:
         data.inputs = &input;
         data.outputs = &output;
 
+        // Everything the editor changed since the last block. try_lock rather than lock: the
+        // editor thread holds this for a few instructions, and an audio thread that waits on a
+        // GUI thread is a dropout. A missed block costs one buffer of latency on a knob move.
+        process_calls_.fetch_add(1, std::memory_order_relaxed);
+
+        int32_t queued = 0;
+        if (param_lock_.try_lock()) {
+            for (const ParamPoint& point : pending_) {
+                queues_[queued].vtable = &g_queue_vtable;
+                queues_[queued].id = point.id;
+                queues_[queued].value = point.value;
+                if (++queued >= kMaxQueuedParams) {
+                    break;
+                }
+            }
+            pending_.clear();
+            param_lock_.unlock();
+        }
+        if (queued > 0) {
+            // Whether the audio thread ever finds anything to deliver. Without this line, an
+            // editor that sends nothing and a queue that is never drained look identical from
+            // outside, and both end with a state that does not change.
+            if (drains_logged_ < 12) {
+                ++drains_logged_;
+                Log("vst3: \"%s\" [%d] delivered %d parameter changes to the processor", name_,
+                    serial_, queued);
+            }
+            changes_.vtable = &g_changes_vtable;
+            changes_.queues = queues_;
+            changes_.count = queued;
+            data.input_params = reinterpret_cast<v3_param_changes**>(&changes_);
+        }
+
         auto* const vt = *reinterpret_cast<v3_audio_processor_cpp**>(processor_);
         // A bridged VST3 dies the same way a bridged VST2 does: yabridge throws when its Wine host
         // is gone, and an exception leaving an audio callback aborts Resolve. One effect going
@@ -674,46 +828,129 @@ public:
     // The controller keeps its own state as well, but only for things the processor does not need,
     // and a controller that is fed the component state through set_component_state ends up in
     // step. That is the order used on restore below, and it is the order the SDK's own host uses.
+    // Both halves of a VST3, because a VST3 keeps its settings in two places.
+    //
+    // The component is the processor and the controller is the editor, and the SDK does not
+    // require them to share anything: the host moves values between them. Saving only the
+    // component was enough for plugins that keep everything processor-side, and useless for the
+    // ones that do not. Measured on 2026-08-29: two Waves F6-RTA, bands moved on both, and both
+    // component states came back byte-identical - the F6 publishes four host parameters, so its
+    // six bands of controls are not values this side can route or read from the processor.
+    //
+    // Layout after the twelve-byte header: a four-byte length, the component state, a four-byte
+    // length, the controller state. The old component-only blobs carry the V3CS tag and are still
+    // read, so nothing saved before this is lost.
+    bool ReadStream(void* target, bool controller, std::vector<uint8_t>& into)
+    {
+        MemoryStream stream{&g_stream_vtable, &into, 0};
+        auto** const handle = reinterpret_cast<v3_bstream**>(&stream);
+        if (controller) {
+            auto* const vt = *reinterpret_cast<v3_edit_controller_cpp**>(target);
+            return vt->ctrl.get_state != nullptr &&
+                   vt->ctrl.get_state(target, handle) == V3_OK;
+        }
+        auto* const vt = *reinterpret_cast<v3_component_cpp**>(target);
+        return vt->comp.get_state != nullptr && vt->comp.get_state(target, handle) == V3_OK;
+    }
+
+    static void AppendLength(std::vector<uint8_t>& out, size_t length)
+    {
+        const uint32_t value = static_cast<uint32_t>(length);
+        const auto* const raw = reinterpret_cast<const uint8_t*>(&value);
+        out.insert(out.end(), raw, raw + sizeof(value));
+    }
+
     bool SaveState(std::vector<uint8_t>& out) override
     {
         if (component_ == nullptr) {
             return false;
         }
-        std::vector<uint8_t> raw;
-        MemoryStream stream{&g_stream_vtable, &raw, 0};
-        auto* const vt = *reinterpret_cast<v3_component_cpp**>(component_);
-        if (vt->comp.get_state == nullptr ||
-            vt->comp.get_state(component_, reinterpret_cast<v3_bstream**>(&stream)) != V3_OK) {
+        std::vector<uint8_t> component;
+        if (!ReadStream(component_, false, component)) {
             return false;
         }
-        StateBegin(out, kStateTagVst3);
-        out.insert(out.end(), raw.begin(), raw.end());
+        std::vector<uint8_t> controller;
+        if (controller_ != nullptr && !ReadStream(controller_, true, controller)) {
+            controller.clear();  // a controller with nothing to say is not a failure
+        }
+
+        StateBegin(out, kStateTagVst3Both);
+        AppendLength(out, component.size());
+        out.insert(out.end(), component.begin(), component.end());
+        AppendLength(out, controller.size());
+        out.insert(out.end(), controller.begin(), controller.end());
         return true;
+    }
+
+    // component->setState, then controller->setComponentState, then controller->setState. That
+    // order is the SDK's, and it matters: the last one must not be overwritten by the others.
+    bool WriteStream(void* target, int which, std::vector<uint8_t>& bytes)
+    {
+        MemoryStream stream{&g_stream_vtable, &bytes, 0};
+        auto** const handle = reinterpret_cast<v3_bstream**>(&stream);
+        if (which == 0) {
+            auto* const vt = *reinterpret_cast<v3_component_cpp**>(target);
+            return vt->comp.set_state != nullptr && vt->comp.set_state(target, handle) == V3_OK;
+        }
+        auto* const vt = *reinterpret_cast<v3_edit_controller_cpp**>(target);
+        auto* const call = which == 1 ? vt->ctrl.set_component_state : vt->ctrl.set_state;
+        return call != nullptr && call(target, handle) == V3_OK;
     }
 
     bool LoadState(const uint8_t* data, size_t size) override
     {
-        size_t body = 0;
-        const uint8_t* const payload = StateBody(data, size, kStateTagVst3, &body);
-        if (payload == nullptr || component_ == nullptr) {
+        if (component_ == nullptr) {
             return false;
         }
-        std::vector<uint8_t> raw(payload, payload + body);
+        size_t body = 0;
 
-        MemoryStream to_component{&g_stream_vtable, &raw, 0};
-        auto* const vt = *reinterpret_cast<v3_component_cpp**>(component_);
-        if (vt->comp.set_state == nullptr ||
-            vt->comp.set_state(component_, reinterpret_cast<v3_bstream**>(&to_component)) != V3_OK) {
+        // A blob from before the controller half was saved.
+        if (const uint8_t* const old = StateBody(data, size, kStateTagVst3, &body)) {
+            std::vector<uint8_t> component(old, old + body);
+            if (!WriteStream(component_, 0, component)) {
+                return false;
+            }
+            if (controller_ != nullptr) {
+                std::vector<uint8_t> again(old, old + body);
+                WriteStream(controller_, 1, again);
+            }
+            edits_logged_ = 0;
+            return true;
+        }
+
+        const uint8_t* const payload = StateBody(data, size, kStateTagVst3Both, &body);
+        if (payload == nullptr || body < sizeof(uint32_t)) {
+            return false;
+        }
+        uint32_t length = 0;
+        std::memcpy(&length, payload, sizeof(length));
+        if (sizeof(uint32_t) + length + sizeof(uint32_t) > body) {
+            return false;
+        }
+        std::vector<uint8_t> component(payload + sizeof(uint32_t),
+                                       payload + sizeof(uint32_t) + length);
+        const uint8_t* const after = payload + sizeof(uint32_t) + length;
+        uint32_t controller_length = 0;
+        std::memcpy(&controller_length, after, sizeof(controller_length));
+        if (sizeof(uint32_t) + length + sizeof(uint32_t) + controller_length > body) {
+            return false;
+        }
+        std::vector<uint8_t> controller(after + sizeof(uint32_t),
+                                        after + sizeof(uint32_t) + controller_length);
+
+        if (!WriteStream(component_, 0, component)) {
             return false;
         }
         if (controller_ != nullptr) {
-            MemoryStream to_controller{&g_stream_vtable, &raw, 0};
-            auto* const ctrl = *reinterpret_cast<v3_edit_controller_cpp**>(controller_);
-            if (ctrl->ctrl.set_component_state != nullptr) {
-                ctrl->ctrl.set_component_state(
-                    controller_, reinterpret_cast<v3_bstream**>(&to_controller));
+            std::vector<uint8_t> again = component;
+            WriteStream(controller_, 1, again);
+            if (!controller.empty()) {
+                WriteStream(controller_, 2, controller);
             }
         }
+        // Everything logged so far was the controller's opening broadcast. What matters is what
+        // arrives after this, which is the user.
+        edits_logged_ = 0;
         return true;
     }
 
@@ -795,7 +1032,83 @@ public:
     }
 
     // From the host main thread, with HostMainLock() already held.
-    void OnHostMainTick() override { run_loop_.Service(); }
+    void OnHostMainTick() override
+    {
+        run_loop_.Service();
+
+        // A parameter change reaches the processor inside a process call, and Resolve only makes
+        // those while audio is running. Move a control with the transport stopped and the change
+        // sits in the queue: the sound does not follow it, and neither does the saved state.
+        //
+        // The cure is the SDK's own: a process call with no audio in it, carrying only the
+        // changes. The host issues it, not the plugin.
+        //
+        // No lock is taken against the audio thread, because the block counter already answers
+        // the only question that matters. If a block ran since the last tick, audio is live and
+        // it drained the queue itself. Two quiet ticks - about 32 ms - mean nothing is calling
+        // process, so nothing can be racing this.
+        const uint64_t blocks = process_calls_.load(std::memory_order_relaxed);
+        const bool quiet = blocks == last_blocks_;
+        last_blocks_ = blocks;
+        if (!quiet) {
+            quiet_ticks_ = 0;
+            return;
+        }
+        if (++quiet_ticks_ < 2) {
+            return;
+        }
+        FlushParameters();
+    }
+
+    void FlushParameters()
+    {
+        if (processor_ == nullptr) {
+            return;
+        }
+        int32_t queued = 0;
+        {
+            const std::lock_guard<std::mutex> held(param_lock_);
+            for (const ParamPoint& point : pending_) {
+                queues_[queued].vtable = &g_queue_vtable;
+                queues_[queued].id = point.id;
+                queues_[queued].value = point.value;
+                if (++queued >= kMaxQueuedParams) {
+                    break;
+                }
+            }
+            pending_.clear();
+        }
+        if (queued == 0) {
+            return;
+        }
+
+        changes_.vtable = &g_changes_vtable;
+        changes_.queues = queues_;
+        changes_.count = queued;
+
+        v3_process_data data{};
+        data.process_mode = V3_REALTIME;
+        data.symbolic_sample_size = V3_SAMPLE_32;
+        data.nframes = 0;  // the whole point: parameters only, no audio
+        data.input_params = reinterpret_cast<v3_param_changes**>(&changes_);
+
+        auto* const vt = *reinterpret_cast<v3_audio_processor_cpp**>(processor_);
+        try {
+            vt->proc.process(processor_, &data);
+        } catch (...) {
+            if (!threw_) {
+                threw_ = true;
+                Log("vst3: \"%s\" threw while taking parameters with the transport stopped",
+                    name_);
+            }
+            return;
+        }
+        if (flushes_logged_ < 8) {
+            ++flushes_logged_;
+            Log("vst3: \"%s\" [%d] took %d parameter changes with no audio running", name_,
+                serial_, queued);
+        }
+    }
 
 private:
     // Which Audio Module class in the file is the plugin.
@@ -1008,7 +1321,17 @@ private:
             // A controller that came from query_interface is already initialised as the component.
             Log("vst3: controller initialize answered false for \"%s\"", name_);
         }
-        vt->ctrl.set_component_handler(controller_, g_component_handler);
+        vt->ctrl.set_component_handler(
+            controller_, reinterpret_cast<v3_component_handler**>(&handler_));
+
+        // How many parameters the controller admits to. This is the number that decides whether
+        // the editor can reach the processor at all: an F6 has six bands of seven controls, so a
+        // count of four means the controls being dragged are not host parameters, and no amount
+        // of routing on this side will carry them.
+        if (vt->ctrl.get_parameter_count != nullptr) {
+            Log("vst3: \"%s\" [%d] publishes %d parameters", name_, serial_,
+                vt->ctrl.get_parameter_count(controller_));
+        }
         ConnectComponentAndController();
     }
 
@@ -1053,6 +1376,51 @@ private:
     v3_plugin_view** view_ = nullptr;
     v3_connection_point** component_point_ = nullptr;
     v3_connection_point** controller_point_ = nullptr;
+    // Set from the editor's thread, drained by the audio thread. See PluginParameterEdited.
+    struct ParamPoint {
+        v3_param_id id;
+        double value;
+    };
+    std::mutex param_lock_;
+    std::vector<ParamPoint> pending_;
+    ParamQueue queues_[kMaxQueuedParams] = {};
+    ParamChanges changes_ = {};
+    EditorHandler handler_ = {&g_handler_vtable, this};
+    int serial_ = ++g_plugin_serial;
+    int edits_logged_ = 0;
+    int drains_logged_ = 0;
+    int flushes_logged_ = 0;
+    std::atomic<uint64_t> process_calls_{0};
+    uint64_t last_blocks_ = 0;
+    int quiet_ticks_ = 0;
+
+public:
+    // One control moved in the plugin's own editor.
+    //
+    // The newest value per parameter is what the processor needs, so a second move of the same
+    // knob before the next block replaces the first rather than queueing behind it.
+    void ParameterEdited(v3_param_id id, double value)
+    {
+        // Two effects hosting the same plugin are two objects with one name, and the log could
+        // not tell them apart. The serial can. Capped, because a knob drag is hundreds of these.
+        if (edits_logged_ < 8) {
+            ++edits_logged_;
+            Log("vst3: editor of \"%s\" [%d] moved parameter %u to %.4f", name_, serial_,
+                static_cast<unsigned>(id), value);
+        }
+        const std::lock_guard<std::mutex> held(param_lock_);
+        for (ParamPoint& point : pending_) {
+            if (point.id == id) {
+                point.value = value;
+                return;
+            }
+        }
+        if (pending_.size() < static_cast<size_t>(kMaxQueuedParams)) {
+            pending_.push_back({id, value});
+        }
+    }
+
+private:
     PluginWindow* window_ = nullptr;
     EditorRunLoop run_loop_;
 
@@ -1069,6 +1437,13 @@ private:
     std::vector<float> scratch_;
     std::vector<float*> scratch_pointers_;
 };
+
+void PluginParameterEdited(Vst3Plugin* plugin, v3_param_id id, double value)
+{
+    if (plugin != nullptr) {
+        plugin->ParameterEdited(id, value);
+    }
+}
 
 }  // namespace
 

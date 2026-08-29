@@ -70,7 +70,8 @@ constexpr size_t kStateHeaderSize = 12;
 constexpr char kStateMagic[8] = {'F', 'X', 'B', 'S', 'T', 'A', 'T', '1'};
 constexpr const char* kStateTagVst2Chunk = "V2CK";
 constexpr const char* kStateTagVst2Params = "V2PM";
-constexpr const char* kStateTagVst3 = "V3CS";
+constexpr const char* kStateTagVst3 = "V3CS";      // component only, written before 0.2.1
+constexpr const char* kStateTagVst3Both = "V3C2";  // component and controller
 constexpr const char* kStateTagClap = "CLST";
 
 inline void StateBegin(std::vector<uint8_t>& out, const char* tag)

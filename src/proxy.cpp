@@ -213,6 +213,8 @@ struct ClaimedEffect {
     std::string state_base;
     std::string state_key;
     std::vector<uint8_t> state_last;
+    bool state_said_gone = false;
+    bool state_said_mute = false;
 };
 
 // Fills both encodings from one name.
@@ -1916,6 +1918,10 @@ BRIDGE_HIDDEN2 void* g_trace_original_24 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk24();
 BRIDGE_HIDDEN2 void* g_trace_original_25 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk25();
+BRIDGE_HIDDEN2 void* g_trace_original_26 = nullptr;
+BRIDGE_HIDDEN2 void BridgeTraceThunk26();
+BRIDGE_HIDDEN2 void* g_trace_original_27 = nullptr;
+BRIDGE_HIDDEN2 void BridgeTraceThunk27();
 BRIDGE_HIDDEN2 void* g_trace_original_0 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk0();
 BRIDGE_HIDDEN2 void* g_trace_original_1 = nullptr;
@@ -1976,6 +1982,8 @@ asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk22", "g_trace_original_22", "22"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk23", "g_trace_original_23", "23"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk24", "g_trace_original_24", "24"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk25", "g_trace_original_25", "25"));
+asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk26", "g_trace_original_26", "26"));
+asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk27", "g_trace_original_27", "27"));
 
 namespace {
 
@@ -2022,6 +2030,12 @@ TraceSlot g_trace_slots[] = {
     // needs its own store. Nothing here answers that question - the log does, once.
     { 0x380, "StorePreset", &g_trace_original_24, reinterpret_cast<void*>(&BridgeTraceThunk24) },
     { 0x388, "LoadPreset", &g_trace_original_25, reinterpret_cast<void*>(&BridgeTraceThunk25) },
+    // How Resolve most likely saves an effect: by reading its parameters, one at a time,
+    // rather than by asking it for a blob. If a burst of these lands on a project save, the
+    // parameter list is the channel, and the settings belong in the project rather than in
+    // a file on a timer.
+    { 0x318, "GetParameterValue", &g_trace_original_26, reinterpret_cast<void*>(&BridgeTraceThunk26) },
+    { 0x340, "SetParameterValueFromText", &g_trace_original_27, reinterpret_cast<void*>(&BridgeTraceThunk27) },
 };
 
 constexpr int kTraceCap = 6;
@@ -2264,14 +2278,33 @@ public:
         const size_t count = g_effect_count.load();
         for (size_t index = 0; index < count; ++index) {
             ClaimedEffect& effect = g_effects[index];
-            if (effect.plugin == nullptr || effect.state_key.empty() || !EffectIsLive(effect)) {
+            if (effect.plugin == nullptr || effect.state_key.empty()) {
+                continue;
+            }
+
+            // Each of the three ways an effect can stop being saved says so once. Silence here
+            // reads as "saved fine" and is how a skipped effect went unnoticed on 2026-08-29.
+            if (!EffectIsLive(effect)) {
+                if (!effect.state_said_gone) {
+                    effect.state_said_gone = true;
+                    Log("state: %s is gone from the project - not saved any more",
+                        effect.state_key.c_str());
+                }
                 continue;
             }
             std::vector<uint8_t> current;
-            if (!effect.plugin->SaveState(current) || current == effect.state_last) {
+            if (!effect.plugin->SaveState(current)) {
+                if (!effect.state_said_mute) {
+                    effect.state_said_mute = true;
+                    Log("state: %s will not report its settings", effect.state_key.c_str());
+                }
+                continue;
+            }
+            if (current == effect.state_last) {
                 continue;
             }
             if (StateStoreWrite(effect.state_key, current)) {
+                Log("state: saved %zu bytes for %s", current.size(), effect.state_key.c_str());
                 effect.state_last.swap(current);
             }
         }
