@@ -857,3 +857,55 @@ Idle cost, same session, five plugins hosted and no editor open: one bridge thre
 because no editor was open, and `fxb-carla` cannot start at all. With no plugin instance at all,
 the bridge starts no threads: the tick is registered by a plugin wrapper's constructor. So the
 20-25% idle CPU reported from another machine is not one of these loops.
+
+### 2026-08-29 — settings, per instance
+
+v0.2.0 keyed the settings store by the plugin. Delirio asked the obvious question the same
+day: he runs a chain with the same compressor and the same EQ twice at different settings, and one
+file per plugin gives both copies whichever was touched last.
+
+An instance needs an identity that survives a save and a reload, and Resolve gives an effect none.
+`AudioPluginPreset` was already ruled out above. `BMDAudioPluginImpl::GetClipID` looked promising -
+it is a plain load from `this+0x1c8`, so it costs one `SafeRead` to try - and it is **zero on all
+fourteen effects of a session**. It is a clip id, and a track effect has no clip.
+
+What is left is the position in the chain, and the trap in it is that nothing here is ever freed.
+Counting every effect ever claimed gives the second project's first EQ the number 1, and the same
+project reopened a third number again. So the count runs over the effects that are still **live**,
+and liveness is read off the object itself:
+
+```c
+bool EffectIsLive(const ClaimedEffect& effect)
+{
+    unsigned long word = 0;
+    if (!SafeRead(effect.primary_base, &word, sizeof(word))) return false;
+    return word == reinterpret_cast<unsigned long>(g_our_vtable + 0x010);
+}
+```
+
+A claimed instance carries our vptr in its primary sub-object. Once Resolve frees it, that word is
+either unmapped or somebody else's, and `SafeRead` says so without faulting. The same test now also
+stops the save thread snapshotting plugins that no longer belong to anything, which it had been
+doing on a ten-second timer since the store was written.
+
+Tested with two Waves F6-RTA Mono on one track, set to visibly different curves:
+
+```
+743–942     pass 1: the project loads, five plugins, no F6
+43455/43494 two F6 added by hand - no restore, no files yet
+43590–43748 pass 2: the project reloads, seven effects
+  43610 hosting "F6-RTA Mono"  ->  43611 state: restored 2391 bytes into "F6-RTA Mono" #0
+  43666 hosting "F6-RTA Mono"  ->  43667 state: restored 2373 bytes into "F6-RTA Mono" #1
+```
+
+Two files, two different sizes, the right numbers. The sizes are the proof: one shared file would
+have restored the same bytes twice.
+
+The liveness test is what that second pass actually exercises. All five effects from pass 1 are
+still in the array, and the two F6 sit at chain positions 2 and 4 rather than next to each other.
+A broken liveness test would have handed `pp-track` the number 1 and the F6 pair 2 and 3.
+
+What it cannot do is survive a rearranged chain. Insert an EQ ahead of two others and everything
+after it shifts up a number, so they come back wearing each other's settings. Appending to the end
+and removing from the end are both safe. Better needs an identity from Resolve, and two candidates
+are now measured and dead.

@@ -242,8 +242,9 @@ every ten seconds, and hand it back the next time that plugin is loaded.
 
     FXBRIDGE_STATE_STORE=1 /opt/resolve/bin/resolve
 
-One file per plugin, under `~/.local/share/BMDAudioPlugins/state/`. Delete a file to get that
-plugin's defaults back.
+One file per plugin **instance**, under `~/.local/share/BMDAudioPlugins/state/`. The same EQ
+twice in one chain is two files and two sets of settings. Delete a file to get that instance's
+defaults back.
 
 **When it saves.** On a timer, and on the load of any project — the second one is what makes a
 project switch keep the settings you just made, since the timer alone would lose up to ten seconds
@@ -251,9 +252,11 @@ of them. Resolve never says that a project is closing, so there is no save at th
 the save happens as the *next* project loads, while the outgoing project's plugins are still
 there. Quitting Resolve straight from a project loses whatever changed in the last ten seconds.
 
-**Read this before turning it on.** The store is keyed by the plugin, not by the effect. Two
-instances of the same plugin in one project share one file, so both come back with whichever set
-of settings was saved last. That is wrong, and it is why this is opt-in rather than the default.
+**Read this before turning it on.** An instance is identified by its position among the effects
+that host the same plugin, in the order Resolve loads them — because Resolve gives an effect no
+identity of its own that survives a save. So **rearranging a chain shuffles the settings**: insert
+an EQ ahead of two others and both of them come back wearing the one behind's settings. Adding to
+the end, or removing from the end, is safe. That is the cost, and it is why this is opt-in.
 
 `AudioPluginPreset` looked like the right place for it — Resolve hands one to
 `AudioPluginHost::AddPlaceholderPlugin` when it restores a plugin that is not loaded yet. **It is

@@ -210,6 +210,7 @@ struct ClaimedEffect {
     // Where this effect's settings are stored, and what was last written there. Both are
     // empty unless FXBRIDGE_STATE_STORE=1. The copy is what makes the periodic save cheap:
     // an unchanged plugin costs one comparison and no file.
+    std::string state_base;
     std::string state_key;
     std::vector<uint8_t> state_last;
 };
@@ -249,40 +250,6 @@ std::atomic<size_t> g_effect_count{0};
 // thread is the deadlock that cost v0.1.1. So the claim only raises a flag, and this thread
 // does the work on its next tick, about 16 ms later. The outgoing project's effects are
 // still in the array with their final settings, because nothing ever removes them.
-// Set when a project is loading. The pass that follows catches the outgoing project's
-// settings before its plugins are forgotten - see the note on StateSaver.
-std::atomic<bool> g_state_flush{false};
-
-class StateSaver final : public HostMainClient {
-public:
-    void OnHostMainTick() override
-    {
-        if (!g_state_flush.exchange(false) && ++ticks_ < kTicksBetweenSaves) {
-            return;
-        }
-        ticks_ = 0;
-        const size_t count = g_effect_count.load();
-        for (size_t index = 0; index < count; ++index) {
-            ClaimedEffect& effect = g_effects[index];
-            if (effect.plugin == nullptr || effect.state_key.empty()) {
-                continue;
-            }
-            std::vector<uint8_t> current;
-            if (!effect.plugin->SaveState(current) || current == effect.state_last) {
-                continue;
-            }
-            if (StateStoreWrite(effect.state_key, current)) {
-                effect.state_last.swap(current);
-            }
-        }
-    }
-
-private:
-    static constexpr int kTicksBetweenSaves = 600;  // the tick is 16 ms, so about ten seconds
-    int ticks_ = 0;
-};
-
-StateSaver g_state_saver;
 std::mutex g_effect_append_lock;
 
 // The effect whose editor Resolve last opened. The window is shared, so one editor shows at a time.
@@ -2259,6 +2226,63 @@ constexpr long kInstanceScanForward = 0x140;
 
 unsigned char* g_stock_vtable = nullptr;
 unsigned char* g_our_vtable = nullptr;
+
+// Whether Resolve still owns this effect.
+//
+// Nothing tells the bridge that an effect is gone - the array only ever grows - so the object
+// itself is the only witness there is. A claimed instance carries our vptr in its primary
+// sub-object; once Resolve frees it, that word is either unmapped or somebody else's. Reading
+// it without faulting is exactly what SafeRead is for.
+//
+// This is what makes the per-instance key survive a project switch. Counting every effect ever
+// claimed would give the second project's first EQ the number 1, and the same project reopened
+// a third number again. Counting only the live ones gives it 0 every time.
+bool EffectIsLive(const ClaimedEffect& effect)
+{
+    if (effect.primary_base == nullptr) {
+        return true;  // never identified - assume live rather than silently drop it
+    }
+    unsigned long word = 0;
+    if (!SafeRead(effect.primary_base, &word, sizeof(word))) {
+        return false;
+    }
+    return word == reinterpret_cast<unsigned long>(g_our_vtable + 0x010);
+}
+
+// Set when a project is loading. The pass that follows catches the outgoing project's
+// settings before its plugins are forgotten - see the note on StateSaver.
+std::atomic<bool> g_state_flush{false};
+
+class StateSaver final : public HostMainClient {
+public:
+    void OnHostMainTick() override
+    {
+        if (!g_state_flush.exchange(false) && ++ticks_ < kTicksBetweenSaves) {
+            return;
+        }
+        ticks_ = 0;
+        const size_t count = g_effect_count.load();
+        for (size_t index = 0; index < count; ++index) {
+            ClaimedEffect& effect = g_effects[index];
+            if (effect.plugin == nullptr || effect.state_key.empty() || !EffectIsLive(effect)) {
+                continue;
+            }
+            std::vector<uint8_t> current;
+            if (!effect.plugin->SaveState(current) || current == effect.state_last) {
+                continue;
+            }
+            if (StateStoreWrite(effect.state_key, current)) {
+                effect.state_last.swap(current);
+            }
+        }
+    }
+
+private:
+    static constexpr int kTicksBetweenSaves = 600;  // the tick is 16 ms, so about ten seconds
+    int ticks_ = 0;
+};
+
+StateSaver g_state_saver;
 int g_instances_claimed = 0;
 
 // Write one slot in our own copy. No mprotect: this memory is ours and already writable.
@@ -2430,18 +2454,54 @@ int ClaimInstance(void* instance)
             }
 
             // Settings from the last run, if the store is on and this plugin left any.
+            //
+            // Keyed per instance, not per plugin: the same EQ twice in one chain is two sets of
+            // settings, and sharing one file gave both of them whichever was touched last.
+            //
+            // The instance number is its position among the LIVE effects that host the same
+            // plugin, counted in the order Resolve claims them. That order is the order it
+            // deserialises the project in, so it is the same on every open - and counting only
+            // live effects is what makes it survive a project switch, since the outgoing
+            // project's entries are still in this array and must not be counted.
+            //
+            // What it cannot survive is a chain that is rearranged. Insert an EQ ahead of two
+            // others and every one after it shifts up a number, so they come back wearing each
+            // other's settings. That is the known cost of having no identity from Resolve.
             if (StateStoreEnabled()) {
                 g_state_flush.store(true);
-                entry->state_key = StateStoreKey(path, class_name);
+                entry->state_base = StateStoreKey(path, class_name);
+                size_t ordinal = 0;
+                const size_t claimed_now = g_effect_count.load();
+                for (size_t other = 0; other < claimed_now; ++other) {
+                    const ClaimedEffect& sibling = g_effects[other];
+                    if (&sibling != entry && !sibling.state_base.empty() &&
+                        sibling.state_base == entry->state_base && EffectIsLive(sibling)) {
+                        ++ordinal;
+                    }
+                }
+                char suffix[24] = {0};
+                std::snprintf(suffix, sizeof(suffix), "-%zu", ordinal);
+                entry->state_key = entry->state_base + suffix;
+
                 std::vector<uint8_t> saved;
-                if (StateStoreRead(entry->state_key, saved) &&
-                    entry->plugin->LoadState(saved.data(), saved.size())) {
+                bool have = StateStoreRead(entry->state_key, saved);
+                if (!have && ordinal == 0) {
+                    // A file written before instance numbers existed. Read it once rather than
+                    // silently losing the settings of everyone who turned the store on in v0.2.0.
+                    have = StateStoreRead(entry->state_base, saved);
+                }
+                if (have && entry->plugin->LoadState(saved.data(), saved.size())) {
                     entry->state_last = saved;
-                    Log("state: restored %zu bytes into \"%s\"", saved.size(),
-                        entry->plugin->Name());
+                    Log("state: restored %zu bytes into \"%s\" #%zu", saved.size(),
+                        entry->plugin->Name(), ordinal);
                 }
                 HostMainRegister(&g_state_saver, 1000);
             }
+
+            // BMDAudioPluginImpl::GetClipID - the word at this+0x1c8 - would have been a better
+            // key than a position in a list, if it held anything. Measured on 2026-08-29: zero,
+            // on all fourteen effects of a session. It is a clip id, and a track effect has no
+            // clip. The probe is gone; the finding is in the engineering log.
         } else {
             Log("effect: no plugin for %s - audio passes through", path);
         }
