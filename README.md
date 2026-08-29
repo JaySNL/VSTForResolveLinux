@@ -238,13 +238,23 @@ open it, and for a plugin that hangs the scan — the check runs before anything
 **Plugins that stopped a start** — `~/.local/share/BMDAudioPlugins/fxbridge-scan-crashed.txt`. You
 do not write this one. Reading a plugin's name runs that plugin's code inside Resolve, so a plugin
 that hangs or faults there takes the start down with it — and without this, every later start would
-open the same module, in the same order, and stop in the same place. The scan notes which module it
-is about to open and rubs the note out when that module answers. A note still there at the next
-start names a module that did not come back: it is written to this file, skipped from then on, and
-named in the log.
+open the same module, in the same order, and stop in the same place.
 
-A start you kill by hand blames whatever was open at that moment, so a line here is not proof of a
-broken plugin. Delete a line to have that plugin tried again, or delete the file to try all of them.
+The scan notes which module it is about to open and rubs the note out when that module answers. A
+note still there at the next start names a module that was open when the last one ended. **The
+first time proves nothing** — a start closed by hand blames whatever happened to be open — so that
+module goes to `fxbridge-scan-suspect.txt` and is opened again. Only a module that is open at the
+end of a second start is written to the crashed file and skipped, and the log says so both times.
+
+A scan that runs all the way through clears the suspect list, because everything in it answered.
+Delete a line from the crashed file to have that plugin opened again, or delete the file to try all
+of them.
+
+**Nothing learned is thrown away.** The cache is written after every module rather than at the end
+of the scan, so a start that stops halfway keeps every answer it already had. The next start begins
+where that one stopped. This matters most with a large Windows collection: each module costs about
+one to three seconds through yabridge, so a first scan of a few hundred of them is minutes long —
+but it only has to happen once, and it no longer has to happen in one sitting.
 
 **Categories** — a VST3's own subcategory is used when the name table has no rule for it. To add a
 rule, edit `CategoryFor()` in `src/fx_categories.cpp`.

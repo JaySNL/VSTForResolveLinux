@@ -500,10 +500,18 @@ std::string ScanInFlightPath() { return ConfigPath("fxbridge-scan-open.txt"); }
 
 std::string ScanBadPath() { return ConfigPath("fxbridge-scan-crashed.txt"); }
 
+std::string ScanSuspectPath() { return ConfigPath("fxbridge-scan-suspect.txt"); }
+
 std::vector<std::string>& ScanBadList()
 {
     static std::vector<std::string> bad;
     return bad;
+}
+
+std::vector<std::string>& ScanSuspectList()
+{
+    static std::vector<std::string> suspect;
+    return suspect;
 }
 
 // Written and closed before the module opens, so it survives a process that never returns.
@@ -527,72 +535,115 @@ void ScanInFlightClear()
     }
 }
 
-// Reads the note the previous start left, and the list of everything blamed before it.
+void ReadLines(const std::string& file, std::vector<std::string>& out)
+{
+    if (file.empty()) {
+        return;
+    }
+    std::FILE* const in = std::fopen(file.c_str(), "re");
+    if (in == nullptr) {
+        return;
+    }
+    char line[1024];
+    while (std::fgets(line, sizeof(line), in) != nullptr) {
+        std::string entry = line;
+        while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r')) {
+            entry.pop_back();
+        }
+        if (!entry.empty() && entry[0] != '#') {
+            out.push_back(entry);
+        }
+    }
+    std::fclose(in);
+}
+
+void WriteLines(const std::string& file, const std::vector<std::string>& lines, const char* header)
+{
+    if (file.empty()) {
+        return;
+    }
+    if (lines.empty()) {
+        ::unlink(file.c_str());
+        return;
+    }
+    std::FILE* const out = std::fopen(file.c_str(), "we");
+    if (out == nullptr) {
+        return;
+    }
+    if (header != nullptr) {
+        std::fprintf(out, "%s", header);
+    }
+    for (const std::string& line : lines) {
+        std::fprintf(out, "%s\n", line.c_str());
+    }
+    std::fclose(out);
+}
+
+// Two strikes, not one.
+//
+// The first module ever blamed by this code was innocent. A tester's scan was not stuck on it -
+// his whole collection is slow, about two seconds a module, and he closed Resolve several
+// minutes in. Whatever was open at that moment would have been blamed, and MAGC.vst3 happened to
+// be it.
+//
+// So a name that turns up in flight once is a suspect and is still opened next time. It is only
+// skipped if it is in flight at the end of a second start as well. That second start is a real
+// test now that the cache is written per module: everything already answered is skipped, so a
+// module that genuinely stops the scan is reached again immediately, while a module that was
+// merely open when someone reached for the window button is not.
 void ScanBadLoad()
 {
     std::vector<std::string>& bad = ScanBadList();
+    std::vector<std::string>& suspect = ScanSuspectList();
     bad.clear();
+    suspect.clear();
 
     const std::string list = ScanBadPath();
-    if (!list.empty()) {
-        if (std::FILE* const in = std::fopen(list.c_str(), "re")) {
-            char line[1024];
-            while (std::fgets(line, sizeof(line), in) != nullptr) {
-                std::string entry = line;
-                while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r')) {
-                    entry.pop_back();
-                }
-                if (!entry.empty() && entry[0] != '#') {
-                    bad.push_back(entry);
-                }
-            }
-            std::fclose(in);
-        }
-    }
+    const std::string pending = ScanSuspectPath();
+    ReadLines(list, bad);
+    ReadLines(pending, suspect);
 
     const std::string flight = ScanInFlightPath();
     if (flight.empty()) {
         return;
     }
-    std::string stranded;
-    if (std::FILE* const in = std::fopen(flight.c_str(), "re")) {
-        char line[1024];
-        if (std::fgets(line, sizeof(line), in) != nullptr) {
-            stranded = line;
-            while (!stranded.empty() && (stranded.back() == '\n' || stranded.back() == '\r')) {
-                stranded.pop_back();
-            }
-        }
-        std::fclose(in);
-    }
+    std::vector<std::string> stranded;
+    ReadLines(flight, stranded);
     ::unlink(flight.c_str());
     if (stranded.empty()) {
         return;
     }
-
-    Log("scan: the last start stopped while it was opening %s. It is skipped from now on.",
-        stranded.c_str());
-    if (std::find(bad.begin(), bad.end(), stranded) == bad.end()) {
-        bad.push_back(stranded);
-        if (!list.empty()) {
-            const bool fresh = std::fopen(list.c_str(), "re") == nullptr;
-            if (std::FILE* const out = std::fopen(list.c_str(), "ae")) {
-                if (fresh) {
-                    std::fprintf(out, "%s",
-                                 "# Plugins that stopped a Resolve start while they were being\n"
-                                 "# opened. Each one was skipped from the scan after that.\n"
-                                 "#\n"
-                                 "# A start you killed by hand blames whatever was open at that\n"
-                                 "# moment, so a line here is not proof of a broken plugin.\n"
-                                 "# Delete a line to have that plugin tried again, or delete the\n"
-                                 "# whole file to try all of them.\n");
-                }
-                std::fprintf(out, "%s\n", stranded.c_str());
-                std::fclose(out);
-            }
-        }
+    const std::string& name = stranded.front();
+    if (std::find(bad.begin(), bad.end(), name) != bad.end()) {
+        return;
     }
-    Log("scan: delete %s to try it again", list.c_str());
+
+    auto seen = std::find(suspect.begin(), suspect.end(), name);
+    if (seen == suspect.end()) {
+        suspect.push_back(name);
+        WriteLines(pending, suspect,
+                   "# Modules that were open when a start ended. One appearance proves nothing -\n"
+                   "# a start closed by hand blames whatever happened to be open. A module listed\n"
+                   "# here is still opened on the next start, and only skipped if it is open when\n"
+                   "# that start ends too.\n");
+        Log("scan: the last start ended while %s was open. It is opened again this time. If this "
+            "start ends there too, it is skipped from then on.",
+            name.c_str());
+        return;
+    }
+
+    suspect.erase(seen);
+    WriteLines(pending, suspect, nullptr);
+    bad.push_back(name);
+    WriteLines(list, bad,
+               "# Modules that were open at the end of two starts in a row, and are skipped from\n"
+               "# the scan because of it.\n"
+               "#\n"
+               "# Delete a line to have that plugin opened again, or delete the whole file to try\n"
+               "# all of them.\n");
+    Log("scan: %s was open when the last two starts ended. It is skipped from now on - delete %s "
+        "to try it again.",
+        name.c_str(), list.c_str());
 }
 
 bool ScanIsBad(const std::string& path)
@@ -917,7 +968,7 @@ void Scan()
                 // Named before the module opens, never only after. A module that hangs the scan
                 // or takes the process down with it writes nothing of its own, so the last line
                 // in the log has to be the one that says which module was being asked.
-                Log("scan: opening %s", candidate.path.c_str());
+                Log("scan: opening %s (%d of %d)", candidate.path.c_str(), opened + 1, to_open);
                 // On disk before the plugin's own code runs, and gone again the moment it
                 // answers. Nothing between these two lines is allowed to assume it returns.
                 ScanInFlightMark(candidate.path);
@@ -940,6 +991,20 @@ void Scan()
                     entry.classes = classes;
                     entry.categories = declared;
                     ScanCache()[candidate.path] = entry;
+                    // Written out here, after every single module, and not once at the end.
+                    //
+                    // A tester with the MeldaProduction bundle never reached the end: each of
+                    // his modules costs 1.6 - 3.0 s, because opening a Windows VST3 starts a
+                    // Wine host and closing it stops one, and there are well over a hundred of
+                    // them. He gave up several minutes in - and because the cache was written
+                    // only after the loop, every one of those starts threw away everything it
+                    // had just learned and began again from the first module.
+                    //
+                    // Rewriting the whole file each time is a few hundred microseconds against
+                    // the seconds the module itself cost, and it is done by rename, so a start
+                    // that stops halfway leaves a complete file rather than a torn one. Every
+                    // start now gets further than the one before it, whatever stops it.
+                    ScanCacheStore();
                 }
             }
         }
@@ -993,6 +1058,9 @@ void Scan()
               [](const ScannedPlugin& a, const ScannedPlugin& b) { return a.name < b.name; });
 
     ScanCacheStore();
+    // The loop finished, so every module in it answered. Nothing here is a suspect.
+    ScanSuspectList().clear();
+    WriteLines(ScanSuspectPath(), ScanSuspectList(), nullptr);
     Log("scan: %d modules answered from the cache, %d had to be opened, %d denied, %d skipped "
         "after stopping a previous start",
         from_cache, opened, denied, stopped);

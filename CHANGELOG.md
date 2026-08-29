@@ -7,6 +7,51 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.2.7 — 2026-08-29
+
+**A slow first scan no longer starts over every time.**
+
+The v0.2.5 report was never a crash. With v0.2.6's logging the tester's own log answered it: every
+module in his MeldaProduction bundle takes **1.6 to 3.0 seconds**, because opening a Windows VST3
+through yabridge starts a Wine host and closing it stops one. With well over a hundred of them,
+his first start was minutes of an unmoving splash screen, and he closed it several minutes in.
+
+### Fixed
+
+- **The cache was written once, at the end of the scan.** So a start that did not finish threw away
+  everything it had just learned, and the next one began again at the first module. The person with
+  the collection slow enough to need the cache was the only one who could never build it.
+
+  It is now written after every module, by rename, so a start stopped halfway leaves a complete
+  file and the next start begins where it stopped. Measured: `SIGKILL` mid-scan used to leave 0
+  cached modules and now leaves **19**.
+
+- **One appearance was enough to skip a plugin, and the first module this blamed was innocent.**
+  The tester's scan was not stuck on `MAGC.vst3`; his whole collection is slow and that module
+  happened to be open when he closed Resolve. A module in flight once is now a **suspect** and is
+  opened again next time. Only a module in flight at the end of a second start is skipped.
+
+  That second start is a real test now that the cache survives: everything already answered is
+  skipped, so a module that genuinely stops the scan is reached again immediately, while one that
+  was merely open when someone reached for the window button is not. A scan that runs to the end
+  clears the suspect list.
+
+  Verified: killed mid-scan, the shell was recorded as a suspect and **opened again** on the next
+  start; forced into flight a second time, it was skipped, named in the log with the file to delete
+  to undo it, and the scan completed.
+
+### Added
+
+- **The scan says how far along it is** — `scan: opening <path> (37 of 153)`, so a long first start
+  is legible as progress rather than as a hang.
+
+### Note for anyone on v0.2.6
+
+Its one-appearance rule may have written an innocent module into
+`~/.local/share/BMDAudioPlugins/fxbridge-scan-crashed.txt`. Delete that file once after upgrading.
+
+---
+
 ## v0.2.6 — 2026-08-29
 
 **A plugin can no longer take the start down with it, and cannot block it twice.**

@@ -1285,3 +1285,68 @@ and one delete away from being undone, and why it is never silent.
 
 Whether any of this is the tester's actual hang. His log had no bridge line in it, so the module
 that stopped him is still unnamed. v0.2.6 is the instrument that would name it.
+
+---
+
+## 2026-08-29, night — it was never a crash, and the cache was written where it could not help
+
+v0.2.6's logging answered the v0.2.5 report in one paste. Every module in the tester's
+MeldaProduction bundle takes **1.6 to 3.0 seconds**:
+
+```
+MDelayMB.vst3      answered 1 classes in 2753 ms
+MSpectralDelay.vst3 answered 1 classes in 2652 ms
+MTurboDelay.vst3   answered 1 classes in 1611 ms
+```
+
+That is a Wine host started and stopped, per plugin. Jay did the arithmetic from the same log:
+about 330 plugins at ~1.5 s is roughly ten minutes of splash screen. Nothing was hung. Nothing
+faulted. The scan was working exactly as designed and the design was wrong.
+
+### The cache was written where it could not help
+
+`ScanCacheStore()` ran after the loop. So the only person whose collection was slow enough to need
+a cache was the one who could never build one: every start he interrupted threw away everything it
+had just learned and began again at the first module. Ten minutes, from zero, every time.
+
+It is written after every module now. Rewriting a 150-line TSV costs a few hundred microseconds
+against the ~2 s the module itself cost, and it goes through the same rename, so a start stopped
+halfway leaves a complete file rather than a torn one.
+
+Measured with `timeout -s KILL 0.6`: **0 modules cached before, 19 after.**
+
+This is the same shape of mistake as the deny list earlier the same day — a thing written at the
+end of a loop that exists to survive the loop not finishing. Two instances in one file in one day
+is a pattern worth naming: *anything that makes the next start cheaper must be durable against this
+start not finishing.*
+
+### The first module this code ever blamed was innocent
+
+`fxbridge-scan-open.txt` named `MAGC.vst3`, and v0.2.6 would have skipped it forever. It was fine.
+It was simply what happened to be open when he closed Resolve, ten minutes into a scan that was
+never going to finish.
+
+One appearance in flight is now a **suspect**, written to `fxbridge-scan-suspect.txt` and opened
+again next time. Only a module in flight at the end of a second start is skipped.
+
+The two changes hold each other up. A second strike means nothing unless the second start reaches
+the same module — which it now does, because everything already answered is cached and skipped. A
+genuinely fatal module is reached again within seconds; a module that was merely open when someone
+reached for the window button is not.
+
+| step | result |
+|---|---|
+| `SIGKILL` mid-scan | 19 cached, shell recorded as a suspect |
+| next start | shell **opened again**, answered, no crashed file |
+| shell in flight a second time | skipped, named in the log with the file to delete |
+| scan runs to the end | suspect list cleared |
+
+### What this cost
+
+Three of the tester's evenings' worth of launches produced nothing readable, because I told him to
+capture the log with `tee` on the terminal. This bridge writes to
+`~/.local/share/DaVinciResolve/logs/ResolveDebug.txt`, which line 190 of the readme has said all
+along. I inferred the destination from `fputs(..., stderr)` in `proxy.cpp` and never checked where
+that stderr goes. The check took four seconds when I finally ran it, and it is the same rule as
+never asserting a negative: **an instruction handed to someone else is verified on a real machine
+first.**
