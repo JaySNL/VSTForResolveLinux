@@ -45,8 +45,20 @@ later turned out to be wrong, the correction stays next to the original rather t
   plugin collection rather than a taxonomy. It rescues about 45% of an unknown collection, not all
   of it: VST2 cannot answer without being instantiated, and CLAP publishes its features somewhere
   the scan does not yet read.
+- **A deny list, written for you with everything you own already in it.**
+  `~/.local/share/BMDAudioPlugins/fxbridge-scan-deny.txt` is created on the first run listing every
+  plugin found on the machine, all commented out — delete the `# ` in front of a line to stop that
+  plugin being opened at all. A pattern is a plain **substring of the full path**, matched without
+  regard to case: not a glob and not a regular expression, so `*.vst3` matches nothing. The check
+  runs before anything is opened, which is the only ordering that helps against a plugin that hangs
+  the scan. Your edits are never overwritten; delete the file to have it rebuilt.
+- `FXBRIDGE_SCAN_KEEP_OPEN=1` restores the old keep-everything-open behaviour.
 
 ### Known
+
+- **The deny list names modules, not menu entries.** One shell holds many plugins — 56 lines cover
+  130 plugins on the development machine — so denying a Waves shell removes all 75 of its plugins
+  at once. Usually the intent, but worth knowing before it surprises you.
 
 - **The first start after installing or updating a plugin is still slow.** That is when the cache
   fills.
