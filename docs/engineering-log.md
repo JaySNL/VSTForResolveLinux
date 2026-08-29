@@ -1149,6 +1149,48 @@ is the store with real per-instance identity.
 **Also useful:** `AudioPluginPreset` is 160 bytes, zero-initialises to a valid empty object, and
 its destructor frees the three strings and the string vector but **not** the payload at `+0x00`.
 
+## 2026-08-29, later again — the editor opens when it is asked for
+
+A tester's list, and the measurement that collapsed most of it into one cause.
+
+The bridge opened every plugin GUI at project load. It did that because a comment in `proxy.cpp`
+said Resolve never calls `InitializeEffectEdit` with the stock panel suppressed, so there would
+otherwise be no way to open a window at all. **That was wrong.** One click on the effect in the
+Audio FX panel logs `editor: shown (AudioPlugin::InitializeEffectEdit)`. The 2026-08-24 reading
+watched the primary slot; the one that fires is the AudioPlugin base at `+0x7b0`.
+
+With a real open signal, three reported problems go away together: the mass-open at project load,
+a window that reappeared after the modal was closed — a hide arriving with our window already gone
+used to be re-read as a show — and a reopen that needed the modal closed twice. Loading the test
+project went from eight windows to zero.
+
+A fourth was unrelated and simpler. Editors were `_NET_WM_WINDOW_TYPE_UTILITY`, chosen so a tiling
+layout would not claim them, and KWin excludes utility windows from the switcher **by type**. They
+are dialogs now. `WM_CLASS`, the `InputHint`, and an `_NET_ACTIVE_WINDOW` request on map were all
+missing outright, so the window also never took the keyboard. The class is Resolve's own,
+`"resolve"`, because a desktop environment labels a window by looking its class up in the installed
+desktop files and a class of our own matched nothing — KDE listed every editor as "unknown".
+
+### Pinned, not started — draw the editor inside Resolve's own panel
+
+`BMDAudioPluginImpl` carries what reads as a complete embedding protocol, not a "do you have a GUI"
+interface: `InitializeEffectEdit(char const*, void*)` at `+0x250`, `GetEffectEdit` at `+0x260`,
+`CloseEffectEdit` at `+0x278`, and `GetEffectRect(QRect&, bool&)`, `UpdateEffectRect`,
+`CheckEffectRect`, `UpdateDPI`, `LockEditor` and `HideSubWindows` in the `+0x8xx` group. A `QRect`
+in the signature says the panel lays the editor out in Qt coordinates.
+
+The `void*` is almost certainly the parent widget. If it is a `QWidget*`, `QWidget::winId()` is
+exported from the bundled `libQt5Widgets` and `XReparentWindow` does the rest.
+
+**The cheapest first step is one log line:** print that pointer and probe whether its vtable lands
+in `libQt5Widgets`. It costs one restart and either opens the path or closes it.
+
+Three reasons this is pinned rather than started, two of them places this project has already lost
+time: bridged Windows plugins are the fussiest windows here and were given their own top-level
+window deliberately; `InitializeEffectEdit` arrives on Resolve's main thread, which is the thread
+that froze on 2026-08-26 with 329 threads asleep; and the panel is one slot, so several editors
+open at once would probably be lost.
+
 ### Still open
 
 What marks the *project* modified from inside a plugin instance. See the clip-id problem above.

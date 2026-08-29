@@ -70,7 +70,13 @@ single Waves shell.
   instead of guessing: `fxb-xpump` (X11 events, 30 ms), `fxb-tick` (plugin idle, 16 ms), and
   `fxb-carla`, which cannot start at all in this build.
 - **A plugin's GUI is a separate window**, not a panel inside Resolve. The inspector panel for a
-  bridged effect stays black on purpose. Under Wayland both windows go through XWayland.
+  bridged effect stays black on purpose. Under Wayland both windows go through XWayland. It is
+  listed in the window switcher and takes the keyboard when it opens; `FXBRIDGE_WINDOW_TYPE`
+  accepts `dialog` (the default), `utility` and `normal` if your window manager wants otherwise.
+- **An editor opens when you click the effect**, not when the project loads. Every plugin GUI used
+  to be constructed during the project load, which is the last thing a large project needs.
+  `FXBRIDGE_OPEN_ON_CLAIM=1` brings that back if a machine turns out to have no other way to open
+  a window.
 - **Resolve sometimes does not exit cleanly.** Undiagnosed.
 - **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
   *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
