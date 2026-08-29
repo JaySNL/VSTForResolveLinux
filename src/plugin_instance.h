@@ -107,6 +107,14 @@ HostedPlugin* CreateHostedPlugin(PluginFormat format, const char* path, const ch
 
 void PluginInstanceSetLogger(void (*logger)(const char*));
 
+// Tell Resolve that the plugin's own editor moved a parameter.
+//
+// An experiment, off unless FXBRIDGE_NOTIFY_PARAM=1. Resolve holds the parameter values it
+// saves in a project and never asks an effect for them - GetParameterValue fires zero times
+// on a Ctrl+S. The question this answers is whether a notification makes it come and read.
+// If it does, settings belong in the project instead of in a file on a timer.
+void BridgeParameterChangedByEditor(HostedPlugin* plugin, unsigned int index);
+
 // What a file extension says the format is. Nothing is loaded to find out.
 PluginFormat FormatFromPath(const char* path);
 

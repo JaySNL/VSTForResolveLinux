@@ -2849,3 +2849,32 @@ extern "C" void* GetBMDPluginInterface()
 
     return interface_ptr;
 }
+
+// See the note in plugin_instance.h. Capped hard: this calls into Resolve from the plugin's
+// own thread, which is the shape of the deadlock that cost v0.1.1, and eight calls are enough to
+// answer the question.
+void BridgeParameterChangedByEditor(HostedPlugin* plugin, unsigned int index)
+{
+    static std::atomic<int> sent{0};
+    if (!EnabledByEnvironment("FXBRIDGE_NOTIFY_PARAM") || sent.load() >= 8) {
+        return;
+    }
+    const size_t count = g_effect_count.load();
+    for (size_t entry = 0; entry < count; ++entry) {
+        ClaimedEffect& effect = g_effects[entry];
+        if (effect.plugin != plugin || effect.primary_base == nullptr) {
+            continue;
+        }
+        using Notify = void (*)(void*, unsigned int);
+        auto* const notify = *reinterpret_cast<Notify*>(g_stock_vtable + 0x0c0);
+        if (notify == nullptr) {
+            return;
+        }
+        // Logged on both sides, so a call that never returns is visible as a missing second line.
+        sent.fetch_add(1);
+        Log("notify: telling Resolve parameter %u moved", index);
+        notify(effect.primary_base, index);
+        Log("notify: returned");
+        return;
+    }
+}

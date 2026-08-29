@@ -909,3 +909,43 @@ What it cannot do is survive a rearranged chain. Insert an EQ ahead of two other
 after it shifts up a number, so they come back wearing each other's settings. Appending to the end
 and removing from the end are both safe. Better needs an identity from Resolve, and two candidates
 are now measured and dead.
+
+### 2026-08-29 — the parameter loop is real
+
+The settings store runs on a timer because a project save asks the effect nothing: `StorePreset`,
+`LoadPreset` and `GetParameterValue` all fire zero times on a Ctrl+S while other traced slots on
+the same object fire normally. Jay's objection was the right one - a VST saves its state on every
+other host, so how?
+
+Because Resolve treats a built-in effect as a slave. It owns the parameter values, pushes them in
+with `SetParameterValue`, and never needs to ask. The class that asks a *plugin* for opaque state
+is Resolve's VST host, and that class is not in the Linux build at all:
+
+```
+rmap find "VstPlugin|VSTPlugin|VST3|AudioUnit"      -> no symbol matches
+rmap find "SetPluginState|GetPluginState|GetChunk"  -> no symbol matches
+```
+
+So there is nothing to hook and nothing to impersonate. What there is instead is the loop Resolve
+already runs for its own effects, and every link of it is now measured:
+
+| Link | Evidence |
+|---|---|
+| Editor moves a control, `performEdit` reaches us | `moved parameter 12 to 0.5031`, per instance |
+| We call `NotifyParameterUpdate` (+0x0c0) | 8 sent, 8 returned, no hang |
+| Resolve reads the value back | `GetParameterValue` 6 calls - **0 in every prior session** |
+| Resolve writes it into the project on Ctrl+S | how the stock Delay's parameters persist |
+| Resolve pushes it back at load | 24 `knob:` lines with non-default values |
+
+The third row is the one that was unknown, and it is the one that makes the design buildable. It
+also settles that calling into Resolve from the plugin's own thread is survivable here - the notify
+is capped at eight and logged on both sides precisely because it is the shape of the v0.1.1
+deadlock.
+
+What remains is construction, not discovery: the effect publishes the carrier's six Delay
+parameters, so only six indices mean anything. Publishing the hosted plugin's list instead -
+`GetNumberOfParameters` at +0x2c8, `GetParameterName` at +0x2d0, and forwarding values both ways -
+puts the settings in the project, saves them with Ctrl+S, and makes them automatable. The file
+store becomes a fallback for what the parameter list cannot carry.
+
+The experiment stays in the tree behind `FXBRIDGE_NOTIFY_PARAM=1`, off by default.

@@ -1408,6 +1408,8 @@ public:
             Log("vst3: editor of \"%s\" [%d] moved parameter %u to %.4f", name_, serial_,
                 static_cast<unsigned>(id), value);
         }
+        BridgeParameterChangedByEditor(this, static_cast<unsigned>(id));
+
         const std::lock_guard<std::mutex> held(param_lock_);
         for (ParamPoint& point : pending_) {
             if (point.id == id) {
