@@ -42,6 +42,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstring>
+#include <ctime>
 
 #include <cstdarg>
 #include <cstdint>
@@ -308,6 +309,10 @@ struct ClaimedEffect {
     std::string state_base;
     std::string state_key;
     std::vector<uint8_t> state_last;
+    // When the settings this effect is currently wearing were written, in seconds since the epoch.
+    // Zero means nothing was restored. It decides between the file store and the project when both
+    // carry something - see TakeAttachedChunk.
+    uint64_t state_stamp = 0;
     bool state_said_gone = false;
     bool state_said_mute = false;
 
@@ -2608,6 +2613,7 @@ public:
             if (StateStoreWrite(effect.state_key, current)) {
                 Log("state: saved %zu bytes for %s", current.size(), effect.state_key.c_str());
                 effect.state_last.swap(current);
+                effect.state_stamp = static_cast<uint64_t>(std::time(nullptr));
                 MarkEffectChanged(effect);
             }
         }
@@ -2828,6 +2834,11 @@ int ClaimInstance(void* instance)
                 }
                 if (have && entry->plugin->LoadState(saved.data(), saved.size())) {
                     entry->state_last = saved;
+                    uint64_t written = 0;
+                    if (StateStoreStamp(entry->state_key, &written) ||
+                        StateStoreStamp(entry->state_base, &written)) {
+                        entry->state_stamp = written;
+                    }
                     Log("state: restored %zu bytes into \"%s\" #%zu", saved.size(),
                         entry->plugin->Name(), ordinal);
                 }
@@ -3510,12 +3521,256 @@ void LogPresetWords(const char* label, const void* preset)
     }
 }
 
+// ---------------------------------------------------------------------------
+// The plugin's own settings, carried inside Resolve's preset
+//
+// Resolve's own VST host already does this, and the format allows it.
+// VSTPlugin::StorePreset picks between two payload shapes on one AEffect flag: a parameter table
+// when the plugin has no chunk, and the plugin's opaque chunk when it has one. Both travel in the
+// same two fields of AudioPluginPreset - the pointer at +0x00 and the length at +0x08 - with a
+// type tag at +0x10 saying which shape it is: 0 for VST parameters, 1 for a VST chunk, 2 for a
+// Blackmagic effect. EffectPresetHeader2 copies that length and that tag into the serialised
+// header, and LoadAudioPluginPreset copies both back and reallocates the buffer, so an opaque blob
+// round-trips through a project file. The length is a uint32 on the way through, which puts the
+// ceiling at 4 GiB rather than anywhere near a plugin's chunk.
+//
+// We do not claim the tag. BMDAudioPluginImpl::LoadPreset never reads it - it checks only that the
+// pointer is not null, the length is not zero, and the first word of the buffer is at least 2 - so
+// setting it would gain nothing and might confuse code we have not read. The carrier's payload is
+// left exactly as it is and the chunk is appended behind a footer:
+//
+//     [ the carrier's own payload ][ our chunk ][ uint64 chunk length ][ 8-byte magic ]
+//
+// On the way back in the length is temporarily set to the carrier's own, so the stock parser sees
+// the buffer it wrote and nothing else, and restored afterwards. That removes the one thing this
+// design would otherwise rest on: whether the stock parser tolerates bytes after its table.
+// ---------------------------------------------------------------------------
+
+// Set from FXBRIDGE_PRESET_STATE. Off leaves both hooks forwarding and logging, as they were.
+bool g_preset_state = false;
+
+// The footer, in two versions. Version 1 was written for one afternoon and is still read, because
+// a project saved with it holds real settings and discarding them to tidy up a format would be a
+// poor trade. Version 2 adds the stamp that decides between this and the file store.
+//
+//   v1:  [ carrier ][ chunk ][ uint64 length ][ "FXBRIDG1" ]
+//   v2:  [ carrier ][ chunk ][ uint64 stamp  ][ uint64 length ][ "FXBRIDG2" ]
+//
+// The length always sits in the eight bytes before the magic, so one reader handles both.
+const char kChunkMagicV1[8] = {'F', 'X', 'B', 'R', 'I', 'D', 'G', '1'};
+const char kChunkMagicV2[8] = {'F', 'X', 'B', 'R', 'I', 'D', 'G', '2'};
+constexpr size_t kChunkFooterV1 = 2 * sizeof(uint64_t);
+constexpr size_t kChunkFooterV2 = 3 * sizeof(uint64_t);
+
+using ArrayNewFn = void* (*)(size_t);
+using ArrayDeleteFn = void (*)(void*);
+ArrayNewFn g_array_new = nullptr;
+ArrayDeleteFn g_array_delete = nullptr;
+
+// Resolve allocated the payload with operator new[] and frees it with operator delete[], so the
+// replacement has to come from that same pair. Both are looked up by name rather than called
+// through our own new[]: this process has two C++ runtimes in it, and the pair Resolve's PLT binds
+// to is whichever the dynamic linker finds first - which is exactly what RTLD_DEFAULT returns.
+// Guessing wrong here frees a pointer on the wrong heap.
+void ResolveArrayAllocator()
+{
+    g_array_new = reinterpret_cast<ArrayNewFn>(dlsym(RTLD_DEFAULT, "_Znam"));
+    g_array_delete = reinterpret_cast<ArrayDeleteFn>(dlsym(RTLD_DEFAULT, "_ZdaPv"));
+    Log("preset: operator new[] at %p, operator delete[] at %p",
+        reinterpret_cast<void*>(g_array_new), reinterpret_cast<void*>(g_array_delete));
+}
+
+// Reads the footer at the end of a payload. Answers true only for a footer we wrote, and fills in
+// where the carrier's own bytes end and how long the chunk behind them is.
+bool FindAttachedChunk(const unsigned char* data, size_t length, size_t* carrier_length,
+                       size_t* chunk_length, uint64_t* stamp)
+{
+    if (stamp != nullptr) {
+        *stamp = 0;
+    }
+    if (data == nullptr || length < kChunkFooterV1) {
+        return false;
+    }
+    char magic[8] = {0};
+    if (!SafeRead(data + length - sizeof(magic), magic, sizeof(magic))) {
+        return false;
+    }
+    size_t footer = 0;
+    if (std::memcmp(magic, kChunkMagicV2, sizeof(magic)) == 0) {
+        footer = kChunkFooterV2;
+    } else if (std::memcmp(magic, kChunkMagicV1, sizeof(magic)) == 0) {
+        footer = kChunkFooterV1;
+    } else {
+        return false;
+    }
+    if (length < footer) {
+        return false;
+    }
+    uint64_t stated = 0;
+    if (!SafeRead(data + length - 2 * sizeof(uint64_t), &stated, sizeof(stated))) {
+        return false;
+    }
+    if (stated > length - footer) {
+        return false;
+    }
+    if (footer == kChunkFooterV2 && stamp != nullptr &&
+        !SafeRead(data + length - footer, stamp, sizeof(*stamp))) {
+        return false;
+    }
+    *chunk_length = static_cast<size_t>(stated);
+    *carrier_length = length - footer - *chunk_length;
+    return true;
+}
+
+// Appends this effect's plugin state to the payload the stock StorePreset just wrote.
+void AttachPluginChunk(ClaimedEffect* effect, void* preset)
+{
+    // A low cap made this unobservable: two saves filled it, and after that a session could not
+    // be asked whether a save had happened at all.
+    static std::atomic<int> said{0};
+    const bool talk = said.fetch_add(1) < 256;
+    if (!g_preset_state || preset == nullptr || effect == nullptr || effect->plugin == nullptr) {
+        return;
+    }
+    if (g_array_new == nullptr || g_array_delete == nullptr) {
+        if (talk) { Log("preset: no operator new[] - \"%s\" not attached", effect->label_narrow); }
+        return;
+    }
+
+    std::vector<uint8_t> blob;
+    if (!effect->plugin->SaveState(blob) || blob.empty()) {
+        if (talk) {
+            Log("preset: \"%s\" reported no settings - nothing attached", effect->label_narrow);
+        }
+        return;
+    }
+
+    unsigned long header[2] = {0, 0};
+    if (!SafeRead(preset, header, sizeof(header))) {
+        if (talk) { Log("preset: cannot read the payload of \"%s\"", effect->label_narrow); }
+        return;
+    }
+    auto* const stock = reinterpret_cast<unsigned char*>(header[0]);
+    const size_t stock_length = static_cast<size_t>(header[1]);
+    if (stock == nullptr || stock_length == 0) {
+        if (talk) {
+            Log("preset: \"%s\" has an empty payload - nothing to append to",
+                effect->label_narrow);
+        }
+        return;
+    }
+
+    // A preset object can arrive already carrying one of ours. Replace that tail, never stack a
+    // second one behind it.
+    size_t carrier_length = stock_length;
+    size_t previous = 0;
+    if (FindAttachedChunk(stock, stock_length, &carrier_length, &previous, nullptr) && talk) {
+        Log("preset: \"%s\" already carried %zu bytes - replacing them", effect->label_narrow,
+            previous);
+    }
+
+    const size_t total = carrier_length + blob.size() + kChunkFooterV2;
+    unsigned char* fresh = nullptr;
+    try {
+        fresh = static_cast<unsigned char*>(g_array_new(total));
+    } catch (...) {
+        fresh = nullptr;
+    }
+    if (fresh == nullptr) {
+        Log("preset: could not allocate %zu bytes for \"%s\" - not attached", total,
+            effect->label_narrow);
+        return;
+    }
+
+    const uint64_t stamp = static_cast<uint64_t>(std::time(nullptr));
+    const uint64_t stated = blob.size();
+    unsigned char* tail = fresh;
+    std::memcpy(tail, stock, carrier_length);
+    tail += carrier_length;
+    std::memcpy(tail, blob.data(), blob.size());
+    tail += blob.size();
+    std::memcpy(tail, &stamp, sizeof(stamp));
+    tail += sizeof(stamp);
+    std::memcpy(tail, &stated, sizeof(stated));
+    tail += sizeof(stated);
+    std::memcpy(tail, kChunkMagicV2, sizeof(kChunkMagicV2));
+    effect->state_stamp = stamp;
+
+    auto* const words = static_cast<unsigned long*>(preset);
+    words[0] = reinterpret_cast<unsigned long>(fresh);
+    words[1] = static_cast<unsigned long>(total);
+    g_array_delete(stock);
+
+    if (talk) {
+        Log("preset: attached %zu bytes of \"%s\" behind %zu carrier bytes (%zu total)",
+            blob.size(), effect->label_narrow, carrier_length, total);
+    }
+}
+
+// Hands the plugin back what the project carried for it. Answers the carrier's own length when the
+// payload holds a chunk, so the stock parser can be shown the buffer it wrote and nothing more.
+bool TakeAttachedChunk(ClaimedEffect* effect, void* preset, size_t* carrier_length)
+{
+    static std::atomic<int> said{0};
+    const bool talk = said.fetch_add(1) < 256;
+    if (!g_preset_state || preset == nullptr) {
+        return false;
+    }
+    unsigned long header[2] = {0, 0};
+    if (!SafeRead(preset, header, sizeof(header))) {
+        return false;
+    }
+    auto* const data = reinterpret_cast<const unsigned char*>(header[0]);
+    const size_t length = static_cast<size_t>(header[1]);
+    size_t chunk_length = 0;
+    uint64_t stamp = 0;
+    if (!FindAttachedChunk(data, length, carrier_length, &chunk_length, &stamp)) {
+        return false;
+    }
+    if (effect == nullptr || effect->plugin == nullptr) {
+        if (talk) {
+            Log("preset: the project carried %zu bytes, but this effect has no plugin yet",
+                chunk_length);
+        }
+        return true;
+    }
+
+    // The file store may already have restored something newer. That is the whole reason it is
+    // still here: Resolve serialises the effects model only when the PROJECT is modified, and an
+    // edit inside a hosted plugin's window is not a project modification. Refusing to overwrite
+    // newer settings with older ones is what makes the two stores safe to run together.
+    // A stamp of zero means the project's chunk predates the stamped footer, not that it is old.
+    // Treating "unknown" as "oldest" made the file store win every comparison and load settings
+    // from an earlier session over the ones the project actually held - measured, and it cost a
+    // restart. Unknown means the project wins: it is the store with real per-instance identity,
+    // and the file store is the fallback.
+    if (stamp != 0 && effect->state_stamp != 0 && stamp < effect->state_stamp) {
+        if (talk) {
+            Log("preset: the project's %zu bytes for \"%s\" are older than the saved file - kept "
+                "the file",
+                chunk_length, effect->label_narrow);
+        }
+        return true;
+    }
+
+    const bool took = chunk_length != 0 &&
+                      effect->plugin->LoadState(data + *carrier_length, chunk_length);
+    if (took) {
+        effect->state_stamp = stamp;
+    }
+    if (talk) {
+        Log("preset: the project carried %zu bytes for \"%s\" - %s", chunk_length,
+            effect->label_narrow, took ? "restored" : "REFUSED by the plugin");
+    }
+    return true;
+}
+
 bool BridgeStorePreset(void* self, void* preset)
 {
     static std::atomic<int> seen{0};
     const int index = seen.fetch_add(1);
     ClaimedEffect* const effect = FindEffectAny(self);
-    if (index < 8) {
+    if (index < 256) {
         Log("preset: StorePreset on \"%s\" (preset at %p)",
             effect != nullptr && effect->label_narrow[0] != '\0' ? effect->label_narrow
                                                                  : "an effect",
@@ -3525,12 +3780,17 @@ bool BridgeStorePreset(void* self, void* preset)
     if (g_original_store_preset != nullptr) {
         answered = reinterpret_cast<bool (*)(void*, void*)>(g_original_store_preset)(self, preset);
     }
-    if (index < 8) {
+    if (index < 256) {
         Log("preset: StorePreset returned %s", answered ? "true" : "false");
-        LogPresetWords("preset: store", preset);
+        if (index < 8) { LogPresetWords("preset: store", preset); }
         if (index < 2) {
             LogPresetTable("preset: store", preset);
         }
+    }
+    // Only when the carrier wrote a payload of its own. A false answer means Resolve is about to
+    // skip this effect, and appending to a buffer nobody reads would be a leak with a log line.
+    if (answered) {
+        AttachPluginChunk(effect, preset);
     }
     return answered;
 }
@@ -3540,21 +3800,37 @@ bool BridgeLoadPreset(void* self, void* preset)
     static std::atomic<int> seen{0};
     const int index = seen.fetch_add(1);
     ClaimedEffect* const effect = FindEffectAny(self);
-    if (index < 8) {
+    if (index < 256) {
         Log("preset: LoadPreset on \"%s\" (preset at %p)",
             effect != nullptr && effect->label_narrow[0] != '\0' ? effect->label_narrow
                                                                  : "an effect",
             preset);
-        LogPresetWords("preset: load ", preset);
+        if (index < 8) { LogPresetWords("preset: load ", preset); }
         if (index < 2) {
             LogPresetTable("preset: load ", preset);
         }
     }
+    // Hide our tail from the stock parser for the length of its call, then give the plugin its
+    // settings back. The stock call goes first because it restores the carrier, and the carrier
+    // must not be able to overwrite what the plugin was told afterwards.
+    size_t carrier_length = 0;
+    const bool carried = TakeAttachedChunk(effect, preset, &carrier_length);
+    unsigned long full_length = 0;
+    if (carried) {
+        auto* const words = static_cast<unsigned long*>(preset);
+        full_length = words[1];
+        words[1] = static_cast<unsigned long>(carrier_length);
+    }
+
     bool answered = false;
     if (g_original_load_preset != nullptr) {
         answered = reinterpret_cast<bool (*)(void*, void*)>(g_original_load_preset)(self, preset);
     }
-    if (index < 8) {
+
+    if (carried) {
+        static_cast<unsigned long*>(preset)[1] = full_length;
+    }
+    if (index < 256) {
         Log("preset: LoadPreset returned %s", answered ? "true" : "false");
     }
     return answered;
@@ -3694,7 +3970,8 @@ void PatchDelayClassVtable()
             watched ? "patched" : "FAILED");
     }
 
-    // On by default: it forwards every call and only writes lines to the log.
+    // On by default. The trace half only forwards and logs; the state half, below, is what puts
+    // a hosted plugin's settings inside the Resolve project.
     if (EnabledByEnvironment("FXBRIDGE_PRESET_TRACE", true)) {
         const bool store = PatchOurSlot(kStorePresetThunkOffset, &g_original_store_preset,
                                         reinterpret_cast<void*>(&BridgeStorePreset));
@@ -3702,6 +3979,14 @@ void PatchDelayClassVtable()
                                        reinterpret_cast<void*>(&BridgeLoadPreset));
         Log("preset: watching the AudioPlugin slots - store %s (+0x990), load %s (+0x998)",
             store ? "patched" : "FAILED", load ? "patched" : "FAILED");
+
+        g_preset_state = store && load && EnabledByEnvironment("FXBRIDGE_PRESET_STATE", true);
+        if (g_preset_state) {
+            ResolveArrayAllocator();
+            g_preset_state = g_array_new != nullptr && g_array_delete != nullptr;
+        }
+        Log("preset: plugin settings travel in the project - %s (FXBRIDGE_PRESET_STATE)",
+            g_preset_state ? "ON" : "off");
     }
 
     Log("editor trace installed on %zu slots",

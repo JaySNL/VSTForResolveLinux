@@ -5,12 +5,17 @@
 // at its defaults. This is the store that fixes that, and it is deliberately the SMALL fix: one
 // file per plugin, holding whatever that plugin last reported.
 //
-// What it cannot do, stated plainly: two instances of the same plugin in one project share one
-// file, so both come back with the settings of whichever one was saved last. The correct fix is
-// per-instance and belongs in Resolve's own AudioPluginPreset - the object it hands to
-// AudioPluginHost::AddPlaceholderPlugin when it restores a plugin. Whether Resolve calls
-// StorePreset and LoadPreset on a project save is traced but not yet measured, which is why this
-// store is off unless FXBRIDGE_STATE_STORE=1 is set.
+// This is no longer the main path. Resolve's own AudioPluginPreset carries a hosted plugin's
+// settings now - see the preset section of proxy.cpp - and that path has real per-instance
+// identity, which this one does not: instances are told apart by their position in the claim
+// order, so rearranging a chain gives them each other's settings.
+//
+// What this store still buys is the one case the project cannot cover. Resolve serialises the
+// effects model only when the project is modified, and a change made inside a hosted plugin's own
+// window is invisible to it - measured on 2026-08-29: a plugin-only edit followed by Ctrl+S
+// produced zero StorePreset calls, while a fader on an unrelated track produced eight. This store
+// writes on its own timer and does not care what Resolve thinks. The two are reconciled by time:
+// each side carries a stamp, and the newer one wins.
 #ifndef FXBRIDGE_PLUGIN_STATE_H
 #define FXBRIDGE_PLUGIN_STATE_H
 
@@ -24,6 +29,10 @@ bool StateStoreEnabled();
 std::string StateStoreKey(const char* path, const char* class_name);
 
 bool StateStoreRead(const std::string& key, std::vector<uint8_t>& out);
+
+// When that file was last written, in seconds since the epoch. Answers false when there is no
+// file. Used to decide whether the project or this store holds the newer settings.
+bool StateStoreStamp(const std::string& key, uint64_t* seconds);
 bool StateStoreWrite(const std::string& key, const std::vector<uint8_t>& bytes);
 
 void StateStoreSetLogger(void (*logger)(const char*));

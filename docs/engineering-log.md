@@ -1097,8 +1097,58 @@ byte-identical blob while smartEQ4 returned a changed one — the "known miss" c
 Chaining the dirty flag to that inherits the blindness. Answering true always costs one preset per
 save, and Resolve clears the flag itself, so nothing accumulates.
 
+## 2026-08-29, later still — the chunk rides, and the gate is project-wide
+
+Both questions from the entry above are now measured.
+
+**The chunk rides.** `AudioPluginPreset` carries a type tag at `+0x10`: 0 for a VST parameter
+table, 1 for a VST opaque chunk, 2 for a Blackmagic effect. `EffectPresetHeader2` copies the
+length from `+0x08` into `hdr+0x04` and the tag from `+0x10` into `hdr+0x08`;
+`LoadAudioPluginPreset` copies both back and reallocates the buffer. The length is a `uint32` on
+the way through, so the ceiling is 4 GiB. An opaque blob is a first-class shape in the project
+format, not something smuggled.
+
+The bridge does not claim the tag, because `BMDAudioPluginImpl::LoadPreset` never reads it — it
+validates the pointer, the length, and `*(uint32*)payload >= 2`, and nothing else. The chunk is
+appended behind the carrier's payload with a footer, and on load the length is set back to the
+carrier's own for the stock call. That removes the last unmeasured dependency: whether the stock
+parser tolerates trailing bytes. It never sees them.
+
+Verified with eight effects and the file store off: eight attached, eight restored, smartEQ4's
+2,320,783 bytes included, zero faults.
+
+**The buffer is reallocated through `dlsym(RTLD_DEFAULT, "_Znam")`, not our own `new[]`.** Checked
+against `/proc/<pid>/maps`: `operator new[]` in this process resolves into
+`/opt/resolve/libs/libtbbmalloc_proxy.so.2`. Resolve replaces the global allocator with Intel
+TBB's, so the payload is on neither libstdc++'s heap nor libc++'s.
+
+**The gate is project-wide.** A plugin-only change followed by Ctrl+S produced zero `StorePreset`
+calls. A fader on a track carrying no effects at all produced eight, one per effect in the project,
+and the plugin-only change from the previous test was captured on that save. So nothing was ever
+lost; it waits for the next thing Resolve can see.
+
+**What would close it, and why it stays open.** The path a real knob takes is
+`EDLEffectImpl::CreateEffectUndo` → `new LoadPresetEDLPluginIncrementalChange(...)` →
+`UndoManager::AddIncrementalChange`. `CreateEffectUndo` is a no-op everywhere else:
+`BMDChainFX::CreateEffectUndo` and `Effect::CreateEffectUndo` are 36 bytes each, a stack canary and
+`ret`. Reaching the `EDLEffectImpl` runs through `AudioEngineController::Instance()` → `vtable+0x460`
+→ `+0x28` for the `EDLEffectsController`, then a lookup by clip id — and
+`BMDAudioPluginImpl::GetClipID` reads zero on every track effect.
+
+Two dead ends closed on the way. `UndoManager::ActuateChange` is not a general mark-modified: it
+acts only on `ModuleIds == 9` with `ParameterIds == 0x3e1` and writes one word to
+`g_Studio()+0x610`. And `BMDAudioPluginImpl::TouchPluginParameter` reads the index out of the
+binding and then calls slot `+0x2f8`, which is `SidechainEnabled()`.
+
+**A rule that was backwards, and what it cost.** The file store and the project are reconciled by
+stamp, newer wins. The first version treated an unstamped project chunk as the oldest possible,
+so every chunk written before the stamp existed lost to any file — and a run loaded settings from
+an earlier session over the ones the project actually held. Unknown now means the project wins: it
+is the store with real per-instance identity.
+
+**Also useful:** `AudioPluginPreset` is 160 bytes, zero-initialises to a valid empty object, and
+its destructor frees the three strings and the string vector but **not** the payload at `+0x00`.
+
 ### Still open
 
-Whether the preset payload can carry a plugin's own chunk alongside the parameter table, and what
-marks the *project* modified — a save only serialises when Resolve already thinks something
-changed, so a plugin-only edit still needs a fader nudge before Ctrl+S does anything.
+What marks the *project* modified from inside a plugin instance. See the clip-id problem above.

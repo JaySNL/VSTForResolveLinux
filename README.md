@@ -56,10 +56,12 @@ single Waves shell.
   SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. YMMV, i haven't been able to test EVERY vst yet.
 - **A plugin editor sometimes opens empty**, and fills only after the effect is removed and the
   removal undone. Visible in the recording above. Not diagnosed; it is not tied to one format.
-- **Settings are not saved per instance.** Reopening a project restores the right plugin at its
-  defaults. Resolve stores an effect's own parameters in the project and knows nothing about what
-  a hosted plugin keeps inside, so there is nowhere to put them yet. `FXBRIDGE_STATE_STORE=1` is
-  an opt-in stopgap — see *Settings between sessions*.
+- **A plugin-only change does not make the project dirty.** Settings themselves are kept now, in
+  the project — see *Settings between sessions*. What is missing is the nudge: Resolve serialises
+  the effects model only when it already thinks something changed, and an edit made inside a
+  hosted plugin's own window is invisible to it. The settings are not lost, they are written on
+  the next thing you do that Resolve can see. `FXBRIDGE_STATE_STORE=1` closes the gap for a
+  session that changes nothing else at all.
 - **Higher idle CPU than stock Resolve on one machine** — reported as 20–25% against 0–3%, where
   Reaper hosting the same plugins is quiet. **Not reproduced.** Measured here with five plugins
   loaded and the timeline idle, the one bridge thread that runs costs **0.31 s of CPU over 321 s
@@ -237,49 +239,84 @@ Both take effect on the next Resolve start. No rebuild.
 
 ## Settings between sessions
 
-Off by default. `FXBRIDGE_STATE_STORE=1` makes the bridge ask each plugin for its own state about
-every ten seconds, and hand it back the next time that plugin is loaded.
+**Your settings live in the Resolve project.** On by default since v0.2.3. A hosted plugin's own
+state travels inside the effect's `AudioPluginPreset`, so it belongs to that effect, it moves with
+the project, and it does not depend on a file sitting beside it. Nothing to turn on.
+
+Measured on 2026-08-29, eight effects on one timeline with the file store switched **off** so that
+nothing else could have supplied them: all eight attached on save and all eight came back on load,
+smartEQ4's 2,320,783-byte chunk included. Zero faults on either half.
+
+**How it rides.** Resolve's own VST host does exactly this, and reading it is what made the fix
+possible. `VSTPlugin::StorePreset` picks between two payload shapes on one `AEffect` flag — a
+parameter table when the plugin has no chunk, the plugin's opaque chunk when it has one — and both
+travel in the same two fields, the pointer at `+0x00` and the length at `+0x08`, with a type tag at
+`+0x10` saying which. `EffectPresetHeader2` copies that length and that tag into the serialised
+header and `LoadAudioPluginPreset` copies both back, so an opaque blob round-trips through a
+project file. The length is a `uint32` on the way through: the ceiling is 4 GiB.
+
+The bridge does not claim the tag. `BMDAudioPluginImpl::LoadPreset` never reads it — it checks only
+that the pointer is not null, the length is not zero and the first word of the buffer is at least
+2. So the carrier's payload is left exactly as it is and the chunk is appended behind a footer:
+
+    [ the carrier's own payload ][ the chunk ][ uint64 stamp ][ uint64 length ][ "FXBRIDG2" ]
+
+On the way back in, the length is set to the carrier's own for the duration of the stock call and
+restored afterwards, so the stock parser never sees a byte it did not write.
+
+**What it still needs from you.** Resolve serialises the effects model only when it already thinks
+the project changed, and an edit inside a hosted plugin's own window is invisible to it. Measured
+on 2026-08-29: a plugin-only change followed by Ctrl+S produced **zero** `StorePreset` calls, while
+moving a fader on a track carrying no effects at all produced **eight**, one for every effect in
+the project. The gate is project-wide, not per effect — so nothing is lost, it waits for the next
+thing you do that Resolve can see.
+
+Closing that gate properly is a door we cannot open yet. The path a real knob takes is
+`EDLEffectImpl::CreateEffectUndo` → `LoadPresetEDLPluginIncrementalChange` →
+`UndoManager::AddIncrementalChange`, and pushing an undo entry is what marks the project modified.
+That method is a no-op on every other class in the chain — `BMDChainFX::CreateEffectUndo` and
+`Effect::CreateEffectUndo` are 36 bytes each and contain nothing but a stack canary and `ret` — and
+reaching the `EDLEffectImpl` needs a clip id that `BMDAudioPluginImpl::GetClipID` reports as zero on
+every track effect.
+
+**The file store, for the one session the project cannot cover.** `FXBRIDGE_STATE_STORE=1` keeps
+the old behaviour running alongside: every plugin is asked for its state about every ten seconds
+and it goes to a file under `~/.local/share/BMDAudioPlugins/state/`. It does not care what Resolve
+thinks, so it covers the case above — a session whose only change is inside a plugin window, ended
+without touching anything else.
 
     FXBRIDGE_STATE_STORE=1 /opt/resolve/bin/resolve
 
-One file per plugin **instance**, under `~/.local/share/BMDAudioPlugins/state/`. The same EQ
-twice in one chain is two files and two sets of settings. Delete a file to get that instance's
-defaults back.
+The two are reconciled by time. Both carry a stamp — the project in its footer, the file in its
+mtime — and the newer one wins. A project chunk with no stamp, written before v0.2.3, counts as
+newer: the project is the store with real per-instance identity and the file store is the fallback.
+Getting that backwards loaded settings from an earlier session over the ones the project held, and
+cost a restart to notice.
 
-**When it saves.** On a timer, and on the load of any project — the second one is what makes a
-project switch keep the settings you just made, since the timer alone would lose up to ten seconds
-of them. Resolve never says that a project is closing, so there is no save at the close itself:
-the save happens as the *next* project loads, while the outgoing project's plugins are still
-there. Quitting Resolve straight from a project loses whatever changed in the last ten seconds.
+**Read this before turning the file store on.** It identifies an instance by its position among the
+effects hosting the same plugin, in the order Resolve loads them, because a file has nothing better
+to go on. So **rearranging a chain shuffles its settings**. The project path does not have this
+problem: a preset belongs to one effect. That difference is why the file store stayed opt-in.
 
-**Read this before turning it on.** An instance is identified by its position among the effects
-that host the same plugin, in the order Resolve loads them — because Resolve gives an effect no
-identity of its own that survives a save. So **rearranging a chain shuffles the settings**: insert
-an EQ ahead of two others and both of them come back wearing the one behind's settings. Adding to
-the end, or removing from the end, is safe. That is the cost, and it is why this is opt-in.
-
-**Why a timer and not your Ctrl+S — and why that is now being replaced.** The earlier answer here
-was that a project save asks the effect nothing at all, on the evidence that `StorePreset` and
-`LoadPreset` fired zero times across a session. **That was measured on the wrong vtable slots.**
-Those traces watched `+0x380` and `+0x388`, the primary ones; Resolve holds an `AudioPlugin*` and
-calls the thunks at `+0x990` and `+0x998`. Watching the right pair, on 2026-08-29:
+**How the channel was found.** The earlier answer here was that a project save asks the effect
+nothing at all, on the evidence that `StorePreset` and `LoadPreset` fired zero times across a
+session. **That was measured on the wrong vtable slots** — `+0x380` and `+0x388`, the primary ones.
+Resolve holds an `AudioPlugin*` and calls the thunks at `+0x990` and `+0x998`. Watching the right
+pair:
 
 * `LoadPreset` fires once per effect on every project load, and returns true;
 * `StorePreset` fires on a save for every effect that answers `IsDirty` true;
 * the payload is a parameter table — a version, a count, then a 64-byte name and a float each.
 
-`VSTPlugin` in `libFairlightPage.so` overrides exactly those two calls. That is how a native VST
-keeps its settings on this platform, and the same channel is open to a hosted plugin. An earlier
-note in the engineering log said no VST host class exists in the Linux build; it does — 198
-symbols — and that note is retracted where it stands.
+`VSTPlugin` in `libFairlightPage.so` overrides exactly those two calls. An earlier note in the
+engineering log said no VST host class exists in the Linux build; it does — 198 symbols — and that
+note is retracted where it stands.
 
 The gate is `AudioPlugin::IsDirty()`, one byte at `AudioPlugin+0x99`, and Resolve clears it once it
 has taken the preset. Our effects answer it true unconditionally, because the alternative is to
 detect a change, and detection is exactly what does not work: two Waves F6-RTA edited by hand both
 returned a byte-identical state blob while smartEQ4 returned a changed one. Answering true costs
 one preset per save and removes that blind spot entirely. `FXBRIDGE_ALWAYS_DIRTY=0` turns it off.
-
-The file store still runs on a timer while the preset payload work is unfinished.
 
 **Publishing the plugin's parameters was tried, and it does not work.** The idea was to report the
 hosted plugin's parameters as the effect's own, so the settings would live in the project and bring

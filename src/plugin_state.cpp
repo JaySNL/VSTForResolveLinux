@@ -83,6 +83,25 @@ std::string StateStoreKey(const char* path, const char* class_name)
     return readable + suffix;
 }
 
+bool StateStoreStamp(const std::string& key, uint64_t* seconds)
+{
+    if (seconds == nullptr) {
+        return false;
+    }
+    *seconds = 0;
+    const std::string directory = StoreDirectory();
+    if (directory.empty() || key.empty()) {
+        return false;
+    }
+    const std::string file = directory + "/" + key + ".bin";
+    struct stat info;
+    if (stat(file.c_str(), &info) != 0) {
+        return false;
+    }
+    *seconds = static_cast<uint64_t>(info.st_mtime);
+    return true;
+}
+
 bool StateStoreRead(const std::string& key, std::vector<uint8_t>& out)
 {
     const std::string directory = StoreDirectory();
