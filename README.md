@@ -90,6 +90,8 @@ single Waves shell.
 > can take Resolve down mid-edit. Save often.
 
 
+Every release, and what changed in it, is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Install
 
 Requires **DaVinci Resolve Studio 21** on Linux. The free version does not load this ABI.
