@@ -190,6 +190,13 @@ int main(int argc, char** argv)
         if (arg == "--verbose" || arg == "-v") {
             g_verbose = true;
         } else if (arg == "--help" || arg == "-h") {
+            // The window pump and the host thread announce their own shutdown from a static
+            // destructor, on stderr, after main returns - so a bare --help used to print four
+            // lines of teardown above the help text. This program never started either of them.
+            if (const int null = ::open("/dev/null", O_WRONLY); null >= 0) {
+                ::dup2(null, STDERR_FILENO);
+                ::close(null);
+            }
             std::printf(
                 "fxbridge-scan - read every plugin once and write the cache Resolve then uses.\n"
                 "\n"
