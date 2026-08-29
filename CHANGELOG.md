@@ -7,6 +7,54 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.2.5 — 2026-08-29
+
+**Startup stops starting a Wine host for every plugin you own.**
+
+### Fixed
+
+- **The high-CPU reports were us, and this is the cause.** Reading a VST3's class names means
+  opening the module, and for a Windows plugin that means yabridge starting a Wine host — which
+  the scan then kept alive for the whole session, deliberately, because a note in the source said
+  it "costs a file handle". Measured on a tester's machine by turning the bridge off and on:
+
+  | | disabled | enabled |
+  |---|---|---|
+  | Resolve threads | 229 | **706** |
+  | Memory in use | 9.5 GB | **22.8 GB** |
+  | Busiest thread | 4.9% | **3 × ~100%** |
+
+  Resolve's own resident set moved 0.4 GB while the machine lost 13 GB, so the memory was in other
+  processes. `pgrep -fc yabridge-host` returned **336**, with no project open.
+
+  Modules are closed after the scan reads them, on every path out including the refusals — each of
+  those used to strand a host for a module the scan had already given up on.
+  `FXBRIDGE_SCAN_KEEP_OPEN=1` restores the old behaviour.
+
+- **Startup no longer scales with the size of your plugin folder.** What the scan found is cached
+  in `~/.local/share/BMDAudioPlugins/fxbridge-scan-cache.tsv`, keyed on each library's size and
+  modification time, so a normal start opens nothing at all. Measured here: first start 0 from
+  cache and 21 opened; every start after, 21 from cache and 0 opened, with the same 130 plugins
+  listed. Delete the file to force a rescan.
+
+### Added
+
+- **A plugin can file itself into a category.** A VST3 publishes its own subcategory — `Fx|EQ`,
+  `Fx|Restoration` — and that is used when the built-in name table has no opinion. Reported by a
+  tester who saw 98% of his plugins land in the fallback, because that table is one person's
+  plugin collection rather than a taxonomy. It rescues about 45% of an unknown collection, not all
+  of it: VST2 cannot answer without being instantiated, and CLAP publishes its features somewhere
+  the scan does not yet read.
+
+### Known
+
+- **The first start after installing or updating a plugin is still slow.** That is when the cache
+  fills.
+- **The cache is new code on the startup path**, which is where this project has historically
+  broken things. It repairs itself if truncated and is safe to delete.
+
+---
+
 ## v0.2.4 — 2026-08-29
 
 **The editor opens when you ask for it.**
