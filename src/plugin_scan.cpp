@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -703,6 +704,31 @@ void Scan()
     int denied = 0;
     std::vector<std::string> offered;
 
+    // Said out loud before the work starts, because the work is invisible while it happens.
+    // Opening one Windows VST3 through yabridge starts a Wine host, asks it, and shuts it down
+    // again: 987 ms and 792 ms for the two Waves shells on the development machine. A first start
+    // with a hundred of them is therefore a minute of a Resolve splash screen that does not move,
+    // and a tester reasonably reported that as the program being stuck. Later starts read the
+    // cache and open nothing.
+    int to_open = 0;
+    for (const Candidate& candidate : candidates) {
+        if (candidate.format != PluginFormat::Vst3 || ScanDenied(candidate.path)) {
+            continue;
+        }
+        unsigned long long size = 0;
+        unsigned long long mtime = 0;
+        auto found = ScanCache().find(candidate.path);
+        if (!ModuleStamp(candidate.path, size, mtime) || found == ScanCache().end() ||
+            found->second.size != size || found->second.mtime != mtime) {
+            ++to_open;
+        }
+    }
+    if (to_open > 0) {
+        Log("scan: %d VST3 modules have to be opened. Each Windows one starts and stops a Wine "
+            "host, so this start is slow and the next one is not.",
+            to_open);
+    }
+
     for (const Candidate& candidate : candidates) {
         offered.push_back(candidate.path);
 
@@ -747,7 +773,17 @@ void Scan()
                 declared = found->second.categories;
                 ++from_cache;
             } else {
+                // Named before the module opens, never only after. A module that hangs the scan
+                // or takes the process down with it writes nothing of its own, so the last line
+                // in the log has to be the one that says which module was being asked.
+                Log("scan: opening %s", candidate.path.c_str());
+                const auto started = std::chrono::steady_clock::now();
                 Vst3ListClasses(candidate.path.c_str(), classes, &declared);
+                const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - started)
+                                       .count();
+                Log("scan: %s answered %zu classes in %lld ms", candidate.path.c_str(),
+                    classes.size(), static_cast<long long>(spent));
                 ++opened;
                 // Stored even when it found nothing, so a module that cannot answer is asked
                 // once rather than on every start.

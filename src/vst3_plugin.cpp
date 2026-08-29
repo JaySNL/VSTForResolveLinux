@@ -1499,8 +1499,14 @@ bool Vst3ListClasses(const char* path, std::vector<std::string>& out,
 
     // Closed on every path out of here, including the refusals below, because each one of those
     // used to leave a Wine host running for a module the scan had already given up on.
+    //
+    // ModuleExit is called only when ModuleEntry was called and agreed. Both halves of that
+    // sentence cost a crash in v0.2.5: the guard used to fire ModuleExit on every path out,
+    // including the refusal below, and tearing down a module that was never entered is outside
+    // the contract every VST3 library is written to.
     struct ModuleGuard {
         void* handle;
+        bool entered;
         ~ModuleGuard()
         {
             if (handle == nullptr) {
@@ -1510,13 +1516,16 @@ bool Vst3ListClasses(const char* path, std::vector<std::string>& out,
             if (keep != nullptr && keep[0] != '0') {
                 return;
             }
-            using ModuleExitFn = bool (*)(void);
-            if (auto* const leave = reinterpret_cast<ModuleExitFn>(dlsym(handle, "ModuleExit"))) {
-                leave();
+            if (entered) {
+                using ModuleExitFn = bool (*)(void);
+                if (auto* const leave =
+                        reinterpret_cast<ModuleExitFn>(dlsym(handle, "ModuleExit"))) {
+                    leave();
+                }
             }
             dlclose(handle);
         }
-    } guard{handle};
+    } guard{handle, false};
 
     using ModuleEntryFn = bool (*)(void*);
     if (auto* const enter = reinterpret_cast<ModuleEntryFn>(dlsym(handle, "ModuleEntry"))) {
@@ -1527,6 +1536,7 @@ bool Vst3ListClasses(const char* path, std::vector<std::string>& out,
             Log("vst3: ModuleEntry refused for %s", binary.c_str());
             return false;
         }
+        guard.entered = true;
     }
 
     using GetFactoryFn = v3_plugin_factory** (*)(void);
@@ -1540,6 +1550,21 @@ bool Vst3ListClasses(const char* path, std::vector<std::string>& out,
         Log("vst3: GetPluginFactory returned null for %s", binary.c_str());
         return false;
     }
+
+    // GetPluginFactory hands out a reference that belongs to the caller, and this function used to
+    // keep it. The host side of this file has always given it back (Release(factory_)); the scan
+    // did not, and then told the module to exit underneath it. On yabridge that means the Wine
+    // host is torn down while a reference still points into it. Declared after the module guard,
+    // so it runs before the module guard - the reference goes back first, the module closes after.
+    struct FactoryRef {
+        v3_plugin_factory** object;
+        ~FactoryRef()
+        {
+            if (object != nullptr) {
+                Unknown(object)->unref(object);
+            }
+        }
+    } factory_ref{factory};
 
     auto* const factory_vt = *reinterpret_cast<v3_plugin_factory_cpp**>(factory);
 
