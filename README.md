@@ -217,7 +217,26 @@ Vocal Rider
 DeBreath
 ```
 
-**Categories** — edit `CategoryFor()` in `src/fx_categories.cpp`.
+**Plugins to skip entirely** — `~/.local/share/BMDAudioPlugins/fxbridge-scan-deny.txt`. Written for
+you on the first run, listing every plugin found on the machine, all commented out. Delete the
+`# ` in front of a line to stop that plugin being opened at all:
+
+```
+# /home/you/.vst3/SomethingThatHangs.vst3
+/yabridge/
+Waves
+```
+
+A pattern is a plain **substring of the plugin's full path**, matched without regard to case. It is
+not a glob and not a regular expression — `*.vst3` matches nothing, because the asterisk is a
+literal asterisk. Your edits are never overwritten; delete the file to have it rebuilt from the
+current scan.
+
+This matters mainly for the **first** start after installing a plugin, which is the one that has to
+open it, and for a plugin that hangs the scan — the check runs before anything is opened.
+
+**Categories** — a VST3's own subcategory is used when the name table has no rule for it. To add a
+rule, edit `CategoryFor()` in `src/fx_categories.cpp`.
 
 Both take effect on the next Resolve start. No rebuild.
 

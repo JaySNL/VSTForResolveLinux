@@ -335,6 +335,149 @@ std::string Vst3BinaryOf(const std::string& bundle)
     return found.empty() ? bundle : found;
 }
 
+// ---------------------------------------------------------------------------
+// The deny list
+//
+// The cache makes a normal start cheap, but it cannot help the FIRST start, and that is the one
+// that hurts on a large collection: every module has to be opened once. A plugin that hangs the
+// scan is worse still - there is no way past it except moving the file.
+//
+// So: one substring per line, matched against the module's full path, applied BEFORE anything is
+// opened. Asked for by a tester on 2026-08-29 whose first scan started 336 Wine hosts.
+//
+//   ~/.local/share/BMDAudioPlugins/fxbridge-scan-deny.txt
+//
+// Matching is deliberately dull, and the generated file says so: a plain case-insensitive
+// substring of the path. Not a glob and not a regular expression - "*" matches a literal asterisk.
+// Anything cleverer is a second thing to learn and a second thing to get wrong, and a path is
+// already the most specific handle a person has.
+// ---------------------------------------------------------------------------
+
+std::string LoweredCopy(const std::string& text)
+{
+    std::string lowered = text;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return lowered;
+}
+
+std::string ConfigPath(const char* file_name)
+{
+    const char* const home = std::getenv("HOME");
+    if (home == nullptr) {
+        return std::string();
+    }
+    return std::string(home) + "/.local/share/BMDAudioPlugins/" + file_name;
+}
+
+const std::vector<std::string>& ScanDenyList()
+{
+    static std::vector<std::string> patterns;
+    static bool loaded = false;
+    if (loaded) {
+        return patterns;
+    }
+    loaded = true;
+    const std::string path = ConfigPath("fxbridge-scan-deny.txt");
+    if (path.empty()) {
+        return patterns;
+    }
+    std::FILE* const file = std::fopen(path.c_str(), "re");
+    if (file == nullptr) {
+        return patterns;
+    }
+    char line[1024];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        std::string entry = line;
+        while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r' ||
+                                  entry.back() == ' ' || entry.back() == '\t')) {
+            entry.pop_back();
+        }
+        size_t start = 0;
+        while (start < entry.size() && (entry[start] == ' ' || entry[start] == '\t')) {
+            ++start;
+        }
+        entry = entry.substr(start);
+        if (entry.empty() || entry[0] == '#') {
+            continue;
+        }
+        patterns.push_back(LoweredCopy(entry));
+    }
+    std::fclose(file);
+    if (!patterns.empty()) {
+        Log("scan: deny list holds %zu patterns", patterns.size());
+    }
+    return patterns;
+}
+
+bool ScanDenied(const std::string& path)
+{
+    const std::vector<std::string>& patterns = ScanDenyList();
+    if (patterns.empty()) {
+        return false;
+    }
+    const std::string lowered = LoweredCopy(path);
+    for (const std::string& pattern : patterns) {
+        if (lowered.find(pattern) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Writes the file the first time, with everything this machine has, all commented out.
+//
+// A blank file that has to be filled in from memory is a file nobody fills in. This one is the
+// list of what is actually installed, so using it is deleting a "#" rather than getting a path
+// right by hand. It is written only when there is no file: an existing one is somebody's work and
+// is never touched. Delete it to have it built again from the current scan.
+void ScanDenyTemplateWrite(const std::vector<std::string>& paths)
+{
+    const std::string path = ConfigPath("fxbridge-scan-deny.txt");
+    if (path.empty()) {
+        return;
+    }
+    if (std::FILE* const existing = std::fopen(path.c_str(), "re")) {
+        std::fclose(existing);
+        return;
+    }
+    std::FILE* const file = std::fopen(path.c_str(), "we");
+    if (file == nullptr) {
+        return;
+    }
+    std::fprintf(file, "%s",
+                 "# Plugins this bridge should not even open.\n"
+                 "#\n"
+                 "# One pattern per line. A pattern is a plain SUBSTRING of the plugin's full\n"
+                 "# path, matched without regard to upper or lower case.\n"
+                 "#\n"
+                 "# It is not a glob and not a regular expression:\n"
+                 "#     Waves          matches every path containing \"waves\"\n"
+                 "#     /yabridge/     matches everything under a folder called yabridge\n"
+                 "#     smartEQ4.vst3  matches that one plugin\n"
+                 "#     *.vst3         matches NOTHING - the asterisk is a literal asterisk\n"
+                 "#\n"
+                 "# A line starting with # is a comment. Blank lines are ignored.\n"
+                 "#\n"
+                 "# Why this exists: reading a plugin's name means opening it, and opening a\n"
+                 "# Windows plugin starts a Wine host. That happens once - what a module answers\n"
+                 "# is cached - but the first start after installing one is the slow one, and a\n"
+                 "# plugin that hangs the scan has no way past it otherwise.\n"
+                 "#\n"
+                 "# Everything found on this machine is listed below, commented out. Remove the\n"
+                 "# \"# \" in front of a line to stop that plugin being opened. Changes take\n"
+                 "# effect on the next Resolve start.\n"
+                 "#\n"
+                 "# This file is written once. Your edits are never overwritten - delete it to\n"
+                 "# have it built again from the current scan.\n"
+                 "\n");
+    for (const std::string& entry : paths) {
+        std::fprintf(file, "# %s\n", entry.c_str());
+    }
+    std::fclose(file);
+    Log("scan: wrote a deny-list template with %zu plugins, all commented out", paths.size());
+}
+
 std::string ScanCachePath()
 {
     const char* const home = std::getenv("HOME");
@@ -557,8 +700,18 @@ void Scan()
     ScanCacheLoad();
     int from_cache = 0;
     int opened = 0;
+    int denied = 0;
+    std::vector<std::string> offered;
 
     for (const Candidate& candidate : candidates) {
+        offered.push_back(candidate.path);
+
+        // Before anything is opened. That is the whole point of this list: a plugin that hangs the
+        // scan has to be stoppable without being opened first.
+        if (ScanDenied(candidate.path)) {
+            ++denied;
+            continue;
+        }
         std::string name = Stem(candidate.path);
         if (name.empty()) {
             continue;
@@ -659,7 +812,9 @@ void Scan()
               [](const ScannedPlugin& a, const ScannedPlugin& b) { return a.name < b.name; });
 
     ScanCacheStore();
-    Log("scan: %d modules answered from the cache, %d had to be opened", from_cache, opened);
+    ScanDenyTemplateWrite(offered);
+    Log("scan: %d modules answered from the cache, %d had to be opened, %d denied", from_cache,
+        opened, denied);
     Log("scan: %zu plugins will be listed", g_plugins.size());
     for (const ScannedPlugin& plugin : g_plugins) {
         Log("scan:   %-5s %s", FormatName(plugin.format), plugin.path.c_str());
