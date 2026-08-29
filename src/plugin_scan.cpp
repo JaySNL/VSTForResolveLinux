@@ -97,6 +97,11 @@ bool LooksLikeSupportLibrary(const std::string& file_name)
     return false;
 }
 
+// The library inside a bundle, or the file itself when it is the flat variant. The cache stamps
+// this rather than the bundle folder: replacing the library inside a bundle does not change the
+// folder's modification time, so stamping the folder would serve stale class names forever.
+std::string Vst3BinaryOf(const std::string& bundle);
+
 // A VST3 bundle is a directory: Name.vst3/Contents/x86_64-linux/Name.so. yabridge builds the same
 // shape around a Windows plugin, with an extra x86_64-win folder beside it that we never touch.
 // The bundle directory is what the host is given, so this only has to confirm the Linux binary is
@@ -286,6 +291,177 @@ bool FormatIsListed(PluginFormat format)
 // A line starting with # is a comment. With no file, a shell contributes its first class only -
 // the old behaviour, and never a menu full of plugins nobody asked for. An empty file means the
 // same thing, deliberately: "allow nothing" has to be sayable.
+// ---------------------------------------------------------------------------
+// The scan cache
+//
+// Reading a VST3's class names means opening the module, and for a Windows plugin that means
+// yabridge starting a Wine host. Measured on a tester's machine on 2026-08-29, with a Windows
+// plugin collection: enabling this bridge took Resolve from 229 threads to 706, from 9.5 GB of
+// system memory to 22.8 GB, and left three cores spinning - with no project open. The count that
+// named it was `pgrep -fc yabridge-host`: **336**. Resolve's own resident set had barely moved,
+// because the memory was in 336 other processes.
+//
+// So the scan remembers what it found. A module is opened only when this file has nothing for it,
+// or when its size or modification time has changed - which is to say, after it is installed or
+// updated, and never again. A normal start opens nothing at all.
+//
+// The format is one header line per module, then one line per class:
+//
+//   M<TAB>path<TAB>size<TAB>mtime<TAB>count
+//   C<TAB>class name<TAB>subcategory
+//
+// A line that does not parse is skipped rather than fatal: a stale or truncated cache must cost a
+// rescan, never a failed start.
+// ---------------------------------------------------------------------------
+
+std::string Vst3BinaryOf(const std::string& bundle)
+{
+    const std::string folder = bundle + "/Contents/x86_64-linux";
+    if (!IsDirectory(folder)) {
+        return bundle;
+    }
+    DIR* const directory = opendir(folder.c_str());
+    if (directory == nullptr) {
+        return bundle;
+    }
+    std::string found;
+    while (const dirent* const item = readdir(directory)) {
+        if (EndsWith(item->d_name, ".so")) {
+            found = folder + "/" + item->d_name;
+            break;
+        }
+    }
+    closedir(directory);
+    return found.empty() ? bundle : found;
+}
+
+std::string ScanCachePath()
+{
+    const char* const home = std::getenv("HOME");
+    if (home == nullptr) {
+        return std::string();
+    }
+    return std::string(home) + "/.local/share/BMDAudioPlugins/fxbridge-scan-cache.tsv";
+}
+
+struct CachedModule {
+    unsigned long long size = 0;
+    unsigned long long mtime = 0;
+    // How many classes the header promised. Kept so a truncated write can be told apart from a
+    // module that genuinely has none, which are the same thing on disk and must not be.
+    size_t expected = 0;
+    std::vector<std::string> classes;
+    std::vector<std::string> categories;
+};
+
+std::map<std::string, CachedModule>& ScanCache()
+{
+    static std::map<std::string, CachedModule> cache;
+    return cache;
+}
+
+bool ModuleStamp(const std::string& path, unsigned long long& size, unsigned long long& mtime)
+{
+    // A VST3 bundle is a directory, so the stamp is taken from the binary inside it rather than
+    // from the folder: a folder's mtime does not change when the library in it is replaced.
+    const std::string binary = Vst3BinaryOf(path);
+    struct stat info;
+    if (stat(binary.empty() ? path.c_str() : binary.c_str(), &info) != 0) {
+        return false;
+    }
+    size = static_cast<unsigned long long>(info.st_size);
+    mtime = static_cast<unsigned long long>(info.st_mtime);
+    return true;
+}
+
+std::vector<std::string> SplitTabs(const std::string& line)
+{
+    std::vector<std::string> fields;
+    size_t start = 0;
+    for (size_t at = 0; at <= line.size(); ++at) {
+        if (at == line.size() || line[at] == '\t') {
+            fields.push_back(line.substr(start, at - start));
+            start = at + 1;
+        }
+    }
+    return fields;
+}
+
+void ScanCacheLoad()
+{
+    const std::string path = ScanCachePath();
+    if (path.empty()) {
+        return;
+    }
+    std::FILE* const file = std::fopen(path.c_str(), "re");
+    if (file == nullptr) {
+        return;  // no cache is the normal first run, not a fault
+    }
+    char line[4096];
+    std::string current;
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        std::string text = line;
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+            text.pop_back();
+        }
+        const std::vector<std::string> fields = SplitTabs(text);
+        if (fields.size() == 5 && fields[0] == "M") {
+            current = fields[1];
+            CachedModule entry;
+            entry.size = std::strtoull(fields[2].c_str(), nullptr, 10);
+            entry.mtime = std::strtoull(fields[3].c_str(), nullptr, 10);
+            entry.expected = static_cast<size_t>(std::strtoul(fields[4].c_str(), nullptr, 10));
+            ScanCache()[current] = entry;
+        } else if (fields.size() == 3 && fields[0] == "C" && !current.empty()) {
+            CachedModule& entry = ScanCache()[current];
+            entry.classes.push_back(fields[1]);
+            entry.categories.push_back(fields[2]);
+        }
+    }
+    std::fclose(file);
+    // A record whose class count does not match its header is a truncated write: drop it, so the
+    // module is opened once and the cache repairs itself rather than listing half a shell.
+    //
+    // A record promising zero classes is NOT that. It is a module that answered nothing - a native
+    // Linux bundle sitting in the yabridge folder is the common case - and remembering that is the
+    // whole point. Treating the two alike reopened ten modules on every start here, which on a
+    // large collection is ten Wine hosts started to re-learn nothing.
+    for (auto it = ScanCache().begin(); it != ScanCache().end();) {
+        it = it->second.classes.size() != it->second.expected ? ScanCache().erase(it)
+                                                              : std::next(it);
+    }
+    Log("scan: cache holds %zu modules", ScanCache().size());
+}
+
+void ScanCacheStore()
+{
+    const std::string path = ScanCachePath();
+    if (path.empty()) {
+        return;
+    }
+    const std::string temporary = path + ".new";
+    std::FILE* const file = std::fopen(temporary.c_str(), "we");
+    if (file == nullptr) {
+        Log("scan: cannot write %s", temporary.c_str());
+        return;
+    }
+    for (const auto& entry : ScanCache()) {
+        std::fprintf(file, "M\t%s\t%llu\t%llu\t%zu\n", entry.first.c_str(), entry.second.size,
+                     entry.second.mtime, entry.second.classes.size());
+        for (size_t at = 0; at < entry.second.classes.size(); ++at) {
+            std::fprintf(file, "C\t%s\t%s\n", entry.second.classes[at].c_str(),
+                         at < entry.second.categories.size() ? entry.second.categories[at].c_str()
+                                                             : "");
+        }
+    }
+    std::fclose(file);
+    // Renamed into place, never written over: a half-written cache read by the next start would
+    // list half of somebody's shell and look like plugins had gone missing.
+    if (std::rename(temporary.c_str(), path.c_str()) != 0) {
+        Log("scan: cannot replace %s", path.c_str());
+    }
+}
+
 const std::vector<std::string>& ShellAllowList(bool& configured)
 {
     static std::vector<std::string> patterns;
@@ -376,6 +552,12 @@ void Scan()
     // One name per entry, and the name has to be unique: the key is built from it, and two effects
     // under one key means the second insert is dropped by the map.
     std::map<std::string, int> seen;
+    // Read what previous starts already learned. Every module found here is one Wine host that
+    // does not have to be started to answer a question it answered before.
+    ScanCacheLoad();
+    int from_cache = 0;
+    int opened = 0;
+
     for (const Candidate& candidate : candidates) {
         std::string name = Stem(candidate.path);
         if (name.empty()) {
@@ -401,7 +583,31 @@ void Scan()
         std::vector<std::string> classes;
         std::vector<std::string> declared;
         if (candidate.format == PluginFormat::Vst3) {
-            Vst3ListClasses(candidate.path.c_str(), classes, &declared);
+            unsigned long long size = 0;
+            unsigned long long mtime = 0;
+            const bool stamped = ModuleStamp(candidate.path, size, mtime);
+            auto found = ScanCache().find(candidate.path);
+            const bool fresh = stamped && found != ScanCache().end() &&
+                               found->second.size == size && found->second.mtime == mtime;
+            if (fresh) {
+                classes = found->second.classes;
+                declared = found->second.categories;
+                ++from_cache;
+            } else {
+                Vst3ListClasses(candidate.path.c_str(), classes, &declared);
+                ++opened;
+                // Stored even when it found nothing, so a module that cannot answer is asked
+                // once rather than on every start.
+                if (stamped) {
+                    CachedModule entry;
+                    entry.size = size;
+                    entry.mtime = mtime;
+                    entry.expected = classes.size();
+                    entry.classes = classes;
+                    entry.categories = declared;
+                    ScanCache()[candidate.path] = entry;
+                }
+            }
         }
 
         if (classes.size() > 1) {
@@ -452,6 +658,8 @@ void Scan()
     std::sort(g_plugins.begin(), g_plugins.end(),
               [](const ScannedPlugin& a, const ScannedPlugin& b) { return a.name < b.name; });
 
+    ScanCacheStore();
+    Log("scan: %d modules answered from the cache, %d had to be opened", from_cache, opened);
     Log("scan: %zu plugins will be listed", g_plugins.size());
     for (const ScannedPlugin& plugin : g_plugins) {
         Log("scan:   %-5s %s", FormatName(plugin.format), plugin.path.c_str());

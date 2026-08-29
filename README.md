@@ -250,13 +250,18 @@ wrong on the way — is in [`docs/settings.md`](docs/settings.md).
   hosted plugin's own window is invisible to it. The settings are not lost, they are written on
   the next thing you do that Resolve can see. `FXBRIDGE_STATE_STORE=1` closes the gap for a
   session that changes nothing else at all.
-- **Higher idle CPU than stock Resolve on one machine** — reported as 20–25% against 0–3%, where
-  Reaper hosting the same plugins is quiet. **Not reproduced.** Measured here with five plugins
-  loaded and the timeline idle, the one bridge thread that runs costs **0.31 s of CPU over 321 s
-  alive — 0.10% of a core**. With no plugin loaded the bridge starts no threads at all. The three
-  it can start are named, so `top -H -p $(pgrep -f /opt/resolve/bin/resolve)` names the culprit
-  instead of guessing: `fxb-xpump` (X11 events, 30 ms), `fxb-tick` (plugin idle, 16 ms), and
-  `fxb-carla`, which cannot start at all in this build.
+- **Startup used to start a Wine host for every Windows plugin you own.** Fixed in v0.2.5, and it
+  was the cause of the high-CPU reports. Reading a VST3's class names means opening it, and for a
+  Windows plugin that means yabridge starting a Wine host — which this bridge then kept alive for
+  the whole session, on purpose, because a note in the source said it "costs a file handle".
+  Measured on a tester's machine on 2026-08-29: `pgrep -fc yabridge-host` returned **336** with no
+  project open, Resolve went from 229 threads to 706, the machine from 9.5 GB of memory in use to
+  22.8 GB, and three cores spun at 100%. Modules are now closed after the scan reads them, and what
+  they answered is cached in `~/.local/share/BMDAudioPlugins/fxbridge-scan-cache.tsv`, so a normal
+  start opens nothing at all. Delete that file to force a rescan; it repairs itself if truncated.
+  `FXBRIDGE_SCAN_KEEP_OPEN=1` restores the old behaviour.
+- **The first start after installing or updating a plugin is still slow**, because that is when the
+  scan has to open it. The cache is keyed on the library's size and modification time.
 - **A plugin's GUI is a separate window**, not a panel inside Resolve. The inspector panel for a
   bridged effect stays black on purpose. Under Wayland both windows go through XWayland. It is
   listed in the window switcher and takes the keyboard when it opens; `FXBRIDGE_WINDOW_TYPE`

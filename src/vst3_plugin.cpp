@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -1477,16 +1478,45 @@ bool Vst3ListClasses(const char* path, std::vector<std::string>& out,
         return false;
     }
 
-    // The module is opened and deliberately never closed.
+    // The module is opened, read, and CLOSED again.
     //
-    // dlclose on a yabridge module tears down the Wine host behind it, and the plugin the user then
-    // picks from the menu would have to start a second one. Leaving it mapped costs a file handle
-    // and makes the later load cheap. The scan runs once per Resolve start, so this cannot grow.
+    // It used to be left open on purpose: dlclose on a yabridge module tears down the Wine host
+    // behind it, so the plugin the user then picks has to start a second one, and the note here
+    // said that leaving it mapped "costs a file handle". That was wrong by three orders of
+    // magnitude. On a tester's Windows plugin collection, 2026-08-29, `pgrep -fc yabridge-host`
+    // returned **336** with no project open. Enabling this bridge took Resolve from 229 threads to
+    // 706 and the machine from 9.5 GB of memory in use to 22.8 GB, with three cores spinning,
+    // because every one of those hosts stayed alive for the whole session.
+    //
+    // Reloading one module when a user actually picks a plugin is the cheaper side of that trade by
+    // a very long way. FXBRIDGE_SCAN_KEEP_OPEN=1 restores the old behaviour for anyone who finds a
+    // plugin that cannot survive being closed and reopened.
     void* const handle = dlopen(binary.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr) {
         Log("vst3: dlopen(%s) failed: %s", binary.c_str(), dlerror());
         return false;
     }
+
+    // Closed on every path out of here, including the refusals below, because each one of those
+    // used to leave a Wine host running for a module the scan had already given up on.
+    struct ModuleGuard {
+        void* handle;
+        ~ModuleGuard()
+        {
+            if (handle == nullptr) {
+                return;
+            }
+            const char* const keep = std::getenv("FXBRIDGE_SCAN_KEEP_OPEN");
+            if (keep != nullptr && keep[0] != '0') {
+                return;
+            }
+            using ModuleExitFn = bool (*)(void);
+            if (auto* const leave = reinterpret_cast<ModuleExitFn>(dlsym(handle, "ModuleExit"))) {
+                leave();
+            }
+            dlclose(handle);
+        }
+    } guard{handle};
 
     using ModuleEntryFn = bool (*)(void*);
     if (auto* const enter = reinterpret_cast<ModuleEntryFn>(dlsym(handle, "ModuleEntry"))) {
