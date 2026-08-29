@@ -39,6 +39,16 @@ bwrap --bind "$ROOT" / --dev /dev --proc /proc --tmpfs /tmp \
             src/host_thread.cpp src/vst3_plugin.cpp src/plugin_scan.cpp src/plugin_state.cpp \
             src/fx_categories.cpp src/plugin_window.cpp \
             -ldl -lX11 -lz -lpthread
+        # The pre-launch scanner ships with the library, and floors at the same glibc, so it is
+        # built in the same rootfs rather than on the machine that happens to be running this.
+        g++ -std=c++17 -O2 -w \
+            -I third_party/clap/include \
+            -I third_party/dpf/distrho/src/travesty \
+            -I /usr/include/carla/includes \
+            -o /out/fxbridge-scan \
+            src/scan_main.cpp src/plugin_scan.cpp src/vst3_plugin.cpp src/host_thread.cpp \
+            src/plugin_window.cpp src/fx_categories.cpp \
+            -ldl -lX11 -lz -lpthread
         # Both checks run INSIDE the old rootfs, which is the only place they mean anything.
         if ldd -r /out/libfxbridge.so 2>&1 | grep -q "undefined symbol"; then
             echo "REFUSING - undefined symbols against glibc 2.31:" >&2
@@ -47,5 +57,5 @@ bwrap --bind "$ROOT" / --dev /dev --proc /proc --tmpfs /tmp \
         fi
         echo "floor: $(objdump -T /out/libfxbridge.so | grep -o "GLIBC[X]*_[0-9.]*" | sort -uV | tail -1) $(objdump -T /out/libfxbridge.so | grep -o "CXXABI_[0-9.]*" | sort -uV | tail -1)"
       '
-( cd "$OUT" && sha256sum libfxbridge.so > SHA256SUMS && cat SHA256SUMS )
+( cd "$OUT" && sha256sum libfxbridge.so fxbridge-scan > SHA256SUMS && cat SHA256SUMS )
 echo "built $TAG into $OUT"

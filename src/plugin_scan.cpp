@@ -9,7 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -17,6 +20,12 @@
 namespace {
 
 void (*g_logger)(const char*) = nullptr;
+void (*g_progress)(int, int, const char*) = nullptr;
+
+// The scan opens several modules at once, so everything shared below it takes this lock: the log,
+// the cache file, and the list of modules currently open. None of them sits on a hot path - the
+// thing being waited for is a Wine host taking a third of a second to start.
+std::mutex g_scan_lock;
 
 void Log(const char* format, ...) __attribute__((format(printf, 1, 2)));
 
@@ -502,6 +511,9 @@ std::string ScanBadPath() { return ConfigPath("fxbridge-scan-crashed.txt"); }
 
 std::string ScanSuspectPath() { return ConfigPath("fxbridge-scan-suspect.txt"); }
 
+// Set when the previous start left modules open. See ScanBadLoad.
+bool g_scan_recovering = false;
+
 std::vector<std::string>& ScanBadList()
 {
     static std::vector<std::string> bad;
@@ -514,25 +526,52 @@ std::vector<std::string>& ScanSuspectList()
     return suspect;
 }
 
-// Written and closed before the module opens, so it survives a process that never returns.
-void ScanInFlightMark(const std::string& path)
+// Written and closed before a module opens, so it survives a process that never returns. Several
+// modules are open at once, so this is a list rather than a name.
+std::vector<std::string>& ScanInFlightNow()
+{
+    static std::vector<std::string> open_now;
+    return open_now;
+}
+
+// Caller holds g_scan_lock.
+void ScanInFlightWriteLocked()
 {
     const std::string file = ScanInFlightPath();
     if (file.empty()) {
         return;
     }
-    if (std::FILE* const out = std::fopen(file.c_str(), "we")) {
-        std::fprintf(out, "%s\n", path.c_str());
-        std::fclose(out);
+    const std::vector<std::string>& now = ScanInFlightNow();
+    if (now.empty()) {
+        ::unlink(file.c_str());
+        return;
     }
+    std::FILE* const out = std::fopen(file.c_str(), "we");
+    if (out == nullptr) {
+        return;
+    }
+    for (const std::string& entry : now) {
+        std::fprintf(out, "%s\n", entry.c_str());
+    }
+    std::fclose(out);
 }
 
-void ScanInFlightClear()
+void ScanInFlightAdd(const std::string& path)
 {
-    const std::string file = ScanInFlightPath();
-    if (!file.empty()) {
-        ::unlink(file.c_str());
+    std::lock_guard<std::mutex> hold(g_scan_lock);
+    ScanInFlightNow().push_back(path);
+    ScanInFlightWriteLocked();
+}
+
+void ScanInFlightRemove(const std::string& path)
+{
+    std::lock_guard<std::mutex> hold(g_scan_lock);
+    std::vector<std::string>& now = ScanInFlightNow();
+    const auto at = std::find(now.begin(), now.end(), path);
+    if (at != now.end()) {
+        now.erase(at);
     }
+    ScanInFlightWriteLocked();
 }
 
 void ReadLines(const std::string& file, std::vector<std::string>& out)
@@ -613,37 +652,43 @@ void ScanBadLoad()
     if (stranded.empty()) {
         return;
     }
-    const std::string& name = stranded.front();
-    if (std::find(bad.begin(), bad.end(), name) != bad.end()) {
-        return;
+
+    // This start is a recovery, and it runs one module at a time. Several modules are open at
+    // once normally, so a start that ends strands all of them - and only one of them is to blame.
+    // Going back to a single worker makes the next name that strands the answer rather than a
+    // one-in-eight guess.
+    g_scan_recovering = true;
+
+    for (const std::string& name : stranded) {
+        if (std::find(bad.begin(), bad.end(), name) != bad.end()) {
+            continue;
+        }
+        const auto seen = std::find(suspect.begin(), suspect.end(), name);
+        if (seen == suspect.end()) {
+            suspect.push_back(name);
+            Log("scan: the last start ended while %s was open. It is opened again this time. If "
+                "this start ends there too, it is skipped from then on.",
+                name.c_str());
+            continue;
+        }
+        suspect.erase(seen);
+        bad.push_back(name);
+        Log("scan: %s was open when the last two starts ended. It is skipped from now on - "
+            "delete %s to try it again.",
+            name.c_str(), list.c_str());
     }
 
-    auto seen = std::find(suspect.begin(), suspect.end(), name);
-    if (seen == suspect.end()) {
-        suspect.push_back(name);
-        WriteLines(pending, suspect,
-                   "# Modules that were open when a start ended. One appearance proves nothing -\n"
-                   "# a start closed by hand blames whatever happened to be open. A module listed\n"
-                   "# here is still opened on the next start, and only skipped if it is open when\n"
-                   "# that start ends too.\n");
-        Log("scan: the last start ended while %s was open. It is opened again this time. If this "
-            "start ends there too, it is skipped from then on.",
-            name.c_str());
-        return;
-    }
-
-    suspect.erase(seen);
-    WriteLines(pending, suspect, nullptr);
-    bad.push_back(name);
+    WriteLines(pending, suspect,
+               "# Modules that were open when a start ended. One appearance proves nothing - a\n"
+               "# start closed by hand blames whatever happened to be open. A module listed here\n"
+               "# is still opened on the next start, and only skipped if it is open when that\n"
+               "# start ends too.\n");
     WriteLines(list, bad,
                "# Modules that were open at the end of two starts in a row, and are skipped from\n"
                "# the scan because of it.\n"
                "#\n"
                "# Delete a line to have that plugin opened again, or delete the whole file to try\n"
                "# all of them.\n");
-    Log("scan: %s was open when the last two starts ended. It is skipped from now on - delete %s "
-        "to try it again.",
-        name.c_str(), list.c_str());
 }
 
 bool ScanIsBad(const std::string& path)
@@ -899,7 +944,7 @@ void Scan()
     // with a hundred of them is therefore a minute of a Resolve splash screen that does not move,
     // and a tester reasonably reported that as the program being stuck. Later starts read the
     // cache and open nothing.
-    int to_open = 0;
+    std::vector<std::string> work;
     for (const Candidate& candidate : candidates) {
         if (candidate.format != PluginFormat::Vst3 || ScanDenied(candidate.path) ||
             ScanIsBad(candidate.path)) {
@@ -910,13 +955,118 @@ void Scan()
         auto found = ScanCache().find(candidate.path);
         if (!ModuleStamp(candidate.path, size, mtime) || found == ScanCache().end() ||
             found->second.size != size || found->second.mtime != mtime) {
-            ++to_open;
+            work.push_back(candidate.path);
         }
     }
+    const int to_open = static_cast<int>(work.size());
+
+    // Several modules at once, because the cost is a Wine host starting and nothing else.
+    //
+    // Measured on the development machine: dlopen 0 ms, ModuleEntry 327-352 ms, ModuleExit
+    // 26-29 ms, dlclose 0 ms. So there is nothing to shave off the work itself - the time is a
+    // separate process being started, and separate processes start alongside each other. Two
+    // modules serially took 1196-1726 ms and 510-951 ms in parallel across three runs each.
+    //
+    // Bounded, and the bound matters. The 336 Wine hosts that this scan once left running are
+    // what made it slow in the first place; eight at a time for the length of one open is a
+    // different thing entirely, and they are gone again before the next eight start.
+    int workers = 8;
+    if (const char* const set = std::getenv("FXBRIDGE_SCAN_THREADS")) {
+        workers = std::atoi(set);
+    }
+    if (g_scan_recovering) {
+        // One at a time, so the module that ends this start is named by itself rather than with
+        // seven innocent neighbours. See ScanBadLoad.
+        workers = 1;
+    }
+    if (workers < 1) {
+        workers = 1;
+    }
+    if (workers > 16) {
+        workers = 16;
+    }
+    if (workers > to_open) {
+        workers = to_open > 0 ? to_open : 1;
+    }
+
+    std::map<std::string, std::pair<std::vector<std::string>, std::vector<std::string>>> answers;
     if (to_open > 0) {
-        Log("scan: %d VST3 modules have to be opened. Each Windows one starts and stops a Wine "
-            "host, so this start is slow and the next one is not.",
-            to_open);
+        Log("scan: %d VST3 modules have to be opened, %d at a time. Each Windows one starts and "
+            "stops a Wine host, so this run is slow and the next one is not.",
+            to_open, workers);
+        if (g_progress != nullptr) {
+            g_progress(0, to_open, nullptr);
+        }
+
+        std::atomic<int> next(0);
+        std::atomic<int> done(0);
+        auto worker = [&]() {
+            for (;;) {
+                const int at = next.fetch_add(1);
+                if (at >= to_open) {
+                    return;
+                }
+                const std::string& path = work[static_cast<size_t>(at)];
+                {
+                    std::lock_guard<std::mutex> hold(g_scan_lock);
+                    Log("scan: opening %s (%d of %d)", path.c_str(), at + 1, to_open);
+                }
+                // On disk before the plugin's own code runs, and gone again the moment it
+                // answers. Nothing between these two lines may assume the process returns.
+                ScanInFlightAdd(path);
+                const auto started = std::chrono::steady_clock::now();
+                std::vector<std::string> classes;
+                std::vector<std::string> declared;
+                Vst3ListClasses(path.c_str(), classes, &declared);
+                ScanInFlightRemove(path);
+                const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - started)
+                                       .count();
+
+                std::lock_guard<std::mutex> hold(g_scan_lock);
+                Log("scan: %s answered %zu classes in %lld ms", path.c_str(), classes.size(),
+                    static_cast<long long>(spent));
+                unsigned long long size = 0;
+                unsigned long long mtime = 0;
+                // Stored even when it found nothing, so a module that cannot answer is asked
+                // once rather than on every run.
+                if (ModuleStamp(path, size, mtime)) {
+                    CachedModule entry;
+                    entry.size = size;
+                    entry.mtime = mtime;
+                    entry.expected = classes.size();
+                    entry.classes = classes;
+                    entry.categories = declared;
+                    ScanCache()[path] = entry;
+                    // Written out after every single module, and not once at the end.
+                    //
+                    // A tester with the MeldaProduction bundle never reached the end: each of
+                    // his modules costs 1.6 - 3.0 s and there are well over a hundred of them.
+                    // He gave up several minutes in - and because the cache was written only
+                    // after the loop, every one of those runs threw away everything it had just
+                    // learned and began again from the first module.
+                    //
+                    // Rewriting the whole file each time is a few hundred microseconds against
+                    // the seconds the module itself cost, and it goes through a rename, so a run
+                    // that stops halfway leaves a complete file rather than a torn one.
+                    ScanCacheStore();
+                }
+                answers[path] = std::make_pair(classes, declared);
+                const int finished = done.fetch_add(1) + 1;
+                if (g_progress != nullptr) {
+                    g_progress(finished, to_open, path.c_str());
+                }
+            }
+        };
+
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<size_t>(workers));
+        for (int i = 0; i < workers; ++i) {
+            pool.emplace_back(worker);
+        }
+        for (std::thread& one : pool) {
+            one.join();
+        }
     }
 
     for (const Candidate& candidate : candidates) {
@@ -965,47 +1115,16 @@ void Scan()
                 declared = found->second.categories;
                 ++from_cache;
             } else {
-                // Named before the module opens, never only after. A module that hangs the scan
-                // or takes the process down with it writes nothing of its own, so the last line
-                // in the log has to be the one that says which module was being asked.
-                Log("scan: opening %s (%d of %d)", candidate.path.c_str(), opened + 1, to_open);
-                // On disk before the plugin's own code runs, and gone again the moment it
-                // answers. Nothing between these two lines is allowed to assume it returns.
-                ScanInFlightMark(candidate.path);
-                const auto started = std::chrono::steady_clock::now();
-                Vst3ListClasses(candidate.path.c_str(), classes, &declared);
-                ScanInFlightClear();
-                const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       std::chrono::steady_clock::now() - started)
-                                       .count();
-                Log("scan: %s answered %zu classes in %lld ms", candidate.path.c_str(),
-                    classes.size(), static_cast<long long>(spent));
-                ++opened;
-                // Stored even when it found nothing, so a module that cannot answer is asked
-                // once rather than on every start.
-                if (stamped) {
-                    CachedModule entry;
-                    entry.size = size;
-                    entry.mtime = mtime;
-                    entry.expected = classes.size();
-                    entry.classes = classes;
-                    entry.categories = declared;
-                    ScanCache()[candidate.path] = entry;
-                    // Written out here, after every single module, and not once at the end.
-                    //
-                    // A tester with the MeldaProduction bundle never reached the end: each of
-                    // his modules costs 1.6 - 3.0 s, because opening a Windows VST3 starts a
-                    // Wine host and closing it stops one, and there are well over a hundred of
-                    // them. He gave up several minutes in - and because the cache was written
-                    // only after the loop, every one of those starts threw away everything it
-                    // had just learned and began again from the first module.
-                    //
-                    // Rewriting the whole file each time is a few hundred microseconds against
-                    // the seconds the module itself cost, and it is done by rename, so a start
-                    // that stops halfway leaves a complete file rather than a torn one. Every
-                    // start now gets further than the one before it, whatever stops it.
-                    ScanCacheStore();
+                // Already opened, above, alongside seven others. This loop stays serial and
+                // stays in path order, because the menu name is built here and has to come out
+                // the same on every run - an entry that changes name is an effect that stops
+                // loading. The slow part is the part that was parallel; the naming is not slow.
+                const auto answered = answers.find(candidate.path);
+                if (answered != answers.end()) {
+                    classes = answered->second.first;
+                    declared = answered->second.second;
                 }
+                ++opened;
             }
         }
 
@@ -1090,4 +1209,15 @@ const std::vector<ScannedPlugin>& ScannedPlugins()
 void PluginScanSetLogger(void (*logger)(const char*))
 {
     g_logger = logger;
+}
+
+void PluginScanSetProgress(void (*progress)(int, int, const char*))
+{
+    g_progress = progress;
+}
+
+const char* PluginScanInFlightPath()
+{
+    static const std::string path = ScanInFlightPath();
+    return path.c_str();
 }

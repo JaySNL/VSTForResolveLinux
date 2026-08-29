@@ -1350,3 +1350,72 @@ along. I inferred the destination from `fputs(..., stderr)` in `proxy.cpp` and n
 that stderr goes. The check took four seconds when I finally ran it, and it is the same rule as
 never asserting a negative: **an instruction handed to someone else is verified on a real machine
 first.**
+
+---
+
+## 2026-08-29, late — the scan moves out of Resolve, and gets measured before it gets faster
+
+Jay asked for two things: parallelise the scan, and have `build.sh` build the cache before Resolve
+is launched, with a status indicator so a person knows what is happening.
+
+### Measure first
+
+The phases of opening one Windows VST3 through yabridge, timed separately:
+
+| phase | cost |
+|---|---|
+| `dlopen` | 0 ms |
+| **`ModuleEntry`** | **327–352 ms** |
+| `ModuleExit` | 26–29 ms |
+| `dlclose` | 0 ms |
+
+That killed my first instinct outright. Deferring the teardown - keeping hosts alive to the end of
+the scan and closing them in a batch - would have bought 8%, at the cost of reintroducing the
+unbounded host count that started all of this. The time is one separate process starting, and
+nothing in our code is on that path.
+
+Which is also why parallelism works. Three runs each over the same two modules: **1196, 1679,
+1726 ms serial against 951, 911, 510 ms parallel.** The whole scan here went 2,910 s → 1,232 s at
+eight workers, on a set where only two of twenty-one modules are Windows plugins. Frankie's set is
+330 modules that are nearly all slow, so his ratio should be better than this one.
+
+### Two phases, because naming has to stay in order
+
+The scan opens modules and then builds the menu. Only the first half parallelises: the menu name is
+stored in the project, so an entry that changes name between runs is an effect that stops loading.
+The open phase now runs in a bounded pool and writes into a map; the naming loop is untouched and
+still walks the candidates in sorted path order.
+
+### A stranded name is worth less when eight are open
+
+The two-strike rule from earlier today assumed one module in flight. With eight, a start that ends
+strands eight names and seven are innocent. A recovery run therefore drops to **one worker**, so
+the name that strands again is the answer rather than a one-in-eight guess.
+
+### Ctrl-C is a person, not a plugin
+
+`fxbridge-scan` installs a handler that deletes the in-flight note and `_exit(130)`s. Not `exit()`:
+the threads are inside a plugin's own code and running static destructors underneath them is a
+worse ending. `unlink` is async-signal-safe; building the path is not, so the path is taken before
+the handler is installed.
+
+| stop | cache kept | blamed |
+|---|---|---|
+| `SIGINT` | 19 modules | nobody - note cleared |
+| `SIGKILL` | 19 modules | the 2 that were genuinely open |
+
+### The plugins talk too
+
+yabridge writes its own diagnostics to stderr, one paragraph per bundle that holds no Windows
+module, and they landed in the middle of the progress line and tore it in half. They go to
+`fxbridge-scan-errors.log` now. Kept, not discarded: a plugin that faults while being read leaves
+its last words there.
+
+### Still open
+
+Option two from the same conversation, not built. Every non-shell module answers exactly one class,
+and its file stem is already the name - so a cold scan could open **nothing**, and resolve the
+class lazily when the plugin is actually loaded. That takes the first run from minutes to seconds.
+The obstacle is shells: `WaveShell` holds 718 plugins behind a stem that names none of them. The
+shape that solves both is a background pass after Resolve has started, correcting the list for the
+next launch. It needs designing, not typing.

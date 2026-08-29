@@ -48,6 +48,38 @@ mv -f "$install_dir/.libfxbridge.so.new" "$install_dir/libfxbridge.so"
 
 echo "built and installed $install_dir/libfxbridge.so"
 
+# The scanner, and then the scan.
+#
+# Reading a plugin's name means opening it, and opening a Windows VST3 through yabridge starts a
+# Wine host - about a third of a second here, one to three seconds on a tester's machine. A few
+# hundred plugins is therefore minutes, and those minutes used to be spent inside Resolve's splash
+# screen with nothing to read. Spent here they have a progress bar, and a plugin that faults while
+# being read takes down a command instead of an edit session.
+#
+# It only costs that once. Afterwards the cache answers and nothing is opened, by this or by
+# Resolve. Set FXBRIDGE_NO_SCAN=1 to skip it.
+g++ -std=c++17 -O2 -Wall -Wextra \
+    -I "$root/third_party/clap/include" \
+    -I "$root/third_party/dpf/distrho/src/travesty" \
+    -I /usr/include/carla/includes \
+    -o "$out/fxbridge-scan" \
+    "$root/src/scan_main.cpp" "$root/src/plugin_scan.cpp" "$root/src/vst3_plugin.cpp" \
+    "$root/src/host_thread.cpp" "$root/src/plugin_window.cpp" "$root/src/fx_categories.cpp" \
+    -ldl -lX11 -lz -lpthread
+cp "$out/fxbridge-scan" "$install_dir/.fxbridge-scan.new"
+chmod 755 "$install_dir/.fxbridge-scan.new"
+mv -f "$install_dir/.fxbridge-scan.new" "$install_dir/fxbridge-scan"
+echo "built and installed $install_dir/fxbridge-scan"
+
+if [ -n "$FXBRIDGE_NO_SCAN" ]; then
+    echo "skipping the scan; run it yourself with:"
+    echo "    $install_dir/fxbridge-scan"
+else
+    echo ""
+    "$install_dir/fxbridge-scan"
+    echo ""
+fi
+
 # Point Resolve at the library, because asking a person to do it by hand does not work.
 #
 # The first outside tester followed the readme, saw no plugins and no error, and had no way to tell

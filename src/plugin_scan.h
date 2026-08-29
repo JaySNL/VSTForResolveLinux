@@ -33,4 +33,15 @@ const std::vector<ScannedPlugin>& ScannedPlugins();
 
 void PluginScanSetLogger(void (*logger)(const char*));
 
+// Called once per module as the scan opens it, so a caller with a terminal can draw progress
+// instead of leaving a person watching nothing. `done` counts modules finished, `total` is how
+// many have to be opened this run, and `path` is the one that just answered. Both counts are
+// zero-based on entry: the first call is (0, total, nullptr), before anything is opened.
+void PluginScanSetProgress(void (*progress)(int done, int total, const char* path));
+
+// The file naming the modules that are open right now. A caller that is stopped on purpose - by a
+// person pressing Ctrl-C rather than by a plugin faulting - deletes it, so nothing gets the blame
+// for a run that was ended deliberately. Never null; empty when HOME is not set.
+const char* PluginScanInFlightPath();
+
 #endif

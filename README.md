@@ -130,6 +130,20 @@ from.
 mkdir -p ~/.local/share/BMDAudioPlugins
 curl -L -o ~/.local/share/BMDAudioPlugins/libfxbridge.so \
   https://github.com/JaySNL/VSTForResolveLinux/releases/latest/download/libfxbridge.so
+curl -L -o ~/.local/share/BMDAudioPlugins/fxbridge-scan \
+  https://github.com/JaySNL/VSTForResolveLinux/releases/latest/download/fxbridge-scan
+chmod +x ~/.local/share/BMDAudioPlugins/fxbridge-scan
+```
+
+The second file is the scanner. Run it once before you start Resolve, and it does the slow part
+out here where you can watch it:
+
+```sh
+~/.local/share/BMDAudioPlugins/fxbridge-scan
+```
+
+```
+  [##########..............]  42%  139/330  3m11s elapsed  ~4m22s left  MTurboDelayMB
 ```
 
 **Step 2. Close DaVinci Resolve.** It owns the config file and rewrites it on quit, so an edit made
@@ -234,6 +248,28 @@ current scan.
 
 This matters mainly for the **first** start after installing a plugin, which is the one that has to
 open it, and for a plugin that hangs the scan — the check runs before anything is opened.
+
+### The first scan, and why it is the only slow one
+
+Reading a plugin's name means opening it, and opening a Windows VST3 through yabridge starts a
+Wine host. Measured here: `dlopen` 0 ms, **`ModuleEntry` 327–352 ms**, `ModuleExit` 26–29 ms,
+`dlclose` 0 ms. On a tester's machine the same step takes one to three seconds per plugin. With a
+few hundred plugins that is minutes, once.
+
+Three things make that once bearable:
+
+- **`fxbridge-scan` does it outside Resolve**, with a progress bar. `build.sh` runs it for you
+  after it installs. A plugin that faults while being read then takes down a command rather than an
+  edit session.
+- **Eight modules are opened at once.** Independent Wine hosts, so they start alongside each other:
+  2,910 s serial against 1,232 s parallel over the same 21 modules here. `FXBRIDGE_SCAN_THREADS`
+  changes the number.
+- **Nothing learned is thrown away.** The cache is written after every module, so Ctrl-C is safe
+  and the next run continues where the last one stopped. A cached start reads the file and opens
+  nothing: **0,003 s** here, against 2,910 s cold.
+
+The cache key is the size and modification time of the binary inside each bundle, so a plugin you
+update or install is read again and the rest are not.
 
 **Plugins that stopped a start** — `~/.local/share/BMDAudioPlugins/fxbridge-scan-crashed.txt`. You
 do not write this one. Reading a plugin's name runs that plugin's code inside Resolve, so a plugin

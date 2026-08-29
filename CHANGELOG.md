@@ -7,6 +7,61 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.2.8 — 2026-08-29
+
+**The slow scan moves out of Resolve, gets a progress bar, and runs eight at a time.**
+
+### Added
+
+- **`fxbridge-scan`, a command that builds the cache before Resolve starts.** The scan was always
+  going to be slow once — reading a plugin's name means opening it, and opening a Windows VST3
+  through yabridge starts a Wine host. It used to be slow inside Resolve's splash screen, with
+  nothing to read and nothing to do.
+
+  ```
+    [##########..............]  42%  139/330  3m11s elapsed  ~4m22s left  MTurboDelayMB
+  ```
+
+  `build.sh` builds it, installs it and runs it. It ships in the release next to the library.
+  It is the same code the bridge runs and writes the same cache to the same place, so Resolve then
+  starts on it and opens nothing.
+
+  Two things follow from it being a separate program. A plugin that faults while being read takes
+  down a command instead of an edit session. And a person pressing Ctrl-C is told apart from a
+  plugin faulting: the interrupt deletes the in-flight note, so nothing is blamed for a run that
+  was ended on purpose. Verified both ways — `SIGINT` keeps the 19 cached modules and clears the
+  note; `SIGKILL` leaves the two that were genuinely open.
+
+- **Eight modules are opened at once.** Measured first, because the fix follows the measurement:
+
+  | phase | cost |
+  |---|---|
+  | `dlopen` | 0 ms |
+  | **`ModuleEntry`** | **327–352 ms** |
+  | `ModuleExit` | 26–29 ms |
+  | `dlclose` | 0 ms |
+
+  All of it is a separate process starting, and separate processes start alongside each other.
+  Two modules took 1196–1726 ms serially and 510–951 ms in parallel across three runs each; the
+  whole scan here went from **2,910 s to 1,232 s**. `FXBRIDGE_SCAN_THREADS` sets the number,
+  default 8, capped at 16.
+
+  Bounded, and the bound is the point: the 336 Wine hosts that made this slow in the first place
+  were unbounded and permanent. Eight for the length of one open is a different thing.
+
+  **A start that ended with modules open runs the next scan one at a time.** Eight in flight means
+  eight stranded names and only one culprit, so a recovery run goes serial and the name that
+  strands again is the answer rather than a one-in-eight guess.
+
+### Note
+
+The plugins' own output — yabridge writes a paragraph for every bundle holding no Windows module —
+now goes to `~/.local/share/BMDAudioPlugins/fxbridge-scan-errors.log` instead of through the
+progress bar. It is kept rather than discarded: if a plugin faults while being read, its last words
+are in there.
+
+---
+
 ## v0.2.7 — 2026-08-29
 
 **A slow first scan no longer starts over every time.**
