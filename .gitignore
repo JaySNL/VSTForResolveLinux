@@ -4,3 +4,5 @@
 build/
 tools/xtree/xtree
 graphify-out/
+release/
+release-test/
