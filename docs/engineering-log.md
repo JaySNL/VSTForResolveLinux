@@ -115,6 +115,14 @@ Resolve falls back to its own library. Config backups from the first session are
 
 ## Dead end: the built-in VST hosts are stubs
 
+> **Corrected 2026-08-29.** This entry is right about `VST3Host` and wrong about the rest. Two
+> `VST3Host` methods were measured as stubs and the conclusion was extended to `VSTHost`,
+> `VSTPluginManager` and every member of all three. `VSTHost::LoadPlugin` at `0x15912f0` has a real
+> body — it takes the recursive mutex at `this+0x70` and increments the counter at `this+0x98`. So
+> does `VSTPlugin::StorePreset`, and reading it is what made v0.2.3 possible. What still holds is
+> the practical finding: nothing in the Linux interface loads a VST. **Why** it does not is no
+> longer explained by "there are no bodies", and is not established.
+
 `libFairlightPage.so` on Linux defines `VSTHost` (44 symbols), `VST3Host` (26) and
 `VSTPluginManager`, with a full member list — `LoadPlugin`, `RescanPlugins`, `GetPluginPaths`,
 `PreProcess`, `PostProcess`. **They have no bodies.** `VST3Host::UpdateInstalledPluginList` at
@@ -1045,8 +1053,14 @@ silence was written down as a fact.
 returned no matches, and that became "there is nothing to hook and nothing to impersonate".
 `nm -DC /opt/resolve/libs/*.so | grep -c VSTPlugin` returns **198**, all in `libFairlightPage.so`,
 and `rmap vtable VSTPlugin` prints the whole class — the same tool would have answered if it had
-been asked a different way. `VSTPlugin` is a complete VST2 host: `Load`, `Dispatch`, `IsWaveShell`,
-`StorePreset`, `LoadPreset`.
+been asked a different way. `VSTPlugin` carries the members of a VST2 host: `Load`, `Dispatch`,
+`IsWaveShell`, `StorePreset`, `LoadPreset`.
+
+**And then that correction overshot in its turn.** It first read "`VSTPlugin` is a complete VST2
+host", which a symbol list cannot show. What is measured is a symbol list plus the bodies of three
+methods — `VSTPlugin::StorePreset`, `VSTPlugin::LoadPreset` and `VSTHost::LoadPlugin`. Nothing here
+has run any of it. Correcting a claim is not a licence to make a bigger one in the opposite
+direction.
 
 **"StorePreset and LoadPreset fire zero times."** Traced on `+0x380` and `+0x388`. Those are the
 primary vtable slots. Resolve holds an `AudioPlugin*`, so it calls the thunks at `+0x990` and

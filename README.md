@@ -11,14 +11,19 @@ external editor — loaded on the track, with their own GUIs, live on the timeli
 Blackmagic does not support this. Their manual lists VST as macOS and Windows only, and nothing in
 the Linux interface loads a VST.
 
-The binary is a different story. `libFairlightPage.so` carries a complete VST2 host — 198 symbols
-under `VSTPlugin`, including the chunk calls a plugin uses to save its state. Reading that host is
-what taught this project how Resolve stores plugin settings, and it is why your settings now live
-in the project file. Whether that code can be reached from the Linux interface at all is a separate
-question, and one this project has not answered.
+The binary is a different story. `libFairlightPage.so` carries **VST host code** — 198 symbols
+under `VSTPlugin` — and the parts of it this project has actually read are real implementations,
+not empty shells: `VSTPlugin::StorePreset` and `VSTPlugin::LoadPreset` drive a plugin's own
+`effGetChunk` and `effSetChunk`, and `VSTHost::LoadPlugin` has a body. Reading those is what taught
+this project how Resolve stores plugin settings, and it is why your settings now live in the
+project file.
 
-*(An earlier version of this readme said the Linux build ships no VST host. That was wrong, and the
-correction is worth more than the original claim was.)*
+**That is symbols and a few method bodies, not a working host.** Nothing here has run any of it,
+and why it is unreachable from the Linux interface is not established. Two `VST3Host` methods were
+measured as stubs, so the VST3 side and the VST2 side do not look alike.
+
+*(An earlier version of this readme said the Linux build ships no VST host, and a first attempt at
+this correction called it "a complete VST2 host". Both were more than the evidence.)*
 
 ![Four plugins open at once inside Resolve: PodcastPlugins TRACK, Waves NS1, Waves Clarity Vx DeReverb and soothe2, with the mixer showing the effect chain](docs/media/plugins-running.png)
 
