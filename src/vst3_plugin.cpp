@@ -1460,9 +1460,13 @@ HostedPlugin* CreateVst3Plugin(const char* path, const char* class_name, double 
     return nullptr;
 }
 
-bool Vst3ListClasses(const char* path, std::vector<std::string>& out)
+bool Vst3ListClasses(const char* path, std::vector<std::string>& out,
+                     std::vector<std::string>* sub_categories)
 {
     out.clear();
+    if (sub_categories != nullptr) {
+        sub_categories->clear();
+    }
     if (path == nullptr) {
         return false;
     }
@@ -1508,6 +1512,19 @@ bool Vst3ListClasses(const char* path, std::vector<std::string>& out)
     }
 
     auto* const factory_vt = *reinterpret_cast<v3_plugin_factory_cpp**>(factory);
+
+    // IPluginFactory2 carries the subcategory. It is asked for, never assumed: a factory only has
+    // to implement version 1, and reading v2's slot off a vtable that ends after v1 is a call into
+    // whatever follows it in memory.
+    void** factory2 = nullptr;
+    if (sub_categories != nullptr) {
+        void* found = nullptr;
+        if (factory_vt->query_interface(factory, v3_plugin_factory_2_iid, &found) == V3_OK &&
+            found != nullptr) {
+            factory2 = static_cast<void**>(found);
+        }
+    }
+
     const int32_t count = factory_vt->v1.num_classes(factory);
     for (int32_t index = 0; index < count; ++index) {
         v3_class_info info{};
@@ -1521,9 +1538,33 @@ bool Vst3ListClasses(const char* path, std::vector<std::string>& out)
         char name[sizeof(info.name) + 1];
         std::memcpy(name, info.name, sizeof(info.name));
         name[sizeof(info.name)] = '\0';
-        if (name[0] != '\0') {
-            out.push_back(name);
+        if (name[0] == '\0') {
+            continue;
         }
+        out.push_back(name);
+
+        // Kept in step with out, so index N of one describes index N of the other. A class that
+        // publishes nothing gets an empty string rather than being skipped, because a gap here
+        // would silently file every later plugin under its neighbour's category.
+        if (sub_categories == nullptr) {
+            continue;
+        }
+        std::string declared;
+        if (factory2 != nullptr) {
+            auto* const vt = *reinterpret_cast<v3_plugin_factory_cpp**>(factory2);
+            v3_class_info_2 info2{};
+            if (vt->v2.get_class_info_2(factory2, index, &info2) == V3_OK) {
+                char sub[sizeof(info2.sub_categories) + 1];
+                std::memcpy(sub, info2.sub_categories, sizeof(info2.sub_categories));
+                sub[sizeof(info2.sub_categories)] = '\0';
+                declared = sub;
+            }
+        }
+        sub_categories->push_back(declared);
+    }
+    if (factory2 != nullptr) {
+        auto* const vt = *reinterpret_cast<v3_plugin_factory_cpp**>(factory2);
+        vt->unref(factory2);
     }
     return !out.empty();
 }

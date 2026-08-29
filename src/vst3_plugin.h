@@ -21,7 +21,12 @@ HostedPlugin* CreateVst3Plugin(const char* path, const char* class_name, double 
 // costs. Measured on the WaveShell, all 718 classes came back in 1.674 s, of which the enumeration
 // itself was 0 ms - the whole bill is Wine starting behind yabridge. Carla needs fifteen minutes on
 // the same file because it *creates* every plugin to report its bus counts. We do not.
-bool Vst3ListClasses(const char* path, std::vector<std::string>& out);
+// Lists the audio classes in a VST3 module. When sub_categories is given it is filled in step with
+// out: each entry is the plugin's own subcategory string, "Fx|EQ" or "Fx|Restoration", or empty
+// when the factory does not publish one. That string is what lets a plugin be filed correctly on a
+// machine whose plugins nobody hardcoded a rule for.
+bool Vst3ListClasses(const char* path, std::vector<std::string>& out,
+                     std::vector<std::string>* sub_categories = nullptr);
 
 void Vst3PluginSetLogger(void (*logger)(const char*));
 

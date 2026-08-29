@@ -269,6 +269,45 @@ bool MakeWritable(void* start, size_t length)
 // on the menu name, longest-intent-first, and anything unrecognised becomes "other" rather than
 // being left out - an entry with a wrong-but-plausible category is still easier to find than one in
 // a list of fifty-six Uncategorized.
+// What the plugin says it is, translated into one of Resolve's category ids.
+//
+// This runs when the name table below has no opinion, and it is the only part of this file that
+// works on a machine whose plugins nobody has written a rule for. A VST3 publishes a subcategory string such
+// as "Fx|EQ" or "Fx|Restoration" through IPluginFactory2, and that is the plugin's own word rather
+// than a guess from its name. Reported on 2026-08-29: a tester saw 98% of his plugins land in the
+// fallback, because every rule in the table below was written from one person's collection.
+//
+// Only ids that are already known to work are produced. An id Resolve does not know is worse than
+// no opinion at all, so anything unrecognised returns nullptr and the name table gets its turn.
+const char* CategoryFromDeclared(const std::string& declared)
+{
+    if (declared.empty()) {
+        return nullptr;
+    }
+    struct Map {
+        const char* token;
+        const char* category;
+    };
+    // Most specific first: "Fx|Restoration|Noise" has to beat a bare "Fx".
+    static const Map map[] = {
+        {"Restoration", "nr"},   {"Noise", "nr"},
+        {"EQ", "eq"},            {"Filter", "eq"},
+        {"Mastering", "mst"},
+        {"Dynamics", "dyn"},     {"Compressor", "dyn"}, {"Limiter", "dyn"},
+        {"Reverb", "rvb"},
+        {"Pitch Shift", "pitch"},{"Pitch", "pitch"},
+        {"Analyzer", "meter"},
+        {"Spatial", "img"},      {"Surround", "img"},
+        {"Channel Strip", "chan"},
+    };
+    for (const Map& entry : map) {
+        if (declared.find(entry.token) != std::string::npos) {
+            return entry.category;
+        }
+    }
+    return nullptr;
+}
+
 const char* CategoryFor(const std::string& name)
 {
     struct Rule {
@@ -385,14 +424,44 @@ void FxCategoriesApply()
 
     std::string additions;
     int added = 0;
+    int from_plugin = 0;
+    int from_table = 0;
+    int fallback = 0;
     for (const ScannedPlugin& plugin : ScannedPlugins()) {
         additions += "<Effect id=\"";
         additions += plugin.key;
         additions += "\" category=\"";
-        additions += CategoryFor(plugin.name);
+        // The hand-written table first, the plugin's own word second.
+        //
+        // The table is specific and was checked by eye: it knows that RVox is a channel strip even
+        // though the plugin calls itself Dynamics. The declaration is generic but universal, so it
+        // is what catches everything the table was never written for. Ordering it the other way
+        // round refiled 59 of 130 plugins on the development machine, away from rules somebody had
+        // deliberately chosen.
+        const char* const named = CategoryFor(plugin.name);
+        const char* chosen = named;
+        if (std::strcmp(named, "other") == 0) {
+            const char* const declared = CategoryFromDeclared(plugin.category);
+            if (declared != nullptr) {
+                chosen = declared;
+                ++from_plugin;
+            } else {
+                ++fallback;
+            }
+        } else {
+            ++from_table;
+        }
+        additions += chosen;
         additions += "\"/>\n";
         ++added;
     }
+    // Say where the categories came from. The name table only knows the plugins of whoever wrote
+    // it, so "fallback" counts the plugins this machine could not file - which is the number a
+    // report of "98% unsorted" is actually about.
+    Log("categories: %d by the name table, %d rescued by the plugin's own subcategory, %d fell "
+        "back to other",
+        from_table, from_plugin, fallback);
+
     const std::string rebuilt = flat.substr(0, close_at) + additions + flat.substr(close_at);
 
     uLongf packed_length = compressBound(static_cast<uLong>(rebuilt.size()));

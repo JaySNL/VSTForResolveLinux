@@ -399,15 +399,17 @@ void Scan()
         // pick. Enumeration does not create anything, so this is cheap - 718 classes came back from
         // the WaveShell in 1.674 s, essentially all of it Wine starting behind yabridge.
         std::vector<std::string> classes;
+        std::vector<std::string> declared;
         if (candidate.format == PluginFormat::Vst3) {
-            Vst3ListClasses(candidate.path.c_str(), classes);
+            Vst3ListClasses(candidate.path.c_str(), classes, &declared);
         }
 
         if (classes.size() > 1) {
             bool configured = false;
             const std::vector<std::string>& patterns = ShellAllowList(configured);
             int taken = 0;
-            for (const std::string& class_name : classes) {
+            for (size_t at = 0; at < classes.size(); ++at) {
+                const std::string& class_name = classes[at];
                 if (configured) {
                     if (!ShellClassAllowed(class_name, patterns)) {
                         continue;
@@ -427,6 +429,7 @@ void Scan()
                 plugin.name = entry;
                 plugin.key = entry + kEffectIdSuffix;
                 plugin.class_name = class_name;
+                plugin.category = at < declared.size() ? declared[at] : std::string();
                 plugin.format = candidate.format;
                 g_plugins.push_back(plugin);
                 ++taken;
@@ -441,6 +444,7 @@ void Scan()
         plugin.path = candidate.path;
         plugin.name = name;
         plugin.key = name + kEffectIdSuffix;
+        plugin.category = declared.empty() ? std::string() : declared.front();
         plugin.format = candidate.format;
         g_plugins.push_back(plugin);
     }

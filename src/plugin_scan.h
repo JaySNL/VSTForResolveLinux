@@ -22,6 +22,9 @@ struct ScannedPlugin {
     std::string key;   // "<name>:1112360057" - the effect id Resolve stores in the project
     // Which plugin inside the file, for a VST3 shell. Empty for everything else.
     std::string class_name;
+    // What the plugin calls itself: a VST3 subcategory such as "Fx|EQ". Empty when the format or
+    // the plugin does not publish one, and empty is not a failure - it means fall back to the name.
+    std::string category;
     PluginFormat format;
 };
 
