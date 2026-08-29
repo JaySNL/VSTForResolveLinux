@@ -258,16 +258,21 @@ identity of its own that survives a save. So **rearranging a chain shuffles the 
 an EQ ahead of two others and both of them come back wearing the one behind's settings. Adding to
 the end, or removing from the end, is safe. That is the cost, and it is why this is opt-in.
 
-`AudioPluginPreset` looked like the right place for it — Resolve hands one to
-`AudioPluginHost::AddPlaceholderPlugin` when it restores a plugin that is not loaded yet. **It is
-not.** Both of its vtable slots were traced and run through a full session with five plugins,
-project saves and a reload: `StorePreset` and `LoadPreset` were called zero times, while eight
-other traced slots on the same object fired normally. That object serves the preset menu, not the
-project.
+**Why a timer and not your Ctrl+S.** Because saving a project asks the effect nothing at all.
+Three candidate channels were traced and all three fire zero times on a save: `StorePreset`,
+`LoadPreset` and `GetParameterValue`, while other traced slots on the same object fire normally.
+What Resolve persists is the parameter values it already holds, pushed to it through its own
+`SetParameterValue` — a path a hosted plugin's internal edits never touch. There is no save signal
+to synchronise with, so the store runs on a timer and on every project load.
 
-So the file store is what there is. The lead that remains is the parameter model: Resolve does ask
-our effect for `GetNumberOfParameters`, and if it saves those values in the project then publishing
-the plugin's parameters as the effect's own is the per-instance channel — and automation with it.
+The way out is to publish the hosted plugin's parameters as the effect's own, so the settings live
+in the project rather than in a file. That is the next real piece of work, and it brings automation
+with it.
+
+**One known miss.** Some plugin editors do not tell the host when a single control is dragged.
+Waves F6-RTA pushes all 84 of its parameters on a preset recall — which is saved correctly — and
+reported nothing for one band moved by hand. Where the editor stays silent, nothing on this side
+can see the change.
 
 
 ## How it works
