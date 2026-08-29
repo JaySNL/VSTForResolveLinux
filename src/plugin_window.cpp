@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -154,8 +156,17 @@ namespace {
 // the size it asked for, inside a window that was smaller, so its own hit-testing pointed at
 // coordinates that were not on screen. It looked exactly like the Wine mouse bug, and was not.
 //
-// A plugin editor is a fixed-size utility window: min and max are the same, and the type hint
-// keeps a tiling layout from claiming it in the first place.
+// A plugin editor is a fixed size: min and max are the same, and the type hint keeps a tiling
+// layout from claiming it in the first place.
+//
+// The type was _NET_WM_WINDOW_TYPE_UTILITY, and that is what kept the editor out of alt-tab and
+// off the task bar on KDE - reported 2026-08-29, with the window also not taking focus when it
+// opened. KWin excludes utility windows from the switcher by their type, so no amount of state
+// juggling brings them back.
+//
+// It is a DIALOG now. Tiling layouts float a dialog for the same reason they float a utility
+// window, and KWin puts a dialog in the switcher. FXBRIDGE_WINDOW_TYPE=utility restores the old
+// behaviour for anyone whose window manager disagrees, and =normal goes the whole way.
 // A plugin embeds its own window inside ours and then forgets about it. When our window changes
 // size - because the plugin asked, or because the window manager did it - the child keeps its old
 // geometry, and from then on the drawn rectangle, the visible rectangle and the rectangle Wine
@@ -195,10 +206,64 @@ void ApplyWindowRulesLocked(Window handle, unsigned int width, unsigned int heig
     hints.height = static_cast<int>(height);
     XSetWMNormalHints(g_display, handle, &hints);
 
+    const char* const chosen = std::getenv("FXBRIDGE_WINDOW_TYPE");
+    const char* wanted = "_NET_WM_WINDOW_TYPE_DIALOG";
+    if (chosen != nullptr && std::strcmp(chosen, "utility") == 0) {
+        wanted = "_NET_WM_WINDOW_TYPE_UTILITY";
+    } else if (chosen != nullptr && std::strcmp(chosen, "normal") == 0) {
+        wanted = "_NET_WM_WINDOW_TYPE_NORMAL";
+    }
     const Atom type = XInternAtom(g_display, "_NET_WM_WINDOW_TYPE", False);
-    const Atom utility = XInternAtom(g_display, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+    const Atom value = XInternAtom(g_display, wanted, False);
     XChangeProperty(g_display, handle, type, XA_ATOM, 32, PropModeReplace,
-                    reinterpret_cast<const unsigned char*>(&utility), 1);
+                    reinterpret_cast<const unsigned char*>(&value), 1);
+
+    // WM_CLASS, so the window manager has a name to match on. The class is Resolve's own, read off
+    // its windows with xprop: "resolve", "resolve". A desktop environment looks the class up in the
+    // installed desktop files to label a window, and a class of our own matches nothing, so KDE
+    // listed every editor as "unknown" in the switcher. The class is also honest - these are
+    // Resolve's plugin windows.
+    //
+    // The instance name stays ours, so an editor is still identifiable in xprop, in a window rule
+    // and in a bug report.
+    XClassHint klass;
+    char name[] = "fxbridge";
+    char klass_name[] = "resolve";
+    klass.res_name = name;
+    klass.res_class = klass_name;
+    XSetClassHint(g_display, handle, &klass);
+
+    // And the hint that says this window takes keyboard input. A window manager is entitled to
+    // give focus to nothing at all without it.
+    XWMHints wm{};
+    wm.flags = InputHint | StateHint;
+    wm.input = True;
+    wm.initial_state = NormalState;
+    XSetWMHints(g_display, handle, &wm);
+}
+
+// Ask the window manager to bring this window forward and give it the keyboard.
+//
+// A map alone does not do it: KWin's focus-stealing prevention leaves a newly mapped window behind
+// whatever the user was on, which is why an editor opened without appearing. This is the EWMH way
+// and it goes to the root window, not to ours. XSetInputFocus is the wrong tool - it bypasses the
+// window manager and fails outright if the window is not viewable yet.
+void RequestActivationLocked(Window handle)
+{
+    const Atom active = XInternAtom(g_display, "_NET_ACTIVE_WINDOW", False);
+    XEvent event{};
+    event.xclient.type = ClientMessage;
+    event.xclient.window = handle;
+    event.xclient.message_type = active;
+    event.xclient.format = 32;
+    // Source 2 is "a pager", which a window manager honours as a direct request from the user.
+    // Source 1 is "an application", and focus-stealing prevention exists to refuse exactly that.
+    // The user clicked the effect to get here, so 2 is the honest description of who asked.
+    event.xclient.data.l[0] = 2;
+    event.xclient.data.l[1] = CurrentTime;
+    event.xclient.data.l[2] = 0;
+    XSendEvent(g_display, RootWindow(g_display, DefaultScreen(g_display)), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
 }
 
 }  // namespace
@@ -226,6 +291,7 @@ PluginWindow* PluginWindowCreate(unsigned int width, unsigned int height, const 
     // Before the map, never after: a window manager reads these when it takes the window over.
     ApplyWindowRulesLocked(handle, width != 0 ? width : 800, height != 0 ? height : 600);
     XMapRaised(g_display, handle);
+    RequestActivationLocked(handle);
     XFlush(g_display);
 
     // Log the id. Three Wine hosts died on "BadWindow ... 0x4c00001" on 2026-08-25 and there was
@@ -261,6 +327,10 @@ bool PluginWindowShow(PluginWindow* window)
         return false;
     }
     XMapRaised(g_display, window->handle);
+    // Reopening asks for the keyboard for the same reason the first open does: the user clicked
+    // the effect to get here. A window that comes back behind Resolve reads as one that did not
+    // come back at all.
+    RequestActivationLocked(window->handle);
     XFlush(g_display);
     window->mapped = true;
     return true;
