@@ -949,3 +949,89 @@ puts the settings in the project, saves them with Ctrl+S, and makes them automat
 store becomes a fallback for what the parameter list cannot carry.
 
 The experiment stays in the tree behind `FXBRIDGE_NOTIFY_PARAM=1`, off by default.
+
+## 2026-08-29 — the parameter route is a dead end, and the one call that has no bounds check
+
+The previous entry ended by saying the next piece of work was publishing the hosted plugin's
+parameter list as the effect's own, so the settings would live in the project rather than in a file
+on a timer. That was built, measured, and it does not work. This entry is the measurement, because
+the idea is obvious enough that somebody will have it again.
+
+### What was built
+
+A probe behind `FXBRIDGE_PARAM_PROBE=1`. Every claimed effect answers `GetNumberOfParameters` with
+four more than the carrier owns, answers `GetParameterName` for those four, answers
+`GetParameterValue` from a small array, and records anything Resolve pushes back through
+`SetParameterValue`. The four seed values come from `FXBRIDGE_PROBE_SEED`, so run one and run two
+can be told apart — without that, a value pushed back could be Resolve echoing what it had just
+read from us in the same session, and the test would prove nothing.
+
+### What Resolve does
+
+It plays along much further than expected:
+
+* it accepts a parameter count no built-in effect has, and enumerates every index;
+* it calls `GetParameterName` on each one and takes the `std::wstring`;
+* it reads every value through `GetParameterValue`, both at load and later;
+* it saves the project, and stores **none** of them.
+
+Two complete cycles — seed, load, Ctrl+S, quit, restart with a different seed — once with the four
+unnamed and once named `FXB Probe 0..3`. Neither pushed a single value back. In the same logs the
+carrier's own seven parameters came back on every load with non-default values, twenty-four
+`knob:` lines of them, which is what proves the `SetParameterValue` hook was live and listening.
+The negative is measured, not assumed.
+
+### Why
+
+What Resolve persists is tied to the real `BMDControlParameter` objects in the vector at
+`this+0x2c8`. `GetNumberOfParameters` is derived from that vector — `(this+0x2d0 - this+0x2c8) / 8`
+— so overriding it changes the count and creates no parameter. A count is not a parameter.
+
+The real way in is exported: `ExposeControl(BMDControlParameter*)` at `0x4f4400`, with
+`HideControl`, `UpdateParameterList` and `BindParameterByName` beside it. What is **not** exported
+is any constructor or vtable for `BMDControlParameter` itself, so using them means building that
+object by hand from its layout. That is a much larger job than a vtable override, and nobody should
+start it believing the override route was left untried.
+
+### The call that has no bounds check
+
+`GetControlType` at `+0x2d8`, thunk at `+0x900`:
+
+```
+4efdd9:  mov 0x2c8(%rdi),%rcx      # the control vector
+4efde0:  mov (%rcx,%rax,8),%rax    # vec[index], with nothing checked
+4efde4:  mov 0x18(%rax),%eax       # <- the fault, at +0x24, rax == 0
+```
+
+Every function in `BMDAudioPluginImpl` that indexes that vector was read mechanically, asking one
+question: after the vector is loaded, does a conditional branch execute before the indexed load?
+Twenty-eight branch first. `GetControlType` does not. Fairlight walks `0` to
+`GetNumberOfParameters() - 1` calling it, from `EffectImpl::CreateLinkToStudio` under
+`StudioModel::Deserialize`, so raising the count without answering this call kills the project
+load. Overriding it, and answering probe indices as the carrier's own control 0, made the load
+clean: seven effects, zero faults, across four subsequent runs.
+
+### Two wrong claims, and what they cost
+
+Both were the same mistake — asserting a guard without reading it.
+
+* The first crash was blamed on `NotifyParameterUpdate`, on the reasoning that it calls out to a
+  listener the class does not own. The next run crashed with it switched off.
+* Then a scanner scored `GetControlType` as guarded, because it counted the `ja` that compares the
+  control *type* to 4 — after the dereference. The corrected rule, "a branch before the indexed
+  load", names exactly one function, and it is the one in the backtrace.
+
+Each wrong claim cost a project load and a Resolve restart.
+
+### The fault handler, which is the part worth keeping
+
+Neither crash left a core: `core_pattern` pipes to `systemd-coredump`, which drops a process this
+size. So both were diagnosed by guessing, twice, wrongly. The bridge now installs a handler for
+`SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGFPE` on its own alternate stack, formats by hand and writes
+with `write()` rather than through the logger — a fault inside `malloc` would deadlock in
+`vfprintf` — dumps `backtrace_symbols_fd` to stderr, which Resolve captures into
+`ResolveDebug.txt`, then restores the previous handler and re-raises so Resolve's own reporting
+still runs. It is on by default and costs nothing until something faults. The very next crash named
+its function, its caller and its offset in one line.
+
+`FXBRIDGE_CRASH_TRACE=0` switches it off.

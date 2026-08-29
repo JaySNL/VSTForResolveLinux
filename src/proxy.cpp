@@ -36,8 +36,10 @@
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <execinfo.h>
 
 #include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstring>
 
@@ -83,6 +85,93 @@ void Log(const char* format, ...)
     std::fflush(stderr);
     va_end(args);
 }
+
+
+// ---------------------------------------------------------------------------
+// The fault handler.
+//
+// Two project loads died on 2026-08-29 with the parameter probe on, and neither left a core to
+// read: core_pattern pipes to systemd-coredump, which drops a process this size. So both crashes
+// were diagnosed by guessing, and the first guess was wrong - NotifyParameterUpdate was blamed,
+// and then the second crash happened with that switched off. Guessing twice is enough.
+//
+// It runs on its own stack so a stack overflow still reports, formats by hand and writes with
+// write() rather than through the logger - a crash inside malloc would deadlock in vfprintf -
+// and then restores the previous handler and re-raises, so Resolve's own reporting still gets
+// its turn. It costs nothing until something faults.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kFatalSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE};
+constexpr size_t kFatalSignalCount = sizeof(kFatalSignals) / sizeof(kFatalSignals[0]);
+struct sigaction g_previous_handler[kFatalSignalCount];
+char g_fault_stack[256 * 1024];
+
+void WriteText(const char* text)
+{
+    if (text == nullptr) {
+        return;
+    }
+    const ssize_t written = write(STDERR_FILENO, text, std::strlen(text));
+    (void)written;
+}
+
+void WriteHex(unsigned long value)
+{
+    char digits[19] = {'0', 'x'};
+    size_t at = 2;
+    bool started = false;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        const unsigned nibble = static_cast<unsigned>((value >> shift) & 0xf);
+        if (nibble != 0 || started || shift == 0) {
+            started = true;
+            digits[at++] = static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10);
+        }
+    }
+    digits[at] = '\0';
+    WriteText(digits);
+}
+
+void OnFatalSignal(int number, siginfo_t* info, void* context)
+{
+    (void)context;
+    WriteText("[fxbridge] crash: signal ");
+    WriteHex(static_cast<unsigned long>(number));
+    WriteText(" at ");
+    WriteHex(info != nullptr ? reinterpret_cast<unsigned long>(info->si_addr) : 0);
+    WriteText("\n[fxbridge] crash: backtrace follows, innermost first\n");
+
+    void* frames[64];
+    const int count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    WriteText("[fxbridge] crash: end of backtrace\n");
+
+    for (size_t index = 0; index < kFatalSignalCount; ++index) {
+        sigaction(kFatalSignals[index], &g_previous_handler[index], nullptr);
+    }
+    raise(number);
+}
+
+void InstallFaultHandler()
+{
+    stack_t stack = {};
+    stack.ss_sp = g_fault_stack;
+    stack.ss_size = sizeof(g_fault_stack);
+    stack.ss_flags = 0;
+    sigaltstack(&stack, nullptr);
+
+    struct sigaction action = {};
+    action.sa_sigaction = &OnFatalSignal;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    for (size_t index = 0; index < kFatalSignalCount; ++index) {
+        sigaction(kFatalSignals[index], &action, &g_previous_handler[index]);
+    }
+    Log("crash handler installed on %zu signals", kFatalSignalCount);
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Which host runs.
@@ -180,6 +269,12 @@ namespace {
 
 constexpr size_t kMaxClaimedEffects = 64;
 
+// How many parameters the probe adds on top of the ones the carrier owns.
+//
+// Four is enough to tell a restored value from a default, and small enough that the cost of
+// being wrong is four indices Resolve asks about and nothing answers. See the probe section.
+constexpr unsigned int kProbeParameters = 4;
+
 struct ClaimedEffect {
     // Resolve may call us with either the bmd::PluginInstance subobject or the AudioPlugin one,
     // so both addresses map to the same effect.
@@ -215,6 +310,15 @@ struct ClaimedEffect {
     std::vector<uint8_t> state_last;
     bool state_said_gone = false;
     bool state_said_mute = false;
+
+    // The parameter probe. Empty unless FXBRIDGE_PARAM_PROBE=1.
+    //
+    // stock_params is what the carrier answered before we added anything, measured once and
+    // then fixed: every index at or above it belongs to the probe and to nothing else, so a
+    // value that arrives on one of them came out of Resolve's own store.
+    unsigned int stock_params = 0;
+    float probe[kProbeParameters] = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool probe_notified = false;
 };
 
 // Fills both encodings from one name.
@@ -267,6 +371,43 @@ ClaimedEffect* FindEffect(const void* key)
         }
     }
     return nullptr;
+}
+
+// The same lookup, and the BMDAudioPluginImpl base as well.
+//
+// A slot in the primary vtable group arrives with `this` pointing at the impl base, which is
+// sixteen bytes BELOW the pointer CreatePluginInstance returned, so FindEffect misses it. The
+// editor hooks got away with that because they fall back to the focused effect. A parameter
+// call cannot: the answer belongs to one effect and would be wrong for any other.
+ClaimedEffect* FindEffectAny(const void* key)
+{
+    ClaimedEffect* const known = FindEffect(key);
+    if (known != nullptr) {
+        return known;
+    }
+    const size_t count = g_effect_count.load(std::memory_order_acquire);
+    for (size_t index = 0; index < count; ++index) {
+        if (g_effects[index].primary_base == key) {
+            return &g_effects[index];
+        }
+    }
+    return nullptr;
+}
+
+// Set once, in PatchDelayClassVtable, from FXBRIDGE_PARAM_PROBE.
+bool g_param_probe = false;
+
+// What this run seeds the four probe parameters with.
+//
+// It has to differ between runs, or the test proves nothing: our own GetParameterValue answers
+// with the seed, so a value pushed back in the same session could be Resolve echoing what it
+// just read. Give run one FXBRIDGE_PROBE_SEED=0.111 and run two 0.777, and a 0.111 arriving in
+// run two came out of the project file and out of nowhere else.
+float g_probe_seed = 0.125f;
+
+float ProbeSeed(unsigned int slot)
+{
+    return g_probe_seed + static_cast<float>(slot) * 0.01f;
 }
 
 ClaimedEffect* AppendEffect(void* instance_key, void* audio_plugin_key)
@@ -1293,6 +1434,9 @@ const char kDefaultClapPlugin[] = "/home/jooshua/.clap/DragonflyHallReverb.clap"
 // Loggers only. Plugins are loaded per effect now, at claim time, not once at startup.
 void LoadConfiguredPlugin()
 {
+    if (EnabledByEnvironment("FXBRIDGE_CRASH_TRACE", true)) {
+        InstallFaultHandler();
+    }
     CarlaHostSetLogger([](const char* line) { Log("%s", line); });
     PluginInstanceSetLogger([](const char* line) { Log("%s", line); });
     PluginScanSetLogger([](const char* line) { Log("%s", line); });
@@ -1375,7 +1519,25 @@ extern "C" void BridgeOnSetParameter(void* self, unsigned int index, float value
     //
     // Set FXBRIDGE_KNOB_BINDING=1 to send them anyway, which is only useful for studying a plugin
     // whose parameter order is known.
-    (void)value;
+
+    // The probe's own indices are a different matter. They sit above everything the carrier
+    // owns, so nothing in Resolve invented them and nothing in the Delay can reach them: a
+    // value that arrives here was stored by Resolve and handed back, which is the whole
+    // question the probe exists to answer.
+    if (g_param_probe) {
+        ClaimedEffect* const effect = FindEffectAny(self);
+        if (effect != nullptr && effect->stock_params != 0 && index >= effect->stock_params &&
+            index < effect->stock_params + kProbeParameters) {
+            const unsigned int slot = index - effect->stock_params;
+            const bool ours = value == ProbeSeed(slot);
+            effect->probe[slot] = value;
+            Log("probe: Resolve set parameter %u (probe %u) of \"%s\" to %.6f  <- %s", index, slot,
+                effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
+                static_cast<double>(value),
+                ours ? "this run's own seed, so it proves nothing"
+                     : "NOT this run's seed - it came out of the project");
+        }
+    }
 }
 
 // The editor gate. Resolve asks HasEditor() before it offers an external editor at all, and the
@@ -2715,6 +2877,338 @@ extern "C" void BridgeClaimInstance(void* instance)
 
 namespace {
 
+
+// ---------------------------------------------------------------------------
+// The parameter probe.
+//
+// The question. A hosted plugin's settings live in a file on a timer, because a project save
+// asks the effect nothing at all - StorePreset, LoadPreset and GetParameterValue all fire zero
+// times on a Ctrl+S. What Resolve does save is the parameter values it holds for a built-in
+// effect, and it hands them back on load through SetParameterValue: twenty-four non-default
+// values arrived that way on 2026-08-29. So there IS a per-effect channel into the project
+// file. What is not known is whether it will carry a value this side invented.
+//
+// The probe answers exactly that and nothing else. Each claimed effect reports four parameters
+// more than the carrier owns, we give those four distinctive values, and NotifyParameterUpdate
+// tells Resolve they moved. Then: save the project, quit, start again. If those four values
+// come back through SetParameterValue, the channel is real and the plugin's own parameter list
+// goes down it next. If they do not, the file store is what there is, and that is written down
+// rather than guessed at again.
+//
+// Why this is safe to leave enabled. Every indexed accessor in BMDAudioPluginImpl guards its
+// vector the same way - load begin at +0x2c8 and end at +0x2d0, subtract, shift, compare, and
+// jump past on jbe. Verified in the disassembly for GetParameterValue, GetParameterName,
+// GetParameterDisplayValue, GetControlType, ParameterCanAutomate, GetAutomationState and
+// SetAutomationState. An index above the real count reads nothing and returns a default, so
+// over-reporting the count cannot make the stock code walk off its own vector.
+//
+// Resolve reaches these through two vtable slots, not one: the primary group for calls on the
+// BMDAudioPluginImpl base, and the AudioPlugin group at the far end for calls on the pointer
+// the Fairlight engine holds. Both are patched, because which one arrives is not this side's
+// choice, and the two get different `this` values - the thunk's is 0x20 higher.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kGetNumberOfParametersOffset = 0x2c8;
+constexpr size_t kGetParameterValueOffset = 0x318;
+constexpr size_t kGetNumberOfParametersThunkOffset = 0x8f0;
+constexpr size_t kGetParameterValueThunkOffset = 0x930;
+constexpr size_t kSetParameterValueThunkOffset = 0x910;
+constexpr size_t kNotifyParameterUpdateOffset = 0x0c0;
+constexpr size_t kGetControlTypeOffset = 0x2d8;
+constexpr size_t kGetControlTypeThunkOffset = 0x900;
+constexpr size_t kGetParameterNameOffset = 0x2d0;
+constexpr size_t kGetParameterNameThunkOffset = 0x8f8;
+
+void* g_original_parameter_count = nullptr;
+void* g_original_parameter_count_thunk = nullptr;
+void* g_original_parameter_value = nullptr;
+void* g_original_parameter_value_thunk = nullptr;
+void* g_original_set_parameter_thunk = nullptr;
+void* g_original_control_type = nullptr;
+void* g_original_control_type_thunk = nullptr;
+void* g_original_parameter_name = nullptr;
+void* g_original_parameter_name_thunk = nullptr;
+
+// Arms the notify pass. Separate from FXBRIDGE_PARAM_PROBE because one half of the probe only
+// reads and the other half killed Resolve - see ProbeNotifier.
+bool g_probe_notify = false;
+
+unsigned long ProbeParameterCount(void* self, void* original)
+{
+    unsigned long stock = 0;
+    if (original != nullptr) {
+        stock = reinterpret_cast<unsigned long (*)(void*)>(original)(self);
+    }
+    ClaimedEffect* const effect = FindEffectAny(self);
+    if (effect == nullptr || effect->plugin == nullptr || stock == 0) {
+        return stock;
+    }
+    if (effect->stock_params == 0) {
+        effect->stock_params = static_cast<unsigned int>(stock);
+        for (unsigned int slot = 0; slot < kProbeParameters; ++slot) {
+            effect->probe[slot] = ProbeSeed(slot);
+        }
+        Log("probe: \"%s\" owns %lu parameters and now reports %lu",
+            effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect", stock,
+            stock + kProbeParameters);
+    }
+    return stock + kProbeParameters;
+}
+
+float ProbeParameterValue(void* self, unsigned int index, void* original)
+{
+    ClaimedEffect* const effect = FindEffectAny(self);
+    if (effect != nullptr && effect->stock_params != 0 && index >= effect->stock_params &&
+        index < effect->stock_params + kProbeParameters) {
+        const unsigned int slot = index - effect->stock_params;
+        static std::atomic<int> reads{0};
+        if (reads.fetch_add(1) < 16) {
+            Log("probe: Resolve read parameter %u (probe %u) of \"%s\" - %.6f", index, slot,
+                effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
+                static_cast<double>(effect->probe[slot]));
+        }
+        return effect->probe[slot];
+    }
+    if (original != nullptr) {
+        return reinterpret_cast<float (*)(void*, unsigned int)>(original)(self, index);
+    }
+    return 0.0f;
+}
+
+// The one accessor in BMDAudioPluginImpl that does not check the index.
+//
+// This is not an opinion. Every function in that class that indexes the control vector was read
+// mechanically on 2026-08-29 - twenty-nine of them - asking one question: after the vector is
+// loaded from this+0x2c8, does a conditional branch run BEFORE the indexed load? Twenty-eight
+// branch first. GetControlType does not:
+//
+//     mov 0x2c8(%rdi),%rcx      # the vector
+//     mov (%rcx,%rax,8),%rax    # vec[index], with nothing checked
+//     mov 0x18(%rax),%eax       # <- the fault, at +0x24, with rax == 0
+//
+// Fairlight walks 0 to GetNumberOfParameters()-1 calling it - EffectImpl::CreateLinkToStudio,
+// under StudioModel::Deserialize - so raising the count without answering this call kills the
+// project load. That is what happened twice on 2026-08-29, and the backtrace that named it is
+// the reason the bridge now installs a fault handler.
+//
+// The probe's indices answer as the carrier's own first control does, because that is a real
+// control type rather than the zero the stock returns for something it does not recognise.
+
+// The parameter's name, which the probe went without on its first two runs.
+//
+// GetParameterName returns a std::wstring BY VALUE, so the ABI puts a hidden return buffer in
+// rdi and `this` in rsi. Declaring a 24-byte POD return makes the compiler generate exactly
+// that, including the sret pointer coming back in rax. Getting this wrong is not theoretical:
+// the effect-name hooks were pulled from this bridge for reading `this` as a write buffer, and
+// the note above kNameRecordOffset says so.
+//
+// The string is Resolve's libc++, so it is built with Resolve's own resize rather than by
+// writing the layout from memory - one allocator, no guesses. The stock code does the same
+// thing at 0x4efaa5, and the layout it then reads is the fallback here: bit 0 of the first byte
+// says long, long data at +0x10, short data at +0x04, and a short wstring holds four characters.
+//
+// Why it matters. Run 2 on 2026-08-29 showed Resolve reading all four probe parameters and
+// storing none of them, and the honest reading of that was "not proven": a parameter with no
+// name may be dropped for having no name. This closes that hole before the route is called dead.
+struct BridgeWideString {
+    unsigned long words[3];
+};
+
+void BuildWideString(BridgeWideString& out, const wchar_t* text, size_t length)
+{
+    using ResizeFn = void (*)(void*, size_t, wchar_t);
+    static ResizeFn resize = reinterpret_cast<ResizeFn>(
+        dlsym(RTLD_DEFAULT, "_ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE6resizeEmw"));
+
+    out.words[0] = 0;
+    out.words[1] = 0;
+    out.words[2] = 0;
+    auto* const bytes = reinterpret_cast<unsigned char*>(&out);
+
+    if (resize == nullptr) {
+        // No libc++ resize in scope: a short string only, which holds four characters.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Log("probe: libc++ resize not found - probe names are cut to four characters");
+        }
+        const size_t fit = length < 4 ? length : 4;
+        bytes[0] = static_cast<unsigned char>(fit << 1);
+        std::memcpy(bytes + 4, text, fit * sizeof(wchar_t));
+        return;
+    }
+
+    resize(&out, length, 0);
+    wchar_t* const data = (bytes[0] & 1u) != 0
+                              ? *reinterpret_cast<wchar_t**>(bytes + 0x10)
+                              : reinterpret_cast<wchar_t*>(bytes + 4);
+    std::memcpy(data, text, length * sizeof(wchar_t));
+}
+
+BridgeWideString ProbeParameterName(void* self, unsigned int index, void* original)
+{
+    using Fn = BridgeWideString (*)(void*, unsigned int);
+    ClaimedEffect* const effect = FindEffectAny(self);
+    if (effect != nullptr && effect->stock_params != 0 && index >= effect->stock_params &&
+        index < effect->stock_params + kProbeParameters) {
+        const unsigned int slot = index - effect->stock_params;
+        const wchar_t* const names[kProbeParameters] = {L"FXB Probe 0", L"FXB Probe 1",
+                                                        L"FXB Probe 2", L"FXB Probe 3"};
+        BridgeWideString out;
+        BuildWideString(out, names[slot], 11);
+        static std::atomic<int> named{0};
+        if (named.fetch_add(1) < 8) {
+            Log("probe: Resolve asked the name of parameter %u - answering \"FXB Probe %u\"",
+                index, slot);
+        }
+        return out;
+    }
+    if (original != nullptr) {
+        return reinterpret_cast<Fn>(original)(self, index);
+    }
+    BridgeWideString empty = {0, 0, 0};
+    return empty;
+}
+
+BridgeWideString BridgeParameterName(void* self, unsigned int index)
+{
+    return ProbeParameterName(self, index, g_original_parameter_name);
+}
+
+BridgeWideString BridgeParameterNameThunk(void* self, unsigned int index)
+{
+    return ProbeParameterName(self, index, g_original_parameter_name_thunk);
+}
+
+int ProbeControlType(void* self, int index, void* original)
+{
+    using Fn = int (*)(void*, int);
+    ClaimedEffect* const effect = FindEffectAny(self);
+    if (effect != nullptr && effect->stock_params != 0 &&
+        index >= static_cast<int>(effect->stock_params) &&
+        index < static_cast<int>(effect->stock_params + kProbeParameters)) {
+        static std::atomic<int> asked{0};
+        if (asked.fetch_add(1) < 8) {
+            Log("probe: Resolve asked the control type of parameter %d - answering as its own 0",
+                index);
+        }
+        return original != nullptr ? reinterpret_cast<Fn>(original)(self, 0) : 0;
+    }
+    return original != nullptr ? reinterpret_cast<Fn>(original)(self, index) : 0;
+}
+
+int BridgeControlType(void* self, int index)
+{
+    return ProbeControlType(self, index, g_original_control_type);
+}
+
+int BridgeControlTypeThunk(void* self, int index)
+{
+    return ProbeControlType(self, index, g_original_control_type_thunk);
+}
+
+unsigned long BridgeParameterCount(void* self)
+{
+    return ProbeParameterCount(self, g_original_parameter_count);
+}
+
+unsigned long BridgeParameterCountThunk(void* self)
+{
+    return ProbeParameterCount(self, g_original_parameter_count_thunk);
+}
+
+float BridgeParameterValue(void* self, unsigned int index)
+{
+    return ProbeParameterValue(self, index, g_original_parameter_value);
+}
+
+float BridgeParameterValueThunk(void* self, unsigned int index)
+{
+    return ProbeParameterValue(self, index, g_original_parameter_value_thunk);
+}
+
+// The AudioPlugin-side setter. The primary one at +0x310 already runs through an assembly
+// trampoline, and this is the same call arriving on the other pointer: plain arguments, no
+// float return, so a C++ replacement is enough.
+void BridgeSetParameterThunk(void* self, unsigned int index, float value)
+{
+    ClaimedEffect* const effect = g_param_probe ? FindEffectAny(self) : nullptr;
+    if (effect != nullptr && effect->stock_params != 0 && index >= effect->stock_params &&
+        index < effect->stock_params + kProbeParameters) {
+        const unsigned int slot = index - effect->stock_params;
+        effect->probe[slot] = value;
+        Log("probe: Resolve set parameter %u (probe %u) of \"%s\" to %.6f  [AudioPlugin base]",
+            index, slot, effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
+            static_cast<double>(value));
+    }
+    if (g_original_set_parameter_thunk != nullptr) {
+        reinterpret_cast<void (*)(void*, unsigned int, float)>(
+            g_original_set_parameter_thunk)(self, index, value);
+    }
+}
+
+// Tells Resolve that the probe's four parameters moved, once per effect.
+//
+// OFF, and it stays off until the listener side is understood. FXBRIDGE_PROBE_NOTIFY=1 arms it.
+//
+// Measured on 2026-08-29, and it cost a project load: with FXBRIDGE_PARAM_PROBE=1 alone Resolve
+// reported the larger count, read probe values 7, 8 and 9 back, and ran on. The moment this
+// class notified those same indices, Resolve was gone before the next line reached the log.
+//
+// The reason is in the disassembly, and the earlier reading of it was half a reading. Every
+// indexed accessor inside BMDAudioPluginImpl guards its own vector, which is why over-reporting
+// the count is safe. NotifyParameterUpdate does not stop inside that class: it walks the
+// listener list at this+0x258 and calls each listener with the index - Fairlight's own object,
+// with its own array, sized from a count it took at a moment of its choosing. Nothing in the
+// class we patched guards that array, and nothing here checked it.
+//
+// So notifying an index the carrier does not own is a write into somebody else's model. The
+// route out is not to notify further, it is to make the count true before Fairlight reads it.
+class ProbeNotifier final : public HostMainClient {
+public:
+    void OnHostMainTick() override
+    {
+        if (!g_probe_notify) {
+            return;
+        }
+        if (ticks_ < kTicksBeforeNotify) {
+            ++ticks_;
+            return;
+        }
+        const size_t count = g_effect_count.load();
+        for (size_t index = 0; index < count; ++index) {
+            ClaimedEffect& effect = g_effects[index];
+            if (effect.probe_notified || effect.stock_params == 0 ||
+                effect.primary_base == nullptr || !EffectIsLive(effect)) {
+                continue;
+            }
+            effect.probe_notified = true;
+            if (g_stock_vtable == nullptr) {
+                continue;
+            }
+            using Notify = void (*)(void*, unsigned int);
+            auto* const notify =
+                *reinterpret_cast<Notify*>(g_stock_vtable + kNotifyParameterUpdateOffset);
+            for (unsigned int slot = 0; slot < kProbeParameters; ++slot) {
+                const unsigned int parameter = effect.stock_params + slot;
+                Log("probe: telling Resolve parameter %u of \"%s\" is now %.6f", parameter,
+                    effect.label_narrow[0] != '\0' ? effect.label_narrow : "an effect",
+                    static_cast<double>(effect.probe[slot]));
+                notify(effect.primary_base, parameter);
+            }
+            Log("probe: \"%s\" reported all %u - save the project, quit, and start again",
+                effect.label_narrow[0] != '\0' ? effect.label_narrow : "an effect",
+                kProbeParameters);
+        }
+    }
+
+private:
+    static constexpr int kTicksBeforeNotify = 300;  // the tick is 16 ms, so about five seconds
+    int ticks_ = 0;
+};
+
+ProbeNotifier g_probe_notifier;
+
 void PatchDelayClassVtable()
 {
     if (g_stock_handle == nullptr) {
@@ -2785,6 +3279,57 @@ void PatchDelayClassVtable()
         PatchOurSlot(kGenerateUserInterfaceOffset, nullptr,
                      reinterpret_cast<void*>(&BridgeGenerateUserInterface));
         Log("empty panel is ON - GenerateUserInterface is a no-op in our vtable");
+    }
+
+    // After the trace loop for the same reason the empty panel is: the tracer holds these two
+    // slots as well, and whichever is patched last saves the other as its original. Chaining
+    // through the tracer is fine - it reports and tail-jumps, so the return value is the stock
+    // one - and it means the probe does not cost the trace lines.
+    g_param_probe = EnabledByEnvironment("FXBRIDGE_PARAM_PROBE");
+    if (g_param_probe) {
+        if (const char* const seed = std::getenv("FXBRIDGE_PROBE_SEED")) {
+            const float parsed = std::strtof(seed, nullptr);
+            if (parsed > 0.0f && parsed < 1.0f) {
+                g_probe_seed = parsed;
+            }
+        }
+        Log("probe: this run seeds the four with %.6f, %.6f, %.6f, %.6f",
+            static_cast<double>(ProbeSeed(0)), static_cast<double>(ProbeSeed(1)),
+            static_cast<double>(ProbeSeed(2)), static_cast<double>(ProbeSeed(3)));
+        const bool count = PatchOurSlot(kGetNumberOfParametersOffset, &g_original_parameter_count,
+                                        reinterpret_cast<void*>(&BridgeParameterCount));
+        const bool count_thunk =
+            PatchOurSlot(kGetNumberOfParametersThunkOffset, &g_original_parameter_count_thunk,
+                         reinterpret_cast<void*>(&BridgeParameterCountThunk));
+        const bool value = PatchOurSlot(kGetParameterValueOffset, &g_original_parameter_value,
+                                        reinterpret_cast<void*>(&BridgeParameterValue));
+        const bool value_thunk =
+            PatchOurSlot(kGetParameterValueThunkOffset, &g_original_parameter_value_thunk,
+                         reinterpret_cast<void*>(&BridgeParameterValueThunk));
+        const bool setter =
+            PatchOurSlot(kSetParameterValueThunkOffset, &g_original_set_parameter_thunk,
+                         reinterpret_cast<void*>(&BridgeSetParameterThunk));
+        const bool control = PatchOurSlot(kGetControlTypeOffset, &g_original_control_type,
+                                          reinterpret_cast<void*>(&BridgeControlType));
+        const bool control_thunk =
+            PatchOurSlot(kGetControlTypeThunkOffset, &g_original_control_type_thunk,
+                         reinterpret_cast<void*>(&BridgeControlTypeThunk));
+        const bool name = PatchOurSlot(kGetParameterNameOffset, &g_original_parameter_name,
+                                       reinterpret_cast<void*>(&BridgeParameterName));
+        const bool name_thunk =
+            PatchOurSlot(kGetParameterNameThunkOffset, &g_original_parameter_name_thunk,
+                         reinterpret_cast<void*>(&BridgeParameterNameThunk));
+        Log("probe: names %s/%s", name ? "primary" : "FAILED", name_thunk ? "thunk" : "FAILED");
+        Log("probe: FXBRIDGE_PARAM_PROBE is ON - count %s/%s, value %s/%s, setter %s, type %s/%s",
+            count ? "primary" : "FAILED", count_thunk ? "thunk" : "FAILED",
+            value ? "primary" : "FAILED", value_thunk ? "thunk" : "FAILED",
+            setter ? "thunk" : "FAILED",
+            control ? "primary" : "FAILED", control_thunk ? "thunk" : "FAILED");
+        g_probe_notify = EnabledByEnvironment("FXBRIDGE_PROBE_NOTIFY");
+        if (g_probe_notify) {
+            Log("probe: FXBRIDGE_PROBE_NOTIFY is ON - this crashed Resolve on 2026-08-29");
+            HostMainRegister(&g_probe_notifier, 1000);
+        }
     }
 
     Log("editor trace installed on %zu slots",

@@ -265,9 +265,30 @@ What Resolve persists is the parameter values it already holds, pushed to it thr
 `SetParameterValue` — a path a hosted plugin's internal edits never touch. There is no save signal
 to synchronise with, so the store runs on a timer and on every project load.
 
-The way out is to publish the hosted plugin's parameters as the effect's own, so the settings live
-in the project rather than in a file. That is the next real piece of work, and it brings automation
-with it.
+**Publishing the plugin's parameters was tried, and it does not work.** The idea was to report the
+hosted plugin's parameters as the effect's own, so the settings would live in the project and bring
+automation with them. It was measured on 2026-08-29 with a probe that reported four parameters more
+than the carrier owns, gave them values and names, and watched what came back after a save and a
+restart. Resolve plays along further than expected and stops short of the only step that matters:
+
+* it accepts a count no built-in effect has, and enumerates every index;
+* it calls `GetParameterName` on each one and takes the string;
+* it reads every value through `GetParameterValue`;
+* it saves the project, and stores **none** of them.
+
+Two full save-and-restart cycles, once with the four unnamed and once named `FXB Probe 0..3`, and
+neither pushed a single value back through `SetParameterValue` — while the carrier's own seven came
+back on every load, which is what proves the hook was live and listening. What Resolve persists is
+tied to the real `BMDControlParameter` objects in the vector at `this+0x2c8`; a count is not a
+parameter. `ExposeControl`, `HideControl`, `UpdateParameterList` and `BindParameterByName` are all
+exported and are the real way in, but no constructor and no vtable for `BMDControlParameter` is, so
+that is a much larger job than a vtable override. **The file store is what there is.**
+
+**One thing that raising the count will do is crash the project load.** `GetControlType` at `+0x2d8`
+is the one accessor in `BMDAudioPluginImpl` that indexes the control vector with no bounds check —
+one of twenty-nine, every other one branches first — and Fairlight calls it for every index while
+deserialising. Anyone repeating this experiment must override that slot and its thunk at `+0x900`
+first, or lose the project load to a null dereference at `+0x24`.
 
 **One known miss.** Some plugin editors do not tell the host when a single control is dragged.
 Waves F6-RTA pushes all 84 of its parameters on a preset recall — which is saved correctly — and

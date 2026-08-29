@@ -834,8 +834,8 @@ public:
     // require them to share anything: the host moves values between them. Saving only the
     // component was enough for plugins that keep everything processor-side, and useless for the
     // ones that do not. Measured on 2026-08-29: two Waves F6-RTA, bands moved on both, and both
-    // component states came back byte-identical - the F6 publishes four host parameters, so its
-    // six bands of controls are not values this side can route or read from the processor.
+    // component states came back byte-identical. The F6 publishes 215 parameters, so the count
+    // was never the limit - what the editor does not report, the processor never learns.
     //
     // Layout after the twelve-byte header: a four-byte length, the component state, a four-byte
     // length, the controller state. The old component-only blobs carry the V3CS tag and are still
