@@ -258,12 +258,28 @@ identity of its own that survives a save. So **rearranging a chain shuffles the 
 an EQ ahead of two others and both of them come back wearing the one behind's settings. Adding to
 the end, or removing from the end, is safe. That is the cost, and it is why this is opt-in.
 
-**Why a timer and not your Ctrl+S.** Because saving a project asks the effect nothing at all.
-Three candidate channels were traced and all three fire zero times on a save: `StorePreset`,
-`LoadPreset` and `GetParameterValue`, while other traced slots on the same object fire normally.
-What Resolve persists is the parameter values it already holds, pushed to it through its own
-`SetParameterValue` — a path a hosted plugin's internal edits never touch. There is no save signal
-to synchronise with, so the store runs on a timer and on every project load.
+**Why a timer and not your Ctrl+S — and why that is now being replaced.** The earlier answer here
+was that a project save asks the effect nothing at all, on the evidence that `StorePreset` and
+`LoadPreset` fired zero times across a session. **That was measured on the wrong vtable slots.**
+Those traces watched `+0x380` and `+0x388`, the primary ones; Resolve holds an `AudioPlugin*` and
+calls the thunks at `+0x990` and `+0x998`. Watching the right pair, on 2026-08-29:
+
+* `LoadPreset` fires once per effect on every project load, and returns true;
+* `StorePreset` fires on a save for every effect that answers `IsDirty` true;
+* the payload is a parameter table — a version, a count, then a 64-byte name and a float each.
+
+`VSTPlugin` in `libFairlightPage.so` overrides exactly those two calls. That is how a native VST
+keeps its settings on this platform, and the same channel is open to a hosted plugin. An earlier
+note in the engineering log said no VST host class exists in the Linux build; it does — 198
+symbols — and that note is retracted where it stands.
+
+The gate is `AudioPlugin::IsDirty()`, one byte at `AudioPlugin+0x99`, and Resolve clears it once it
+has taken the preset. Our effects answer it true unconditionally, because the alternative is to
+detect a change, and detection is exactly what does not work: two Waves F6-RTA edited by hand both
+returned a byte-identical state blob while smartEQ4 returned a changed one. Answering true costs
+one preset per save and removes that blind spot entirely. `FXBRIDGE_ALWAYS_DIRTY=0` turns it off.
+
+The file store still runs on a timer while the preset payload work is unfinished.
 
 **Publishing the plugin's parameters was tried, and it does not work.** The idea was to report the
 hosted plugin's parameters as the effect's own, so the settings would live in the project and bring

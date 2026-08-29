@@ -1035,3 +1035,70 @@ still runs. It is on by default and costs nothing until something faults. The ve
 its function, its caller and its offset in one line.
 
 `FXBRIDGE_CRASH_TRACE=0` switches it off.
+
+## 2026-08-29, later — the preset channel, and two retractions
+
+Two claims in this log were wrong, and both were wrong the same way: a tool was silent and the
+silence was written down as a fact.
+
+**"No VST host exists in the Linux build."** `rmap find "VstPlugin|VSTPlugin|VST3|AudioUnit"`
+returned no matches, and that became "there is nothing to hook and nothing to impersonate".
+`nm -DC /opt/resolve/libs/*.so | grep -c VSTPlugin` returns **198**, all in `libFairlightPage.so`,
+and `rmap vtable VSTPlugin` prints the whole class — the same tool would have answered if it had
+been asked a different way. `VSTPlugin` is a complete VST2 host: `Load`, `Dispatch`, `IsWaveShell`,
+`StorePreset`, `LoadPreset`.
+
+**"StorePreset and LoadPreset fire zero times."** Traced on `+0x380` and `+0x388`. Those are the
+primary vtable slots. Resolve holds an `AudioPlugin*`, so it calls the thunks at `+0x990` and
+`+0x998`. The offsets were derived rather than guessed: in `VSTPlugin`'s own vtable the second
+group's vptr is at `symbol+0x238` and its `StorePreset` thunk at `symbol+0x578`, so the call site
+reads `vptr+0x340` — and `EffectsController::SaveEffectPreset` has exactly that call at `0x14ac5fa`.
+`0x990 - 0x340 = 0x650`, the carrier's AudioPlugin group, cross-checked against `HasEditor`
+(`0x718 - 0x0c8 = 0x650`).
+
+### The path, read statically
+
+```
+EffectsController::StudioModelSerialize
+  -> SaveEffectPresets(EffectPresetMap&, ModuleIds, int, bool)
+       skip if the effect name is L"SYSTEM", L"REWIRE" or L"INTERNAL"
+       -> IsDirty()       vptr+0x420, false skips the effect
+       -> StorePreset()   vptr+0x340, false skips it too
+       -> name, inputs, MIDI
+       -> SetDirty(false) vptr+0x418, cleared once the preset is taken
+  -> operator<<(BinaryStream&, EffectPresetMap const&)
+```
+
+`AudioPlugin::SetDirty` is one byte and a walk upwards:
+
+```
+mov  %sil, 0x99(%rdi)     the flag
+mov  0x40(%rdi), %rdi     the parent
+cmp  %rax, %rdi
+je   done                 a plugin that is its own parent stops here
+call *0x418(%rax)         otherwise the parent is marked too
+```
+
+and `IsDirty` is `cmpb $0x0, 0x99(%rdi)`. A null parent would be dereferenced on the line after the
+compare, so any code that calls `SetDirty` must read that word first.
+
+### Measured
+
+* `IsDirty` asked 7 times per save, once per hosted effect.
+* Marking one effect by hand: six answered false, that one answered true, and `StorePreset` fired
+  on exactly it and returned true.
+* Answering true for every effect of ours: `IsDirty` 7, `StorePreset` 7, no faults.
+
+### Why the flag is set unconditionally
+
+Driving it from a detected change does not work. The store notices a change by comparing the
+plugin's state blob against the last one, and two Waves F6-RTA edited by hand both returned a
+byte-identical blob while smartEQ4 returned a changed one — the "known miss" carried since v0.2.1.
+Chaining the dirty flag to that inherits the blindness. Answering true always costs one preset per
+save, and Resolve clears the flag itself, so nothing accumulates.
+
+### Still open
+
+Whether the preset payload can carry a plugin's own chunk alongside the parameter table, and what
+marks the *project* modified — a save only serialises when Resolve already thinks something
+changed, so a plugin-only edit still needs a fader nudge before Ctrl+S does anything.

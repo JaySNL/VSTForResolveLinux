@@ -397,6 +397,12 @@ ClaimedEffect* FindEffectAny(const void* key)
 // Set once, in PatchDelayClassVtable, from FXBRIDGE_PARAM_PROBE.
 bool g_param_probe = false;
 
+// Set once, from FXBRIDGE_MARK_DIRTY. See MarkEffectChanged.
+bool g_mark_dirty = false;
+
+// BMDAudioPluginImpl::NotifyParameterUpdate - how a plugin says a value moved.
+constexpr size_t kNotifyParameterUpdateOffset = 0x0c0;
+
 // What this run seeds the four probe parameters with.
 //
 // It has to differ between runs, or the test proves nothing: our own GetParameterValue answers
@@ -2429,6 +2435,140 @@ bool EffectIsLive(const ClaimedEffect& effect)
 // settings before its plugins are forgotten - see the note on StateSaver.
 std::atomic<bool> g_state_flush{false};
 
+// Tell Resolve this effect changed, so that it asks for its state.
+//
+// The whole path was read out of libFairlightPage.so rather than probed a call at a time, after
+// two runs where a plugin's settings were changed, the timeline played and the project saved, and
+// StorePreset was called zero times each way:
+//
+//     EffectsController::SaveEffectPresets      the project-save path
+//       -> [module id, effect group and position gates]
+//       -> IsDirty()          at vptr+0x420 - false skips the effect entirely
+//       -> StorePreset()      at vptr+0x340 - false skips it too
+//       -> name, inputs, MIDI
+//       -> SetDirty(false)    at vptr+0x418 - cleared once the preset is taken
+//
+// So an effect is asked for its state only when it is marked dirty, and Resolve cannot mark ours:
+// an edit inside a hosted plugin's own window is invisible to it. What marks one dirty is
+// Effect::PluginParameterChanged, which is the listener NotifyParameterUpdate calls - the chain
+// that was guessed at earlier and is now traced.
+//
+// None of that machinery is needed. AudioPlugin::SetDirty is two instructions of substance:
+//
+//     mov  %sil, 0x99(%rdi)     the flag, one byte in the AudioPlugin sub-object
+//     mov  0x40(%rdi), %rdi     its parent
+//     cmp  %rax, %rdi
+//     je   done                 a plugin that is its own parent stops here
+//     call *0x418(%rax)         otherwise the parent is marked too, all the way up
+//
+// and IsDirty is `cmpb $0x0, 0x99(%rdi)`. So the flag is set directly, on the AudioPlugin
+// sub-object, with no parameter index involved - which also means none of the risk that killed
+// two project loads today, because nothing here touches Fairlight's own arrays.
+//
+// The one hazard is in that disassembly and is guarded rather than hoped about: a null parent
+// would be dereferenced by `mov (%rdi),%rax` on the line after the compare. The parent word is
+// read first, and a null one means this effect is left alone.
+constexpr size_t kSetDirtyOffset = 0xa68;
+constexpr size_t kIsDirtyOffset = 0xa70;
+constexpr size_t kAudioPluginParentOffset = 0x40;
+constexpr size_t kDirtyFlagOffset = 0x99;
+
+// Does the project save walk our effect at all?
+//
+// Setting the dirty flag by hand did not bring StorePreset with it, and there are two possible
+// reasons that look identical from outside: the gates before IsDirty reject the effect, or
+// SaveEffectPresets never reaches it in the first place. IsDirty is the first thing that path
+// asks our effect, so watching it separates the two. It only logs and forwards.
+void* g_original_is_dirty = nullptr;
+
+// An effect that hosts a plugin is always worth asking.
+//
+// Measured on 2026-08-29: Resolve asks IsDirty once per effect on a project save - seven asks for
+// seven effects - and calls StorePreset on exactly the ones that answer true. So the flag is the
+// whole gate, and the question is only who sets it.
+//
+// Setting it from a detected change does not work, and the reason is an old one. The state store
+// notices a change by comparing the plugin's own state blob against the last one; two Waves F6-RTA
+// were edited by hand in the same session and both returned a byte-identical blob, while smartEQ4
+// returned a different one and was marked. That is the "known miss" this project has carried since
+// v0.2.1, and chaining the dirty flag to it inherits the blindness whole.
+//
+// So the answer is not to detect better. An effect of ours holds state that only it can produce,
+// and the cost of answering true is one preset written per save. Resolve clears the flag itself
+// afterwards, at 14a7f1e, so nothing accumulates.
+bool BridgeIsDirty(void* self)
+{
+    bool answered = false;
+    if (g_original_is_dirty != nullptr) {
+        answered = reinterpret_cast<bool (*)(void*)>(g_original_is_dirty)(self);
+    }
+    const ClaimedEffect* const effect = FindEffectAny(self);
+    const bool ours = effect != nullptr && effect->plugin != nullptr;
+    static std::atomic<int> asked{0};
+    if (asked.fetch_add(1) < 16) {
+        Log("dirty: Resolve asked IsDirty - stock says %s, we answer %s%s",
+            answered ? "true" : "false", (answered || ours) ? "true" : "false",
+            ours && !answered ? "  (ours, so always worth storing)" : "");
+    }
+    return answered || ours;
+}
+
+void MarkEffectChanged(const ClaimedEffect& effect)
+{
+    if (!g_mark_dirty) {
+        return;
+    }
+    static std::atomic<int> told{0};
+    const int index = told.fetch_add(1);
+    const bool talk = index < 8;
+
+    // Every reason this does nothing says so. A silent skip here reads as "Resolve was told"
+    // and is exactly how one of two effects went unmarked without a line in the log.
+    if (g_stock_vtable == nullptr) {
+        if (talk) { Log("dirty: no vtable yet - \"%s\" not marked", effect.state_key.c_str()); }
+        return;
+    }
+    void* const plugin = effect.audio_plugin_key;
+    if (plugin == nullptr) {
+        if (talk) {
+            Log("dirty: \"%s\" has no AudioPlugin pointer - not marked", effect.state_key.c_str());
+        }
+        return;
+    }
+    void* parent = nullptr;
+    if (!SafeRead(static_cast<unsigned char*>(plugin) + kAudioPluginParentOffset, &parent,
+                  sizeof(parent))) {
+        if (talk) {
+            Log("dirty: \"%s\" would not let its parent be read - not marked",
+                effect.state_key.c_str());
+        }
+        return;
+    }
+    if (parent == nullptr) {
+        if (talk) {
+            Log("dirty: \"%s\" has a null parent, which SetDirty would dereference - not marked",
+                effect.state_key.c_str());
+        }
+        return;
+    }
+
+    using SetDirty = void (*)(void*, bool);
+    auto* const set_dirty = *reinterpret_cast<SetDirty*>(g_stock_vtable + kSetDirtyOffset);
+    set_dirty(plugin, true);
+
+    // Read the byte back. IsDirty is `cmpb $0x0, 0x99(%rdi)`, so this is the exact thing
+    // Resolve will test, and reporting the write without reading it is how a no-op looks
+    // like a success.
+    unsigned char flag = 0;
+    const bool read = SafeRead(static_cast<unsigned char*>(plugin) + kDirtyFlagOffset, &flag,
+                               sizeof(flag));
+    if (talk) {
+        Log("dirty: marked \"%s\" - the flag at +0x99 now reads %s",
+            effect.state_key.c_str(),
+            !read ? "unreadable" : (flag != 0 ? "set" : "STILL CLEAR"));
+    }
+}
+
 class StateSaver final : public HostMainClient {
 public:
     void OnHostMainTick() override
@@ -2468,6 +2608,7 @@ public:
             if (StateStoreWrite(effect.state_key, current)) {
                 Log("state: saved %zu bytes for %s", current.size(), effect.state_key.c_str());
                 effect.state_last.swap(current);
+                MarkEffectChanged(effect);
             }
         }
     }
@@ -2913,7 +3054,6 @@ constexpr size_t kGetParameterValueOffset = 0x318;
 constexpr size_t kGetNumberOfParametersThunkOffset = 0x8f0;
 constexpr size_t kGetParameterValueThunkOffset = 0x930;
 constexpr size_t kSetParameterValueThunkOffset = 0x910;
-constexpr size_t kNotifyParameterUpdateOffset = 0x0c0;
 constexpr size_t kGetControlTypeOffset = 0x2d8;
 constexpr size_t kGetControlTypeThunkOffset = 0x900;
 constexpr size_t kGetParameterNameOffset = 0x2d0;
@@ -3209,6 +3349,217 @@ private:
 
 ProbeNotifier g_probe_notifier;
 
+
+// ---------------------------------------------------------------------------
+// The preset channel, watched on the slots Resolve really dials.
+//
+// An earlier session traced StorePreset and LoadPreset, saw zero calls across a full session
+// with project saves, and concluded from that silence that the preset is not how Resolve stores
+// an effect. That conclusion is retracted here: the trace was on +0x380 and +0x388, which are
+// the PRIMARY vtable slots, and Resolve holds an AudioPlugin* - so it calls the thunks at +0x990
+// and +0x998. The silence was our own microphone pointed at the wrong slot.
+//
+// What the offsets are, worked out from the VST host rather than assumed. VSTPlugin in
+// libFairlightPage.so is a complete VST2 host - 198 symbols, StorePreset, LoadPreset, IsWaveShell
+// - so Resolve on Linux does host VSTs and does keep their state. In its vtable the second group's
+// vptr is at symbol+0x238 and its StorePreset thunk at symbol+0x578, so Resolve's call site reads
+// vptr+0x340. EffectsController::SaveEffectPreset has exactly that call at 0x14ac5fa, and treats
+// a false return as "nothing to save":
+//
+//     14ac5fa:  call *0x340(%rax)      # StorePreset(preset)
+//     14ac600:  test %al,%al
+//     14ac602:  je   <bail out>
+//
+// Applying the same base to the carrier gives 0x990 - 0x340 = 0x650, which is its AudioPlugin
+// group; HasEditor checks out at the same base (0x718 - 0x0c8 = 0x650).
+//
+// This hook only watches and forwards. What the preset object looks like is the next question,
+// and it is answered by reading one that Resolve fills, not by guessing at it.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kStorePresetThunkOffset = 0x990;
+constexpr size_t kLoadPresetThunkOffset = 0x998;
+
+void* g_original_store_preset = nullptr;
+void* g_original_load_preset = nullptr;
+
+// The payload the preset carries, read rather than guessed at.
+//
+// The first two words of an AudioPluginPreset are a pointer and a length - 0x2ac bytes for one
+// effect, 0x3bc for another - which is the shape of a variable-size blob. What is inside it
+// decides whether a hosted plugin's own chunk can travel the same way, so it is dumped as bytes
+// and as text side by side.
+void LogPresetPayload(const char* label, const void* preset)
+{
+    if (preset == nullptr) {
+        return;
+    }
+    unsigned long header[2] = {0, 0};
+    if (!SafeRead(preset, header, sizeof(header))) {
+        return;
+    }
+    const auto* const data = reinterpret_cast<const unsigned char*>(header[0]);
+    const unsigned long length = header[1];
+    Log("%s payload %lu bytes at %p", label, length, static_cast<const void*>(data));
+    if (data == nullptr || length == 0) {
+        return;
+    }
+    const unsigned long shown = length < 160 ? length : 160;
+    for (unsigned long at = 0; at < shown; at += 16) {
+        unsigned char row[16] = {0};
+        const unsigned long take = (shown - at) < 16 ? (shown - at) : 16;
+        if (!SafeRead(data + at, row, take)) {
+            return;
+        }
+        char line[120];
+        int written = std::snprintf(line, sizeof(line), "%s %04lx  ", label, at);
+        for (unsigned long column = 0; column < 16; ++column) {
+            written += std::snprintf(line + written, sizeof(line) - written,
+                                     column < take ? "%02x " : "   ",
+                                     column < take ? row[column] : 0);
+        }
+        written += std::snprintf(line + written, sizeof(line) - written, " ");
+        for (unsigned long column = 0; column < take; ++column) {
+            const unsigned char byte = row[column];
+            written += std::snprintf(line + written, sizeof(line) - written, "%c",
+                                     byte >= 0x20 && byte < 0x7f ? byte : '.');
+        }
+        Log("%s", line);
+    }
+}
+
+// The payload is a parameter table, so read it as one.
+//
+// Measured from the bytes on 2026-08-29, not from a header anyone published:
+//
+//     +0x00  int    version, 3 here
+//     +0x04  int    how many parameters follow
+//     +0x08  char[64]  the preset's name, "__DEFAULT__" for the one a project carries
+//     then, per parameter: char[64] name, then a float
+//
+// The first float read back this way was 0.305426, which is exactly what the knob hook had
+// logged for index 0 of that effect. The names are qualified - "StereoDelay::HP_FREQ" - which
+// says the table is keyed by name rather than by position.
+void LogPresetTable(const char* label, const void* preset)
+{
+    if (preset == nullptr) {
+        return;
+    }
+    unsigned long header[2] = {0, 0};
+    if (!SafeRead(preset, header, sizeof(header))) {
+        return;
+    }
+    const auto* const data = reinterpret_cast<const unsigned char*>(header[0]);
+    const unsigned long length = header[1];
+    if (data == nullptr || length < 72) {
+        return;
+    }
+    int version = 0;
+    int count = 0;
+    char name[65] = {0};
+    if (!SafeRead(data, &version, sizeof(version)) ||
+        !SafeRead(data + 4, &count, sizeof(count)) || !SafeRead(data + 8, name, 64)) {
+        return;
+    }
+    name[64] = '\0';
+    Log("%s table: version %d, %d parameters, preset \"%s\", %lu bytes", label, version, count,
+        name, length);
+    // Hard cap on the lines this writes.
+    //
+    // LoadPreset runs on Resolve's own thread while the project loads, and every Log here is an
+    // fprintf plus an fflush into Resolve's log pipe. A table of any size would put hundreds of
+    // synchronous writes on the thread that is loading the project. Resolve hung once on
+    // 2026-08-29 with an uncapped version of this in place; that was never traced to this code
+    // and may have been unrelated, but an uncapped log on a loading thread is not worth keeping
+    // either way.
+    if (count < 0 || count > 512) {
+        return;
+    }
+    const int shown = count < 16 ? count : 16;
+    for (int index = 0; index < shown; ++index) {
+        const unsigned long at = 72 + static_cast<unsigned long>(index) * 68;
+        if (at + 68 > length) {
+            Log("%s table: entry %d runs past the %lu bytes - stopping", label, index, length);
+            return;
+        }
+        char field[65] = {0};
+        float value = 0.0f;
+        if (!SafeRead(data + at, field, 64) || !SafeRead(data + at + 64, &value, sizeof(value))) {
+            return;
+        }
+        field[64] = '\0';
+        Log("%s table:   [%2d] %-40s %.6f", label, index, field, static_cast<double>(value));
+    }
+    if (shown < count) {
+        Log("%s table:   ... and %d more, not logged", label, count - shown);
+    }
+}
+
+void LogPresetWords(const char* label, const void* preset)
+{
+    if (preset == nullptr) {
+        return;
+    }
+    for (int row = 0; row < 4; ++row) {
+        unsigned long words[4] = {0, 0, 0, 0};
+        if (!SafeRead(static_cast<const unsigned char*>(preset) + row * 32, words, sizeof(words))) {
+            return;
+        }
+        Log("%s +0x%02x  %016lx %016lx %016lx %016lx", label, row * 32, words[0], words[1],
+            words[2], words[3]);
+    }
+}
+
+bool BridgeStorePreset(void* self, void* preset)
+{
+    static std::atomic<int> seen{0};
+    const int index = seen.fetch_add(1);
+    ClaimedEffect* const effect = FindEffectAny(self);
+    if (index < 8) {
+        Log("preset: StorePreset on \"%s\" (preset at %p)",
+            effect != nullptr && effect->label_narrow[0] != '\0' ? effect->label_narrow
+                                                                 : "an effect",
+            preset);
+    }
+    bool answered = false;
+    if (g_original_store_preset != nullptr) {
+        answered = reinterpret_cast<bool (*)(void*, void*)>(g_original_store_preset)(self, preset);
+    }
+    if (index < 8) {
+        Log("preset: StorePreset returned %s", answered ? "true" : "false");
+        LogPresetWords("preset: store", preset);
+        if (index < 2) {
+            LogPresetTable("preset: store", preset);
+        }
+    }
+    return answered;
+}
+
+bool BridgeLoadPreset(void* self, void* preset)
+{
+    static std::atomic<int> seen{0};
+    const int index = seen.fetch_add(1);
+    ClaimedEffect* const effect = FindEffectAny(self);
+    if (index < 8) {
+        Log("preset: LoadPreset on \"%s\" (preset at %p)",
+            effect != nullptr && effect->label_narrow[0] != '\0' ? effect->label_narrow
+                                                                 : "an effect",
+            preset);
+        LogPresetWords("preset: load ", preset);
+        if (index < 2) {
+            LogPresetTable("preset: load ", preset);
+        }
+    }
+    bool answered = false;
+    if (g_original_load_preset != nullptr) {
+        answered = reinterpret_cast<bool (*)(void*, void*)>(g_original_load_preset)(self, preset);
+    }
+    if (index < 8) {
+        Log("preset: LoadPreset returned %s", answered ? "true" : "false");
+    }
+    return answered;
+}
+
 void PatchDelayClassVtable()
 {
     if (g_stock_handle == nullptr) {
@@ -3285,6 +3636,10 @@ void PatchDelayClassVtable()
     // slots as well, and whichever is patched last saves the other as its original. Chaining
     // through the tracer is fine - it reports and tail-jumps, so the return value is the stock
     // one - and it means the probe does not cost the trace lines.
+    g_mark_dirty = EnabledByEnvironment("FXBRIDGE_MARK_DIRTY");
+    if (g_mark_dirty) {
+        Log("dirty: FXBRIDGE_MARK_DIRTY is ON - a changed plugin sets its own dirty flag");
+    }
     g_param_probe = EnabledByEnvironment("FXBRIDGE_PARAM_PROBE");
     if (g_param_probe) {
         if (const char* const seed = std::getenv("FXBRIDGE_PROBE_SEED")) {
@@ -3330,6 +3685,23 @@ void PatchDelayClassVtable()
             Log("probe: FXBRIDGE_PROBE_NOTIFY is ON - this crashed Resolve on 2026-08-29");
             HostMainRegister(&g_probe_notifier, 1000);
         }
+    }
+
+    if (EnabledByEnvironment("FXBRIDGE_ALWAYS_DIRTY", true)) {
+        const bool watched = PatchOurSlot(kIsDirtyOffset, &g_original_is_dirty,
+                                          reinterpret_cast<void*>(&BridgeIsDirty));
+        Log("dirty: an effect of ours always answers IsDirty true - %s (+0xa70)",
+            watched ? "patched" : "FAILED");
+    }
+
+    // On by default: it forwards every call and only writes lines to the log.
+    if (EnabledByEnvironment("FXBRIDGE_PRESET_TRACE", true)) {
+        const bool store = PatchOurSlot(kStorePresetThunkOffset, &g_original_store_preset,
+                                        reinterpret_cast<void*>(&BridgeStorePreset));
+        const bool load = PatchOurSlot(kLoadPresetThunkOffset, &g_original_load_preset,
+                                       reinterpret_cast<void*>(&BridgeLoadPreset));
+        Log("preset: watching the AudioPlugin slots - store %s (+0x990), load %s (+0x998)",
+            store ? "patched" : "FAILED", load ? "patched" : "FAILED");
     }
 
     Log("editor trace installed on %zu slots",
