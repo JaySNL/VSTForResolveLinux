@@ -446,3 +446,42 @@ and no bridged plugin in the chain confirms or refutes that, and it is the teste
 
 If it holds, this is Resolve's behaviour with any latent effect, the bridge is not involved, and
 the correct outcome is a line in the readme rather than a change to this code.
+
+### Probe 3 — the fix confirmed from the other end, and both priming candidates dead
+
+`GetLatency`, the cached value Resolve's compensation actually reads, now returns 1024, 6144, 2048,
+720 and 1080 where every earlier log had zero. The probe-2 prediction holds: feed the poll an
+honest answer and Resolve's own propagation does the rest with nothing else overridden.
+
+**`GetPluginFlags` (+0x480) never fired. `SetOfflineSamplesToProcess` (+0x208, +0x770) never fired
+on either offset.** Resolve does not ask our effect what kind of thing it is, and never tells it to
+process audio outside playback. Neither is the missing priming call, so the gap is not something we
+are failing to answer.
+
+`GetPluginLatency` (+0x478) is absent from this log because the fix took that slot and answers
+before the probe behind it runs. The `latency: "..." reports N samples` lines are that handler.
+
+### One instance is not compensated, and it is a real defect
+
+Call 6 returned `0` while the plugin reported 768 samples. Every other instance matches its
+plugin. So one effect's latency reached the plugin object and not the cache - 16 ms at 48 kHz.
+
+Not diagnosed. The likely shapes are a poll that happened before that plugin finished loading, or
+a `LatencyChanged` that did not propagate for that one instance. It is small enough to be invisible
+and wrong enough to be worth a line here.
+
+### The limiter test was magnitude-limited, and the right one is still unrun
+
+A stock Limiter's lookahead is a few milliseconds; the bridged plugin that gaps reports 6144
+samples, 128 ms. "No gap" from the Limiter is therefore not evidence that Resolve primes its own
+plugins - the gap would have been inaudible either way. That caveat belonged in the test design,
+not after the result.
+
+The test with the magnitudes matched: a **stock plugin with large latency** - Voice Isolation,
+Music Separator or the Dialogue Processor, all of which are heavy enough to be heard. No bridged
+plugin in the chain.
+
+- It gaps → Resolve does not pre-roll any latent effect, which is consistent with there being no
+  priming slot on this interface at all, and the outcome is a known note rather than a change.
+- It does not gap → Resolve primes its own plugins through something that is not on the plugin
+  vtable, and that is where to look next.
