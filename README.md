@@ -297,6 +297,27 @@ rule, edit `CategoryFor()` in `src/fx_categories.cpp`.
 
 Both take effect on the next Resolve start. No rebuild.
 
+## Latency
+
+Plugins with lookahead — a linear-phase EQ, a limiter, anything oversampled — need the rest of the
+timeline delayed to match, or the audio walks away from the picture. Resolve does that compensation
+itself and does it well. It only has to be told the number, and until v0.2.9 this bridge told it
+zero for every effect.
+
+It now reports what the plugin reports, so stacking effects no longer pushes the audio out of sync.
+The log names each one:
+
+```
+[fxbridge] latency: "Acon Digital DeVerberate 3" reports 6144 samples
+```
+
+Two things are known and not fixed. Playback starts with a short silence when a high-latency plugin
+is loaded — **exports are unaffected**, and the cause is still open. And a plugin that changes its
+latency while the project is open may not be re-compensated until it is reopened.
+
+`FXBRIDGE_LATENCY=0` turns the reporting off; `FXBRIDGE_RESET=0` stops the plugin being told the
+playhead jumped. Both exist for narrowing down a problem, not for daily use.
+
 ## Settings between sessions
 
 **Your plugin settings live in the Resolve project.** On by default since v0.2.3, nothing to turn

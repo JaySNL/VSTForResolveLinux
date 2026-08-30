@@ -7,6 +7,57 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.2.9 — 2026-08-30
+
+**Resolve now knows how much latency your plugins have, and compensates for it.**
+
+A tester reported that stacking effects pushed the audio out of sync with the video, and that the
+first moments after a jump in the timeline replayed the end of the previous position. Both are
+fixed and both are confirmed on his machine.
+
+Every claim below was measured on a real session before anything was changed. The account, the
+wrong turns included, is in [`docs/latency-and-reset.md`](docs/latency-and-reset.md).
+
+### Fixed
+
+- **The bridge told Resolve its effects had no latency.** Resolve asks each effect once, at project
+  load. Nine instances in one session answered zero while the plugins behind them held 720, 768,
+  1024, 1080, 2048 and 6144 samples. Resolve compensated for none of it, which is the audio walking
+  away from the picture — and worse with every effect you stack.
+
+  The effect now answers with the plugin's real figure. **Only the answer is ours**: the poll, the
+  cache, the mutex, `LatencyChanged` and `DelayCompensation` all stay Resolve's own code. The
+  measurement showed that machinery working correctly on an input of zero, so it needed feeding
+  rather than replacing.
+
+  Confirmed from both ends: the tester hears correct sync with his track back at zero offset, and
+  the cached value Resolve reads now carries 1024, 6144, 2048, 720 and 1080 where every earlier log
+  showed zero.
+
+- **A jump in the timeline left the plugin's buffers full of the old position.** Resolve says so —
+  it called our effect a dozen times a session — and the bridge dropped it, because no format
+  wrapper had a reset. Delay lines, lookahead and reverb tails survived a locate, so the first
+  moments after a jump were the tail of wherever the playhead had been.
+
+  The plugin is now told: VST3 `setProcessing` off and on, VST2 stop and start process, CLAP
+  `reset()`. It happens at the top of the next audio block rather than where Resolve announces it,
+  so it can never land inside processing on another thread. Resolve's own plugins defer it behind a
+  flag in exactly the same way, which was read out of the disassembly afterwards rather than
+  copied.
+
+### Known
+
+- **A short silence when playback starts**, a few hundred milliseconds with a high-latency plugin.
+  **It does not affect exports** — the rendered file is correct. It is not the reset: switching
+  that off with `FXBRIDGE_RESET=0` leaves the gap exactly as it was. Resolve never asks our effect
+  for the two things that would let it prime one, so the cause is still open.
+- **A plugin that changes its latency while the project is open** may not be re-compensated until
+  the project is reopened. Nothing re-asks after load.
+- One instance in one session reported 768 samples to the plugin object and zero to the cache,
+  where every other instance agreed. Undiagnosed, 16 ms.
+
+---
+
 ## v0.2.8 — 2026-08-29
 
 **The slow scan moves out of Resolve, gets a progress bar, and runs eight at a time.**
