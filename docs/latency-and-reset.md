@@ -427,3 +427,22 @@ Compressor - with no bridged plugin anywhere in the chain, and start playback.
   is the next thing to find.
 
 That is one launch, no binary, and it splits the remaining question in half.
+
+### The switch is confirmed, and there is no priming hook to miss
+
+`latency: the locate is NOT forwarded (FXBRIDGE_RESET=0)` is present in the tester's log, so the
+switch took effect and the result above stands. The gap is not ours.
+
+Searched for the priming path and it is not on this vtable. `GetPrefetchSize()` - a host asking an
+object how far ahead to read - exists in `libFairlightPage.so` at `+0x0a8` on `GenericAudioFilter`
+and its subclasses: retimers, pitch shifters, sample-rate convertors. It is **not** on
+`AudioPlugin`, not on `BMDAudioPluginImpl`, and not on `BMDStereoDelay`. `PrimeMacroFX` at `+0x3c8`
+is about macro-FX presets, not about audio.
+
+So a Fairlight FX plugin has no way to ask for pre-roll and Resolve has no slot through which to
+offer it. **Prediction: a stock Resolve plugin with lookahead gaps at play start in exactly the
+same way**, because nothing in this interface could prime it either. One launch with their Limiter
+and no bridged plugin in the chain confirms or refutes that, and it is the tester's to run.
+
+If it holds, this is Resolve's behaviour with any latent effect, the bridge is not involved, and
+the correct outcome is a line in the readme rather than a change to this code.
