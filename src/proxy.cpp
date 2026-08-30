@@ -4252,11 +4252,27 @@ void PatchDelayClassVtable()
     if (EnabledByEnvironment("FXBRIDGE_LATENCY", true)) {
         PatchOurSlot(kGetPluginLatencyOffset, &g_original_get_plugin_latency,
                      reinterpret_cast<void*>(&BridgeGetPluginLatency));
+        Log("latency: reporting the plugin's own latency");
+    }
+
+    // Separately switchable, and that is the whole reason it is a second variable.
+    //
+    // With the desync fixed, one symptom is left: a few hundred milliseconds of silence when
+    // playback starts, which an export does not have. Two candidates. Either this reset empties a
+    // plugin that then has nothing to output for its own latency - 6144 samples is 128 ms, and a
+    // stack of them is a few hundred - or Resolve does not run the effect ahead of the playhead at
+    // transport start, in which case the silence is there no matter who reset what.
+    //
+    // One switch tells them apart. FXBRIDGE_RESET=0 keeps the latency answer and drops the reset:
+    // if the gap survives that, it was never ours.
+    if (EnabledByEnvironment("FXBRIDGE_RESET", true)) {
         PatchOurSlot(kResetHistoryOffset, &g_original_reset_history,
                      reinterpret_cast<void*>(&BridgeResetHistory));
         PatchOurSlot(kResetHistoryThunkOffset, &g_original_reset_history_thunk,
                      reinterpret_cast<void*>(&BridgeResetHistoryThunk));
-        Log("latency: reporting the plugin's own latency, and forwarding a locate to it");
+        Log("latency: forwarding a locate to the plugin");
+    } else {
+        Log("latency: the locate is NOT forwarded (FXBRIDGE_RESET=0)");
     }
     // The name hooks are OUT. GetEffectName returns a string by value, so the ABI puts the hidden
     // return buffer in rdi and `this` in rsi. Calling it as `const void* (*)(void*)` hands the
