@@ -396,3 +396,34 @@ If it disappears, the reset is the cause and the question becomes what the stock
 differently — most likely being primed by a host that runs them ahead.
 
 Not built.
+
+### The switch test — the gap is not ours
+
+`FXBRIDGE_RESET=0` and the normal launch behave identically on the tester's machine: the gap at
+play start is still there, and the stale audio has not come back.
+
+**The gap survives with the reset off, so the reset does not cause it.** Candidate 1 is dead.
+What is left is candidate 2 — Resolve does not run the effect ahead of the playhead when the
+transport starts, so the first stretch of a compensated signal is silence no matter who reset what.
+
+**The second half of that result proves nothing, and it would be easy to read as proof.** The gap
+and the stale audio occupy the *same window*: the first few hundred milliseconds after a locate.
+Silence there hides stale audio there. "Identical behaviour" is what you would see if the reset
+works and equally what you would see if it does nothing, so it cannot tell those apart, and the
+reset stays until something measures it separately.
+
+Caveat on all of the above: it rests on the switch having taken effect. The log line
+`latency: the locate is NOT forwarded (FXBRIDGE_RESET=0)` is what confirms that, and it has not
+been read yet.
+
+### The next measurement needs no build from us
+
+Put a **stock Resolve plugin with lookahead** on a track - its Limiter, or the Multiband
+Compressor - with no bridged plugin anywhere in the chain, and start playback.
+
+- Same gap → it is Resolve's own behaviour with any latent effect, the bridge is not involved, and
+  there is nothing here to fix.
+- No gap → Resolve primes its own plugins and not ours, and the difference between those two paths
+  is the next thing to find.
+
+That is one launch, no binary, and it splits the remaining question in half.
