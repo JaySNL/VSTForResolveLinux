@@ -214,6 +214,24 @@ public:
 
     uint32_t ChannelCount() const override { return effect_ != nullptr ? channels_ : 0; }
     const char* Name() const override { return name_; }
+    long long LatencySamples() const override
+    {
+        // VST2 has no call for this. The plugin writes the number into its own struct and the
+        // host reads it there, which is why the field has sat unused in vst2_abi.h until now.
+        return effect_ != nullptr ? static_cast<long long>(effect_->initialDelay) : -1;
+    }
+
+    void Reset() override
+    {
+        if (effect_ == nullptr || effect_->dispatcher == nullptr) {
+            return;
+        }
+        // VST2 has no reset call. Stopping and restarting the process run is what every host does
+        // instead, and it is what the specification points a plugin at for clearing its buffers.
+        effect_->dispatcher(effect_, kEffStopProcess, 0, 0, nullptr, 0.0f);
+        effect_->dispatcher(effect_, kEffStartProcess, 0, 0, nullptr, 0.0f);
+    }
+
     PluginFormat Format() const override { return PluginFormat::Vst2; }
     unsigned long EditorWindow() const override { return PluginWindowHandle(window_); }
 

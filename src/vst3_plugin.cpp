@@ -821,6 +821,33 @@ public:
 
     uint32_t ChannelCount() const override { return channel_count_; }
     const char* Name() const override { return name_[0] != '\0' ? name_ : nullptr; }
+    long long LatencySamples() const override
+    {
+        if (processor_ == nullptr) {
+            return -1;
+        }
+        auto* const vt = *reinterpret_cast<v3_audio_processor_cpp**>(processor_);
+        if (vt == nullptr || vt->proc.get_latency_samples == nullptr) {
+            return -1;
+        }
+        return static_cast<long long>(vt->proc.get_latency_samples(processor_));
+    }
+
+    void Reset() override
+    {
+        if (processor_ == nullptr || !processing_) {
+            return;
+        }
+        // The VST3 way to say "forget what you heard". Leaving processing off is not an option -
+        // the next Process would be handed a plugin that has been told to stop.
+        auto* const vt = *reinterpret_cast<v3_audio_processor_cpp**>(processor_);
+        if (vt == nullptr || vt->proc.set_processing == nullptr) {
+            return;
+        }
+        vt->proc.set_processing(processor_, false);
+        vt->proc.set_processing(processor_, true);
+    }
+
     PluginFormat Format() const override { return PluginFormat::Vst3; }
     unsigned long EditorWindow() const override { return PluginWindowHandle(window_); }
 

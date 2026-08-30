@@ -328,6 +328,29 @@ public:
 
     uint32_t ChannelCount() const override { return channel_count_; }
     const char* Name() const override { return name_[0] != '\0' ? name_ : nullptr; }
+    long long LatencySamples() const override
+    {
+        if (plugin_ == nullptr) {
+            return -1;
+        }
+        const auto* const latency =
+            static_cast<const clap_plugin_latency_t*>(plugin_->get_extension(plugin_,
+                                                                            CLAP_EXT_LATENCY));
+        if (latency == nullptr || latency->get == nullptr) {
+            return -1;
+        }
+        return static_cast<long long>(latency->get(plugin_));
+    }
+
+    void Reset() override
+    {
+        // The only one of the three formats with a call that means exactly this, and its
+        // documentation names the audio thread as where it belongs.
+        if (plugin_ != nullptr && plugin_->reset != nullptr) {
+            plugin_->reset(plugin_);
+        }
+    }
+
     PluginFormat Format() const override { return PluginFormat::Clap; }
     unsigned long EditorWindow() const override { return PluginWindowHandle(window_); }
 

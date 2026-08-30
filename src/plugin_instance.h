@@ -58,6 +58,29 @@ public:
         return false;
     }
 
+    // The plugin's own latency, in samples, or -1 when it does not answer.
+    //
+    // READ-ONLY, and nothing acts on it yet. Resolve asks an effect for its latency at project
+    // load and is currently told zero, which is the desync a tester reported: see
+    // docs/latency-and-reset.md. Before any of that is wired up, this exists so the log can say
+    // whether there is a non-zero number to report at all, and whether it is known by the time
+    // Resolve asks. A measurement is worth more than an assumption about what the plugin says.
+    virtual long long LatencySamples() const { return -1; }
+
+    // Throw away everything the plugin is holding from the audio it has already seen.
+    //
+    // Resolve asks for this on every locate - ResetHistory arrives at the thunk +0x6a0 a dozen
+    // times in a session - and the bridge used to drop it. A delay line, a lookahead buffer or a
+    // reverb tail then survives a jump in the timeline, so the first block after the jump is the
+    // tail of wherever the playhead used to be. That is a tester's "first ms of audio is a slice
+    // of the latest sentence before the stop".
+    //
+    // Called on the audio thread, immediately before a Process that follows a locate. That is the
+    // one place all three formats agree is safe: CLAP names reset() an audio-thread call, and the
+    // alternative - resetting inside Resolve's own ResetHistory call - would run wherever Resolve
+    // happens to call it from, possibly while Process is running on another thread.
+    virtual void Reset() {}
+
     virtual PluginFormat Format() const = 0;
 };
 

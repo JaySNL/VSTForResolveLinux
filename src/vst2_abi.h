@@ -68,6 +68,10 @@ constexpr int32_t kEffGetParamName = 8;
 constexpr int32_t kEffSetSampleRate = 10;
 constexpr int32_t kEffSetBlockSize = 11;
 constexpr int32_t kEffMainsChanged = 12;   // value 1 = resume, 0 = suspend
+// A process run, started and stopped. VST2 has no reset call, so stopping and restarting the run
+// is how a host tells a plugin to drop its delay lines and tails after a locate.
+constexpr int32_t kEffStartProcess = 71;
+constexpr int32_t kEffStopProcess = 72;
 constexpr int32_t kEffEditGetRect = 13;
 constexpr int32_t kEffEditOpen = 14;       // ptr = the native parent window handle
 constexpr int32_t kEffEditClose = 15;

@@ -282,6 +282,19 @@ struct ClaimedEffect {
     void* instance_key = nullptr;
     void* audio_plugin_key = nullptr;
     HostedPlugin* plugin = nullptr;
+
+    // Set when Resolve says the playhead jumped, consumed by the next Process.
+    //
+    // The reset is not done where Resolve asks for it. ResetHistory arrives on whatever thread
+    // Resolve happens to call it from, and doing the work there could land inside a Process
+    // running on another thread. Deferring it to the top of the next Process puts it on the audio
+    // thread, in the one place no Process is in flight - which is where all three formats agree a
+    // reset belongs.
+    std::atomic<bool> reset_pending{false};
+
+    // What we last told Resolve this effect's latency is, so the log carries a line when it
+    // changes and stays quiet when it does not.
+    long long reported_latency = -1;
     std::vector<float> dry;
     // Stand-in buffers for channels Resolve does not provide, so a stereo plugin can still run on
     // a mono track. Allocated at claim time; never on the audio thread.
@@ -1997,6 +2010,11 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
         scratch[frames] = kOverrunMarker;
     }
 
+    // The locate, honoured here rather than where it was announced. See reset_pending.
+    if (effect->reset_pending.exchange(false, std::memory_order_acq_rel)) {
+        effect->plugin->Reset();
+    }
+
     const bool processed = effect->plugin->Process(effect->channels, asked,
                                                    static_cast<unsigned int>(frames));
 
@@ -2143,6 +2161,85 @@ BRIDGE_HIDDEN2 void* g_trace_original_15 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk15();
 }
 
+
+// ---------------------------------------------------------------------------
+// The latency and reset probe.
+//
+// A measurement, not a fix. Every slot below calls the stock implementation and returns exactly
+// what the stock implementation returned. Nothing here changes a value Resolve sees.
+//
+// It exists because two tester reports point at code this bridge does not have. Stacked effects
+// desync the audio from the video, and the first milliseconds after a locate replay the previous
+// position. Nothing in this bridge reads a hosted plugin's latency, and nothing tells a hosted
+// plugin that the playhead jumped. Resolve has both mechanisms - the question is which of its
+// slots actually reach an effect of ours, and what they carry. See docs/latency-and-reset.md.
+//
+// The trace thunk above cannot answer it. That one reports on entry and then tail-jumps, so it
+// never sees a return value, and the return value is the entire question for GetLatency and
+// GetPluginLatency. This one calls the original, keeps the result, reports it, and hands it back
+// untouched.
+//
+// Stack discipline: at entry rsp is 8 past a 16-byte boundary, pushing rbp puts it on one, and
+// the 32 bytes of scratch keep it there, so both calls are correctly aligned.
+// ---------------------------------------------------------------------------
+
+#define BRIDGE_PROBE_THUNK(name, original, index) \
+    ".text\n" \
+    ".globl " name "\n" \
+    ".hidden " name "\n" \
+    ".type " name ", @function\n" \
+    name ":\n" \
+    "  pushq %rbp\n" \
+    "  movq %rsp, %rbp\n" \
+    "  subq $32, %rsp\n" \
+    "  movq %rdi, -8(%rbp)\n" \
+    "  movq %rsi, -16(%rbp)\n" \
+    "  call *" original "(%rip)\n" \
+    "  movq %rax, -24(%rbp)\n" \
+    "  movl $" index ", %edi\n" \
+    "  movq -8(%rbp), %rsi\n" \
+    "  movq -16(%rbp), %rdx\n" \
+    "  movq -24(%rbp), %rcx\n" \
+    "  call BridgeReportProbe\n" \
+    "  movq -24(%rbp), %rax\n" \
+    "  movq %rbp, %rsp\n" \
+    "  popq %rbp\n" \
+    "  ret\n" \
+    ".size " name ", .-" name "\n"
+
+extern "C" {
+BRIDGE_HIDDEN2 void BridgeReportProbe(unsigned int index, void* self, unsigned long argument,
+                                      unsigned long result);
+BRIDGE_HIDDEN2 void* g_probe_original_0 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk0();
+BRIDGE_HIDDEN2 void* g_probe_original_1 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk1();
+BRIDGE_HIDDEN2 void* g_probe_original_2 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk2();
+BRIDGE_HIDDEN2 void* g_probe_original_3 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk3();
+BRIDGE_HIDDEN2 void* g_probe_original_4 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk4();
+BRIDGE_HIDDEN2 void* g_probe_original_5 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk5();
+BRIDGE_HIDDEN2 void* g_probe_original_6 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk6();
+BRIDGE_HIDDEN2 void* g_probe_original_7 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk7();
+BRIDGE_HIDDEN2 void* g_probe_original_8 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk8();
+}
+
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk0", "g_probe_original_0", "0"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk1", "g_probe_original_1", "1"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk2", "g_probe_original_2", "2"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk3", "g_probe_original_3", "3"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk4", "g_probe_original_4", "4"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk5", "g_probe_original_5", "5"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk6", "g_probe_original_6", "6"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk7", "g_probe_original_7", "7"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk8", "g_probe_original_8", "8"));
+
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk0", "g_trace_original_0", "0"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk1", "g_trace_original_1", "1"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk2", "g_trace_original_2", "2"));
@@ -2225,11 +2322,156 @@ TraceSlot g_trace_slots[] = {
     { 0x340, "SetParameterValueFromText", &g_trace_original_27, reinterpret_cast<void*>(&BridgeTraceThunk27) },
 };
 
+// The probe table. Offsets are read off BMDStereoDelay's own vtable with
+// `tools/resolve-map/rmap vtable BMDStereoDelay`, never off another class: +0x120 carries
+// AudioPlugin::GetLatency on ADMRenderer and BMDAudioPluginImpl::DragDropEvent here, and probing
+// it would have replaced drag-and-drop on a build handed to a tester.
+//
+// Both the primary slot and its non-virtual thunk are probed, because which of the two Resolve
+// calls is part of what is being measured.
+struct ProbeSlot {
+    size_t offset;
+    const char* name;
+    bool returns_value;
+    // A latency slot is never silenced by the change filter, because the first probe could not
+    // tell "not called again" from "called again with the same answer" - and the answer was zero
+    // every time. The call count decides whether answering this slot honestly is enough, so it is
+    // counted on every call and printed on every line.
+    bool is_latency;
+    void** original;
+    void* replacement;
+    int reports;
+    long calls;
+    unsigned long last_argument;
+    unsigned long last_result;
+    bool seen;
+};
+
+ProbeSlot g_probe_slots[] = {
+    // What consumers read. DelayCompensation::CalculateEffectDelay and BMDChainFX::UpdateLatency
+    // both end up here, and the stock body is `mov 0x160(%rdi),%eax` - a cached int32.
+    { 0x200, "GetLatency", true, true, &g_probe_original_0,
+      reinterpret_cast<void*>(&BridgeProbeThunk0) },
+    { 0x760, "GetLatency (thunk)", true, true, &g_probe_original_1,
+      reinterpret_cast<void*>(&BridgeProbeThunk1) },
+    // What asks the plugin what its latency IS. The only caller found in libBMDAudioPlugins.so is
+    // BMDChainFX::OnIdle, so whether this fires at all says whether our effect sits in a chain.
+    { 0x478, "GetPluginLatency", true, true, &g_probe_original_2,
+      reinterpret_cast<void*>(&BridgeProbeThunk2) },
+    // The only thing that writes the cache at this+0x160, under a recursive mutex.
+    { 0x490, "LatencyChanged", false, true, &g_probe_original_3,
+      reinterpret_cast<void*>(&BridgeProbeThunk3) },
+    // The locate. If these fire when the playhead jumps, the stale-audio report has a seam.
+    { 0x1c0, "ResetHistory", false, false, &g_probe_original_4,
+      reinterpret_cast<void*>(&BridgeProbeThunk4) },
+    { 0x6a0, "ResetHistory (thunk)", false, false, &g_probe_original_5,
+      reinterpret_cast<void*>(&BridgeProbeThunk5) },
+    { 0x1c8, "RequiresHistoryReset", true, false, &g_probe_original_6,
+      reinterpret_cast<void*>(&BridgeProbeThunk6) },
+    { 0xa00, "RequiresHistoryReset (thunk)", true, false, &g_probe_original_7,
+      reinterpret_cast<void*>(&BridgeProbeThunk7) },
+    // Found while checking the others, and not in the written-up analysis: Resolve asks whether a
+    // plugin can reset itself.
+    { 0x800, "CanResetInternally", true, false, &g_probe_original_8,
+      reinterpret_cast<void*>(&BridgeProbeThunk8) },
+};
+
+// The first calls always, and after that only when something changed.
+//
+// GetLatency can be asked once per block. A flat cap would answer "does it fire" and then go
+// quiet before the interesting moment - a plugin being added, or a locate. A change filter keeps
+// the log readable for an hour of editing and still catches every transition.
+constexpr int kProbeAlways = 12;
+constexpr int kProbeCap = 400;
+
 constexpr int kTraceCap = 6;
 
 // The two slots the panel button really drives.
 constexpr size_t kUpdateEffectEditTitleOffset = 0x7c0;
 constexpr size_t kHideSubWindowsOffset = 0x830;
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Latency, and the locate.
+//
+// Measured before it was written, on a tester's machine over two probe builds. Resolve asks each
+// effect for its latency exactly once, at project load, through GetPluginLatency at +0x478 - after
+// the hosted plugin is loaded and while it is answering with a real number. It was told zero every
+// time. Nine instances reporting 0, 0, 0, 0, 720, 768, 1024, 1080, 2048 and 6144 samples, and
+// Resolve compensating for none of it. That is the audio drifting out of sync with the video.
+//
+// Only the answer is ours. The poll, the cache at this+0x160, the mutex, LatencyChanged and
+// DelayCompensation all stay Resolve's own code doing its own job - the measurement showed that
+// machinery running correctly on an input of zero. Full account in docs/latency-and-reset.md.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using GetPluginLatencyFn = long long (*)(void*);
+using ResetHistoryFn = void (*)(void*, bool);
+
+void* g_original_get_plugin_latency = nullptr;
+void* g_original_reset_history = nullptr;
+void* g_original_reset_history_thunk = nullptr;
+
+// A thunk hands over `this` adjusted by 0x20, and Resolve calls the thunks: every GetLatency line
+// in the probe sat exactly 0x20 above its paired GetPluginLatency line.
+ClaimedEffect* EffectBehindSlot(void* self)
+{
+    ClaimedEffect* const found = FindEffectAny(self);
+    if (found != nullptr) {
+        return found;
+    }
+    return FindEffectAny(static_cast<void*>(static_cast<char*>(self) - 0x20));
+}
+
+long long BridgeGetPluginLatency(void* self)
+{
+    ClaimedEffect* const effect = EffectBehindSlot(self);
+    if (effect != nullptr && effect->plugin != nullptr) {
+        const long long samples = effect->plugin->LatencySamples();
+        // A format that cannot answer returns -1, and -1 is not a latency. Falling through to the
+        // stock body is right there: it answers zero, which is what a plugin that reports nothing
+        // is asking to be treated as.
+        if (samples >= 0) {
+            if (effect->reported_latency != samples) {
+                effect->reported_latency = samples;
+                Log("latency: \"%s\" reports %lld samples", effect->plugin->Name(), samples);
+            }
+            return samples;
+        }
+    }
+    if (g_original_get_plugin_latency != nullptr) {
+        return reinterpret_cast<GetPluginLatencyFn>(g_original_get_plugin_latency)(self);
+    }
+    return 0;
+}
+
+void BridgeResetHistoryCommon(void* self, bool flag, void* original)
+{
+    if (original != nullptr) {
+        reinterpret_cast<ResetHistoryFn>(original)(self, flag);
+    }
+    ClaimedEffect* const effect = EffectBehindSlot(self);
+    if (effect != nullptr) {
+        effect->reset_pending.store(true, std::memory_order_release);
+    }
+}
+
+void BridgeResetHistory(void* self, bool flag)
+{
+    BridgeResetHistoryCommon(self, flag, g_original_reset_history);
+}
+
+void BridgeResetHistoryThunk(void* self, bool flag)
+{
+    BridgeResetHistoryCommon(self, flag, g_original_reset_history_thunk);
+}
+
+constexpr size_t kGetPluginLatencyOffset = 0x478;
+constexpr size_t kResetHistoryOffset = 0x1c0;
+constexpr size_t kResetHistoryThunkOffset = 0x6a0;
 
 }  // namespace
 
@@ -2328,6 +2570,71 @@ extern "C" const wchar_t* BridgeUserEffectName(void* self)
         return stock;
     }
     return effect->label_wide;
+}
+
+extern "C" void BridgeReportProbe(unsigned int index, void* self, unsigned long argument,
+                                 unsigned long result)
+{
+    if (index >= sizeof(g_probe_slots) / sizeof(g_probe_slots[0])) {
+        return;
+    }
+    ProbeSlot& entry = g_probe_slots[index];
+    ++entry.calls;
+    if (entry.reports >= kProbeCap) {
+        return;
+    }
+    const bool changed = !entry.seen || entry.last_argument != argument ||
+                         (entry.returns_value && entry.last_result != result);
+    // A latency slot reports on a schedule as well as on a change, so the log carries how often it
+    // is really asked. Everything else stays quiet once it has nothing new to say.
+    const bool scheduled = entry.is_latency && (entry.calls % 50) == 0;
+    if (entry.reports >= kProbeAlways && !changed && !scheduled) {
+        return;
+    }
+    entry.seen = true;
+    entry.last_argument = argument;
+    entry.last_result = result;
+    ++entry.reports;
+
+    // What the hosted plugin says about itself, next to what Resolve was told.
+    //
+    // The two numbers on one line is the whole point. Resolve reads zero; if the plugin reports
+    // something else at the same moment, the gap between them is the bug, and the timing says
+    // whether the number is even known by the time Resolve asks.
+    //
+    // Only on a latency slot, and that restriction is deliberate. LatencySamples() calls into the
+    // plugin, and a VST3 wants get_latency_samples on the main thread. The latency slots were
+    // measured arriving at project load; RequiresHistoryReset fired four hundred times in one
+    // session and may well be on the audio thread. Asking a plugin a question from there to
+    // satisfy a log line is not a trade worth making.
+    char hosted[64] = "";
+    if (entry.is_latency) {
+        // FindEffectAny also matches primary_base, which is what a thunk's adjusted `this`
+        // resolves to. The explicit -0x20 is the fallback: measured on the first probe, every
+        // GetLatency line sat exactly 0x20 above its paired GetPluginLatency line.
+        ClaimedEffect* found = FindEffectAny(self);
+        if (found == nullptr) {
+            found = FindEffectAny(static_cast<void*>(static_cast<char*>(self) - 0x20));
+        }
+        if (found != nullptr && found->plugin != nullptr) {
+            const long long samples = found->plugin->LatencySamples();
+            if (samples >= 0) {
+                std::snprintf(hosted, sizeof(hosted), "  plugin says %lld", samples);
+            } else {
+                std::snprintf(hosted, sizeof(hosted), "  plugin does not answer");
+            }
+        } else {
+            std::snprintf(hosted, sizeof(hosted), "  no effect of ours at this pointer");
+        }
+    }
+
+    if (entry.returns_value) {
+        Log("probe: %s (+0x%03zx) call %ld this=%p arg=%#lx -> %lu%s", entry.name, entry.offset,
+            entry.calls, self, argument, result, hosted);
+    } else {
+        Log("probe: %s (+0x%03zx) call %ld this=%p arg=%lu%s", entry.name, entry.offset,
+            entry.calls, self, argument, hosted);
+    }
 }
 
 extern "C" void BridgeReportSlot(unsigned int slot, void* self)
@@ -3922,6 +4229,34 @@ void PatchDelayClassVtable()
 
     for (TraceSlot& entry : g_trace_slots) {
         PatchOurSlot(entry.offset, entry.original, entry.replacement);
+    }
+
+    // The latency and reset probe. Measures, changes nothing: every slot calls the stock body and
+    // returns its result untouched. On by default in this build because that is what it is for;
+    // FXBRIDGE_LATENCY_PROBE=0 turns it off.
+    if (EnabledByEnvironment("FXBRIDGE_LATENCY_PROBE", true)) {
+        int installed = 0;
+        for (ProbeSlot& entry : g_probe_slots) {
+            if (PatchOurSlot(entry.offset, entry.original, entry.replacement)) {
+                ++installed;
+            }
+        }
+        Log("probe: latency and reset probe on, %d slots - see docs/latency-and-reset.md",
+            installed);
+    }
+
+    // After the probe, so the answer wins the slot and the probe becomes the fallback behind it.
+    // Both reset offsets are taken even though only the thunk was ever seen to fire: the one that
+    // does not fire costs a pointer, and a build where the other one fires would otherwise be a
+    // silent no-op.
+    if (EnabledByEnvironment("FXBRIDGE_LATENCY", true)) {
+        PatchOurSlot(kGetPluginLatencyOffset, &g_original_get_plugin_latency,
+                     reinterpret_cast<void*>(&BridgeGetPluginLatency));
+        PatchOurSlot(kResetHistoryOffset, &g_original_reset_history,
+                     reinterpret_cast<void*>(&BridgeResetHistory));
+        PatchOurSlot(kResetHistoryThunkOffset, &g_original_reset_history_thunk,
+                     reinterpret_cast<void*>(&BridgeResetHistoryThunk));
+        Log("latency: reporting the plugin's own latency, and forwarding a locate to it");
     }
     // The name hooks are OUT. GetEffectName returns a string by value, so the ABI puts the hidden
     // return buffer in rdi and `this` in rsi. Calling it as `const void* (*)(void*)` hands the
