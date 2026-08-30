@@ -533,3 +533,69 @@ have yet.
 
 Cheaper first: **a stock plugin with large latency** - Voice Isolation, Music Separator, the
 Dialogue Processor. If it gaps, the reading above is right and there is nothing to fix here.
+
+### The full read — the pre-roll is clamped to a constant
+
+`DelayCompensation::DelayHandler::UpdateMaxTrackAdvance`, all 87 bytes:
+
+```
+mov  0x18(%rdi),%rdi        ; the engine control object
+call *0x488(%rax)           ; one virtual on it -> a bool, kept in bpl
+call g_ProjectTimeDomain
+lea  0x24(%rax),%rdi        ; a Fraction inside the time domain
+call Fraction::GetInt
+lea  (%rax,%rax,2),%ecx     ; ecx = n * 3
+test %bpl,%bpl
+cmovne %eax,%ecx            ; if the bool is set, ecx = n
+mov  %ecx,0x38(%rbx)        ; maxTrackAdvance = n or 3n
+```
+
+So the ceiling is `n` or `3n`, where `n` comes from the project time domain. **No plugin latency
+takes part in it.**
+
+`DelayHandler::ActuateChange` is the only reader, and it uses it as a clamp:
+
+```
+test %ebp,%ebp / jne out        ; only when arg2 == 0
+cmp  $0x234,%ecx / jne out      ; only for ParameterId 0x234
+mov  0x38(%rdi),%eax            ; the ceiling
+neg  %edx                       ; -ceiling
+cmp  %r14d,%edx / cmovl %r14d   ; edx = max(-ceiling, requested)
+cmp  %eax,%edx   / cmovge %eax  ; edx = min(edx, +ceiling)
+mov  0x18(%rdi),%rdi
+call *0x2e8(%rax)               ; SetTrackAdvance(track, clamped)  - slot +0x2f8
+```
+
+**The requested advance is clamped to ±ceiling before it reaches `SetTrackAdvance`.**
+
+That single fact accounts for everything observed. A stock plugin with a few milliseconds of
+lookahead asks for an advance well inside the ceiling, gets pre-rolled in full, and does not gap. A
+plugin asking for more than the ceiling is cut off at it, and the part that was not advanced is the
+silence at the start.
+
+It also predicts the shape of the symptom: **gap ≈ latency − ceiling**, so the gap should grow with
+the plugin's latency rather than being the same length for every plugin.
+
+### What is still unknown, and it decides whether this is fixable
+
+The **numeric value of the ceiling**. `Fraction::GetInt(g_ProjectTimeDomain()+0x24)` is a frame rate
+or a sample rate, and `n` versus `3n` depends on a boolean from an engine virtual. Statically this
+cannot be settled - the time domain is a live object.
+
+If the ceiling is generous (seconds), the clamp is not what bites and the gap is something else. If
+it is a few frames, a 6144-sample plugin is over it and the clamp is the whole story.
+
+**It also decides whether anything here is ours to fix.** The ceiling belongs to Resolve, is
+computed from the project, and is not reachable from a plugin. Reporting less latency would stay
+inside it and bring the desync straight back, which is not a trade worth making.
+
+### The experiment that settles it, and it is cheap
+
+Compare the gap on a **low-latency** plugin against a **high-latency** one - 1024 samples against
+6144, both already in the tester's session.
+
+- Gap grows with latency → the clamp is the cause, `gap ≈ latency − ceiling`, and the ceiling can be
+  derived from two measurements rather than guessed.
+- Gap is the same length either way → the clamp is not it, and the cause is elsewhere.
+
+Two plays and a stopwatch, no build.
