@@ -1419,3 +1419,32 @@ class lazily when the plugin is actually loaded. That takes the first run from m
 The obstacle is shells: `WaveShell` holds 718 plugins behind a stem that names none of them. The
 shape that solves both is a background pass after Resolve has started, correcting the list for the
 next launch. It needs designing, not typing.
+
+---
+
+## 2026-08-30 — latency compensation, and one thing still open
+
+Shipped as v0.2.9: Resolve is told each plugin's real latency and compensates for it, and a locate
+is forwarded so buffers no longer carry the previous position. Both confirmed by the tester who
+reported them, and confirmed from Resolve's own cache as well as by ear.
+
+The whole account lives in `docs/latency-and-reset.md` and does not need repeating here. What is
+worth carrying forward is the one open item and the two rules the session paid for.
+
+**Open:** a few hundred milliseconds of silence at playback start with a high-latency plugin.
+Exports are unaffected. The best explanation is that Resolve clamps its pre-roll to a ceiling that
+has no plugin latency in it. One experiment settles it - compare the gap on a 1024-sample plugin
+against a 6144-sample one - and it needs no build. If the clamp is confirmed it is probably not
+ours to fix, and under-reporting latency to hide it is refused in writing.
+
+**Rule, paid for twice.** An offset is only meaningful for the class it was read from.
+`+0x120` is `AudioPlugin::GetLatency` on `ADMRenderer` and `BMDAudioPluginImpl::DragDropEvent` on
+`BMDStereoDelay`, which is what this bridge rides. `rmap where X` lists a method across classes;
+only `rmap vtable BMDStereoDelay` is about ours. The first probe was nearly built against the wrong
+three slots.
+
+**Rule, paid for by two builds.** When the question is "why does Resolve treat its own plugins
+differently", probing what Resolve asks *us* cannot answer it. The mechanism was on the caller side
+the whole time - `EffectsController::GetPathLatency`, `DelayCompensation`, and the track advance -
+and none of it is on the plugin interface. Look at what the host does for itself before
+instrumenting what it asks of you.

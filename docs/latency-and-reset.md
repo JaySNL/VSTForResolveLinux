@@ -7,6 +7,36 @@ Dates and offsets are from 2026-08-30 against Resolve Studio 21.0.4.0005.
 
 ---
 
+## Where this stands
+
+**Shipped in v0.2.9, confirmed by the tester:** the desync is fixed - Resolve is told each plugin's
+real latency and compensates for it - and the stale audio after a locate is gone.
+
+**Still open: a few hundred milliseconds of silence when playback starts.** Exports are unaffected.
+It is not the reset (`FXBRIDGE_RESET=0` leaves it unchanged), and it is not a call we fail to
+answer (`GetPluginFlags` and `SetOfflineSamplesToProcess` are never made to our effect).
+
+**The best explanation, read out of Resolve's own code and not yet confirmed at runtime:** the
+pre-roll is clamped. `DelayHandler::UpdateMaxTrackAdvance` computes a ceiling from the project time
+domain with no plugin latency in it, and `ActuateChange` clamps the requested advance to ±that
+ceiling before calling `SetTrackAdvance`. A plugin needing more than the ceiling is only partly
+pre-rolled, and the remainder is the silence.
+
+**The next step is one experiment and it needs no build.** Compare the gap on a 1024-sample plugin
+against a 6144-sample one, both already loaded in the tester's session:
+
+- gap grows with latency → the clamp is the cause, and subtracting the two gives the ceiling
+- gap is the same either way → the clamp is not it, and the cause is elsewhere
+
+**If the clamp is confirmed, this is probably not ours to fix.** The ceiling belongs to Resolve, is
+computed from the project, and is not reachable from a plugin. The only lever on our side would be
+under-reporting latency to stay beneath it, which brings the desync straight back. That trade is
+refused here in writing so it is not rediscovered as a good idea later.
+
+The detail behind all of this is below, wrong turns included.
+
+---
+
 ## The two reports
 
 > Looks like latency is somehow not compensated or it is but with some wrong value. Placing some
