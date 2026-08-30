@@ -485,3 +485,51 @@ plugin in the chain.
   priming slot on this interface at all, and the outcome is a known note rather than a change.
 - It does not gap → Resolve primes its own plugins through something that is not on the plugin
   vtable, and that is where to look next.
+
+### The caller side, which is where this should have been looked at first
+
+Two probe builds went into asking "what does Resolve ask us". The question was "what does Resolve
+do for its own effects", and the answer is in `libFairlightPage.so`, which the index has held all
+along.
+
+| symbol | job |
+|---|---|
+| `EffectsController::GetPathLatency(FL::ModuleIds, int)` | the latency of a whole signal path |
+| `DelayCompensation::CalculateEffectDelay` | calls the above, turns it into a delay |
+| `DelayCompensation::DelayHandler::UpdateDelay` | applies it through `StudioModel` and `AudioRouter` |
+| `DelayCompensation::DelayHandler::UpdateMaxTrackAdvance` | **the pre-roll** |
+| `AudioEngine::SetTrackAdvance`, `AudioEngineController::SetTrackAdvance` | sets it |
+| `AudioTrack::SetCacheAdvance(SAMPLE64)` | per track |
+
+**Advancing a track is pre-roll**: running it ahead of the playhead so a latent effect has already
+been fed by the time you hear it. That is the mechanism the gap is about, and none of it is on the
+plugin interface — which is why no amount of probing our own vtable was ever going to find it.
+
+### What UpdateMaxTrackAdvance appears not to do
+
+It is 87 bytes. It reads a pointer at `this+0x18`, calls one virtual on it, then
+`g_ProjectTimeDomain()` and `Fraction::GetInt()`, and writes `this+0x38`.
+
+That is a **time-domain conversion, not a sum of plugin latencies**. No symbol in the index ties
+`GetPathLatency` to `MaxTrackAdvance` either. So on the evidence available, the pre-roll does not
+scale with how much latency the effects on a track have.
+
+**If that reading is right, it predicts that a stock plugin with enough latency gaps in exactly the
+same way** — the pre-roll is fixed, and anything latent enough to exceed it starts with silence.
+That contradicts the expectation that Resolve's own plugins never gap, and the contradiction is the
+useful part: it is one launch to settle.
+
+### Where the static analysis stops being cheap
+
+`GetPathLatency` and `UpdateDelay` reach into `StudioModel`, `AudioRouter` and bus mapping through
+virtuals on objects this bridge never holds a pointer to. Reading further means following vtables
+belonging to classes that are not ours, and offsets collide between classes - which has already
+produced one wrong answer in this file.
+
+The next real measurement is caller-side instrumentation: hook `AudioEngineController::SetTrackAdvance`
+and log what it is set to, with a bridged plugin and with a stock one. That is a detour on an
+exported non-virtual function rather than a vtable patch, which is machinery this bridge does not
+have yet.
+
+Cheaper first: **a stock plugin with large latency** - Voice Isolation, Music Separator, the
+Dialogue Processor. If it gaps, the reading above is right and there is nothing to fix here.
