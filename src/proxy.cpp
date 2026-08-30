@@ -2228,6 +2228,12 @@ BRIDGE_HIDDEN2 void* g_probe_original_7 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk7();
 BRIDGE_HIDDEN2 void* g_probe_original_8 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk8();
+BRIDGE_HIDDEN2 void* g_probe_original_9 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk9();
+BRIDGE_HIDDEN2 void* g_probe_original_10 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk10();
+BRIDGE_HIDDEN2 void* g_probe_original_11 = nullptr;
+BRIDGE_HIDDEN2 void BridgeProbeThunk11();
 }
 
 asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk0", "g_probe_original_0", "0"));
@@ -2239,6 +2245,9 @@ asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk5", "g_probe_original_5", "5"));
 asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk6", "g_probe_original_6", "6"));
 asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk7", "g_probe_original_7", "7"));
 asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk8", "g_probe_original_8", "8"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk9", "g_probe_original_9", "9"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk10", "g_probe_original_10", "10"));
+asm(BRIDGE_PROBE_THUNK("BridgeProbeThunk11", "g_probe_original_11", "11"));
 
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk0", "g_trace_original_0", "0"));
 asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk1", "g_trace_original_1", "1"));
@@ -2338,6 +2347,10 @@ struct ProbeSlot {
     // every time. The call count decides whether answering this slot honestly is enough, so it is
     // counted on every call and printed on every line.
     bool is_latency;
+    // Whether to ask the hosted plugin its latency for this line. Separate from is_latency, which
+    // only decides how loudly a slot reports: asking the plugin means calling into it, and a slot
+    // that fires often or off the main thread is the wrong place to do that for a log line.
+    bool ask_plugin;
     void** original;
     void* replacement;
     int reports;
@@ -2350,30 +2363,44 @@ struct ProbeSlot {
 ProbeSlot g_probe_slots[] = {
     // What consumers read. DelayCompensation::CalculateEffectDelay and BMDChainFX::UpdateLatency
     // both end up here, and the stock body is `mov 0x160(%rdi),%eax` - a cached int32.
-    { 0x200, "GetLatency", true, true, &g_probe_original_0,
+    { 0x200, "GetLatency", true, true, true, &g_probe_original_0,
       reinterpret_cast<void*>(&BridgeProbeThunk0) },
-    { 0x760, "GetLatency (thunk)", true, true, &g_probe_original_1,
+    { 0x760, "GetLatency (thunk)", true, true, true, &g_probe_original_1,
       reinterpret_cast<void*>(&BridgeProbeThunk1) },
     // What asks the plugin what its latency IS. The only caller found in libBMDAudioPlugins.so is
     // BMDChainFX::OnIdle, so whether this fires at all says whether our effect sits in a chain.
-    { 0x478, "GetPluginLatency", true, true, &g_probe_original_2,
+    { 0x478, "GetPluginLatency", true, true, true, &g_probe_original_2,
       reinterpret_cast<void*>(&BridgeProbeThunk2) },
     // The only thing that writes the cache at this+0x160, under a recursive mutex.
-    { 0x490, "LatencyChanged", false, true, &g_probe_original_3,
+    { 0x490, "LatencyChanged", false, true, false, &g_probe_original_3,
       reinterpret_cast<void*>(&BridgeProbeThunk3) },
     // The locate. If these fire when the playhead jumps, the stale-audio report has a seam.
-    { 0x1c0, "ResetHistory", false, false, &g_probe_original_4,
+    { 0x1c0, "ResetHistory", false, false, false, &g_probe_original_4,
       reinterpret_cast<void*>(&BridgeProbeThunk4) },
-    { 0x6a0, "ResetHistory (thunk)", false, false, &g_probe_original_5,
+    { 0x6a0, "ResetHistory (thunk)", false, false, false, &g_probe_original_5,
       reinterpret_cast<void*>(&BridgeProbeThunk5) },
-    { 0x1c8, "RequiresHistoryReset", true, false, &g_probe_original_6,
+    { 0x1c8, "RequiresHistoryReset", true, false, false, &g_probe_original_6,
       reinterpret_cast<void*>(&BridgeProbeThunk6) },
-    { 0xa00, "RequiresHistoryReset (thunk)", true, false, &g_probe_original_7,
+    { 0xa00, "RequiresHistoryReset (thunk)", true, false, false, &g_probe_original_7,
       reinterpret_cast<void*>(&BridgeProbeThunk7) },
     // Found while checking the others, and not in the written-up analysis: Resolve asks whether a
     // plugin can reset itself.
-    { 0x800, "CanResetInternally", true, false, &g_probe_original_8,
+    { 0x800, "CanResetInternally", true, false, false, &g_probe_original_8,
       reinterpret_cast<void*>(&BridgeProbeThunk8) },
+    // The gap at play start survives with our reset switched off, so it is not the reset. These
+    // three are the remaining candidates for how Resolve primes a latent effect, and none of them
+    // has been seen to fire on ours.
+    //
+    // GetPluginFlags reads the DSP object at +0x30, immediately after the latency at +0x28. If one
+    // of those bits says "this effect has latency, run it ahead", our effect answers with whatever
+    // the stock Delay puts there - a plugin that has none.
+    { 0x480, "GetPluginFlags", true, true, false, &g_probe_original_9,
+      reinterpret_cast<void*>(&BridgeProbeThunk9) },
+    // A host telling a plugin to chew through samples outside playback. That is what priming is.
+    { 0x208, "SetOfflineSamplesToProcess", false, true, false, &g_probe_original_10,
+      reinterpret_cast<void*>(&BridgeProbeThunk10) },
+    { 0x770, "SetOfflineSamplesToProcess (thunk)", false, true, false, &g_probe_original_11,
+      reinterpret_cast<void*>(&BridgeProbeThunk11) },
 };
 
 // The first calls always, and after that only when something changed.
@@ -2608,7 +2635,7 @@ extern "C" void BridgeReportProbe(unsigned int index, void* self, unsigned long 
     // session and may well be on the audio thread. Asking a plugin a question from there to
     // satisfy a log line is not a trade worth making.
     char hosted[64] = "";
-    if (entry.is_latency) {
+    if (entry.ask_plugin) {
         // FindEffectAny also matches primary_base, which is what a thunk's adjusted `this`
         // resolves to. The explicit -0x20 is the fallback: measured on the first probe, every
         // GetLatency line sat exactly 0x20 above its paired GetPluginLatency line.
