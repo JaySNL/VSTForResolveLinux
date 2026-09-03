@@ -9,7 +9,16 @@
     let
       lib = nixpkgs.lib;
       systems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = f: lib.genAttrs systems (sys: f (nixpkgs.legacyPackages.${sys}));
+      # The build references davinci-resolve-studio, which is unfree, so the
+      # nixpkgs used here must allow unfree. Importing with that config (rather
+      # than legacyPackages, which defaults allowUnfree = false) also matches how
+      # a consuming flake like nix-configs builds its pkgs, and it keeps following
+      # the parent's nixpkgs input when this flake is folded into one.
+      mkPkgs = system: import nixpkgs {
+        inherit system;
+        config.allowUnfree = true;
+      };
+      forAllSystems = f: lib.genAttrs systems (sys: f (mkPkgs sys));
 
       # The two vendored third_party/ submodules are not checked out in a
       # bare clone, so they are fetched explicitly (and pinned) and overlaid
@@ -19,7 +28,7 @@
       # Hashes are computed by nix from the bytes it actually downloads; a
       # lib.fakeHash placeholder fails the build and prints the real value.
       fetchSubmodule = owner: repo: rev: hash:
-        nixpkgs.legacyPackages.${builtins.head systems}.fetchFromGitHub {
+        (mkPkgs (builtins.head systems)).fetchFromGitHub {
           inherit owner repo rev hash;
           fetchSubmodules = false;
         };
@@ -61,7 +70,11 @@
       # consumer can point BMDPlugins.Path at $out/BMDAudioPlugins/libfxbridge.so.
       bmdaudioplugins = pkgs:
         let
-          carla = pkgs.carla;
+          carla   = pkgs.carla;
+          # davinci-resolve-studio is an FHS-env *wrapper*; the real app tree
+          # (bin/, libs/, BlackmagicRAWPlayer/, ...) lives in its inner `davinci`
+          # derivation. We point at that inner one, not the outer wrapper.
+          davinci = pkgs.davinci-resolve-studio.davinci;
         in
         pkgs.stdenv.mkDerivation {
           pname = "bmdaudioplugins";
@@ -70,13 +83,26 @@
 
           # carla is only read for its headers during compilation; libX11 and
           # zlib are linked. dl/pthread come from the toolchain's glibc.
-          nativeBuildInputs = [ carla ];
+          # davinci (the inner Resolve derivation) is a build-time reference
+          # only: its libs/ path is baked into the .so, so the store path must be
+          # present for that dlopen to resolve at run time.
+          nativeBuildInputs = [ carla davinci ];
           buildInputs = [ pkgs.libX11 pkgs.zlib ];
 
           # No autotools here; the two g++ invocations are hand-rolled,
           # mirroring build.sh.
           dontConfigure = true;
           dontMakeBuildWrapper = true;
+
+          # The bridge dlopens Resolve's stock BMD library (kStockLibrary) to
+          # clone it. That constant is hardcoded to /opt/resolve/libs/..., which
+          # does not exist under Nix. Point it at the inner davinci store path (a
+          # sibling of the FHS wrapper, whose libs/ really holds the .so) so the
+          # dlopen resolves at run time. The stock lib file is unchanged; only its
+          # location changes.
+          patchPhase = ''
+            sed -i "s|/opt/resolve|${davinci}|g" src/proxy.cpp
+          '';
 
           buildPhase = ''
             mkdir -p build
