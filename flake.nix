@@ -112,9 +112,11 @@
           '';
 
           installPhase = ''
-            mkdir -p $out/BMDAudioPlugins
+            mkdir -p $out/BMDAudioPlugins $out/bin
             install -m 755 build/libfxbridge.so $out/BMDAudioPlugins/libfxbridge.so
-            install -m 755 build/fxbridge-scan  $out/BMDAudioPlugins/fxbridge-scan
+            # The scanner lives in $out/bin so it lands on PATH when the package
+            # is added to environment.systemPackages (a non-bin directory would not).
+            install -m 755 build/fxbridge-scan  $out/bin/fxbridge-scan
           '';
 
           meta = with lib; {
