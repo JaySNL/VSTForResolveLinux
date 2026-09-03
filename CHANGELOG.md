@@ -7,6 +7,47 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.2.10 — 2026-09-03
+
+**v0.2.9 could crash Resolve on project load. This turns off the part that did it.**
+
+### Fixed
+
+- **A VST2 through yabridge aborted while a project was loading.** Signal 6, `terminate called
+  without an active exception`, with every meaningful frame inside `libyabridge-vst2.so` reached
+  through this bridge.
+
+  The cause is the locate forwarding added in v0.2.9. It is now **off by default**. Confirmed by
+  changing only that: with `FXBRIDGE_RESET=0` the same project opens, the same plugin loads, and
+  the latency fix keeps working — `"PodcastPlugins TRACK" reports 5279 samples`.
+
+  **The delay compensation from v0.2.9 is unaffected and stays on.** Sync remains correct. What
+  comes back is the older, milder problem: after a jump in the timeline, the first moments may
+  replay the tail of the previous position.
+
+  The reasoning that caused it is worth writing down. The reset is deferred to the top of the next
+  audio block on purpose — nothing is being processed there, and CLAP names the audio thread as
+  where a reset belongs. For VST2 that means dispatching `effStopProcess` and `effStartProcess`
+  from the audio thread into a Wine IPC bridge, and yabridge expects most dispatcher traffic on the
+  main thread. The reasoning was right for VST3 and CLAP, and was generalised to VST2 without
+  evidence for it.
+
+  `FXBRIDGE_RESET=1` turns it back on. That is how the real fix will be tested, and it is not
+  recommended otherwise.
+
+- **The Carla idle thread was never joined or detached.** Its destructor ran at exit while still
+  joinable, which calls `std::terminate` and aborts with the same message a dying yabridge host
+  produces — the kind of coincidence that sends a crash hunt the wrong way. It now stops and joins
+  at exit. Only reachable with the Carla loader selected, and unrelated to the crash above.
+
+### Known
+
+Unchanged from v0.2.9: a short silence when playback starts with a high-latency plugin, which does
+not affect exports; and a plugin that changes its latency mid-session may not be re-compensated
+until the project is reopened.
+
+---
+
 ## v0.2.9 — 2026-08-30
 
 **Resolve now knows how much latency your plugins have, and compensates for it.**

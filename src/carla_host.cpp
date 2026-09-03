@@ -212,6 +212,24 @@ bool CarlaHostLoad(double sample_rate, uint32_t max_frames)
         g_idle_thread = std::thread(IdleLoop);
     }
 
+    // Stopped and joined at exit.
+    //
+    // A std::thread destroyed while still joinable calls std::terminate, which aborts with
+    // "terminate called without an active exception" - the same message a dying yabridge host
+    // produces, which is exactly the kind of coincidence that sends a crash hunt the wrong way.
+    // The other two global threads in this bridge each carry this note; this one was created and
+    // never joined or detached. Joining needs the flag cleared first, because IdleLoop runs until
+    // it goes false, and the loop sleeps 30 ms so the join returns promptly.
+    static struct IdleThreadStop {
+        ~IdleThreadStop()
+        {
+            g_idle_running.store(false);
+            if (g_idle_thread.joinable()) {
+                g_idle_thread.join();
+            }
+        }
+    } stop_idle_thread;
+
     g_ready = true;
     Log("carla: loaded \"%s\" (%s), %u in, %u out, %.0f Hz",
         g_descriptor->name != nullptr ? g_descriptor->name : "Carla",

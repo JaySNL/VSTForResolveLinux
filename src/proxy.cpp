@@ -4292,14 +4292,31 @@ void PatchDelayClassVtable()
     //
     // One switch tells them apart. FXBRIDGE_RESET=0 keeps the latency answer and drops the reset:
     // if the gap survives that, it was never ours.
-    if (EnabledByEnvironment("FXBRIDGE_RESET", true)) {
+    // DEFAULT OFF since v0.2.10, because this crashed Resolve.
+    //
+    // A VST2 through yabridge aborts during project load with "terminate called without an active
+    // exception" and seven frames inside libyabridge-vst2.so. Confirmed by switching only this:
+    // with the reset off the same project opens, smartEQ4 loads, and the latency fix keeps working
+    // (`"PodcastPlugins TRACK" reports 5279 samples`).
+    //
+    // The cause is almost certainly the thread. The reset is deferred to the top of the next
+    // Process on purpose - no processing is in flight there, and CLAP names the audio thread as
+    // where a reset belongs. But for VST2 that means dispatching effStopProcess and effStartProcess
+    // from the audio thread into a Wine IPC bridge, and yabridge expects most dispatcher traffic on
+    // the main thread. The reasoning was right for VST3 and CLAP and was generalised to VST2
+    // without evidence.
+    //
+    // Off until that is fixed properly rather than guessed at. FXBRIDGE_RESET=1 restores it, which
+    // is how the fix will be tested.
+    if (EnabledByEnvironment("FXBRIDGE_RESET", false)) {
         PatchOurSlot(kResetHistoryOffset, &g_original_reset_history,
                      reinterpret_cast<void*>(&BridgeResetHistory));
         PatchOurSlot(kResetHistoryThunkOffset, &g_original_reset_history_thunk,
                      reinterpret_cast<void*>(&BridgeResetHistoryThunk));
         Log("latency: forwarding a locate to the plugin");
     } else {
-        Log("latency: the locate is NOT forwarded (FXBRIDGE_RESET=0)");
+        Log("latency: the locate is not forwarded - off by default since v0.2.10, "
+            "FXBRIDGE_RESET=1 turns it back on");
     }
     // The name hooks are OUT. GetEffectName returns a string by value, so the ABI puts the hidden
     // return buffer in rdi and `this` in rsi. Calling it as `const void* (*)(void*)` hands the
