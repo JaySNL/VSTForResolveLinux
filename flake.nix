@@ -8,7 +8,12 @@
   outputs = { self, nixpkgs }:
     let
       lib = nixpkgs.lib;
-      systems = [ "x86_64-linux" "aarch64-linux" ];
+      # x86_64 only, and not by preference.
+      #
+      # src/proxy.cpp contains hand-written x86-64 assembly - the trace and probe thunks are
+      # written in it - so aarch64 does not compile. Resolve's own vtable offsets, which this
+      # bridge reads and patches, are x86-64 layout as well.
+      systems = [ "x86_64-linux" ];
       # The build references davinci-resolve-studio, which is unfree, so the
       # nixpkgs used here must allow unfree. Importing with that config (rather
       # than legacyPackages, which defaults allowUnfree = false) also matches how
@@ -57,6 +62,8 @@
           chmod -R u+rwX $out
         '';
 
+      # Bumped by hand with the tag and CHANGELOG.md. Nix cannot read it from git here without
+      # making the build impure, so this is the one place that has to be kept in step.
       version = "0.2.10";
 
       # Common compiler flags. carla is headers-only here (CarlaNative.h /
@@ -126,6 +133,10 @@
               -ldl -lX11 -lz -lpthread
           '';
 
+          # Without this the checkPhase below never runs: stdenv only runs it when doCheck is
+          # set, so the guard was present and dead.
+          doCheck = true;
+
           # A library that dlopen()s against a private ABI can link cleanly
           # yet still carry unresolved symbols that only fail at load time.
           # Fail the build in that case rather than ship a silent no-op.
@@ -154,7 +165,7 @@
             '';
             homepage = "https://github.com/JaySNL/VSTForResolveLinux";
             license = licenses.mit;
-            platforms = platforms.linux;
+            platforms = [ "x86_64-linux" ];
             maintainers = [ ];
           };
         };
@@ -185,7 +196,12 @@
 
             # Resolve owns this file and rewrites it on quit; editing it under a
             # running Resolve loses the change.
-            if ps -eo comm,args 2>/dev/null | awk '$1=="GUI" && /\/opt\/resolve\/bin\/resolve/ { found=1 } END { exit !found }'; then
+            # Matched on the path-agnostic part, because on NixOS Resolve is not in /opt at all -
+            # which is the whole reason this flake rewrites that path during the build. Looking for
+            # /opt/resolve here meant the guard could never fire on the platform it was written
+            # for, and Resolve rewrites this file on quit, so the edit would be silently lost.
+            # Its process is called GUI rather than resolve, which is why this greps comm.
+            if ps -eo comm,args 2>/dev/null | awk '$1=="GUI" && /\/bin\/resolve/ { found=1 } END { exit !found }'; then
               echo "Resolve is RUNNING; close it first, or add by hand:" >&2
               echo "    $line" >&2
               exit 1
