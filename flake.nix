@@ -64,7 +64,7 @@
 
       # Bumped by hand with the tag and CHANGELOG.md. Nix cannot read it from git here without
       # making the build impure, so this is the one place that has to be kept in step.
-      version = "0.2.10";
+      version = "0.2.11";
 
       # Common compiler flags. carla is headers-only here (CarlaNative.h /
       # CarlaDefines.h); the library is dlopen()'d at run time, never linked.

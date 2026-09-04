@@ -7,6 +7,43 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.2.11 — 2026-09-05
+
+**NixOS support, and a tag that Nix can actually build.**
+
+### Added
+
+- **A flake**, contributed by [@mogorman](https://github.com/mogorman) in
+  [#1](https://github.com/JaySNL/VSTForResolveLinux/pull/1). `nix build` produces the bridge and
+  the scanner, and `nix run .#bmdaudioplugins-install` writes `BMDPlugins.Path` for you. Third-party
+  sources are pinned by revision and hash, matching this repo's own submodules.
+
+  Three things were corrected on top of it: the `checkPhase` that refuses a library with unresolved
+  symbols never ran, because `stdenv` only runs it when `doCheck` is set; `aarch64-linux` was
+  advertised and cannot work, since `src/proxy.cpp` carries hand-written x86-64 assembly; and the
+  installer's "is Resolve running" guard matched `/opt/resolve/bin/resolve`, which is precisely the
+  path the flake rewrites because NixOS does not have it — so on NixOS it never fired, and Resolve
+  rewrites its config on quit. Confirmed working after those changes by the contributor.
+
+### Why this has a version number at all
+
+**The library is unchanged.** Nothing under `src/` differs from v0.2.10, and the published
+`libfxbridge.so` is byte-identical — same sha256. If you are not on NixOS there is nothing here for
+you, and no reason to re-download.
+
+It gets a tag because `v0.2.10` was cut before the flake was merged, so
+`nix build github:JaySNL/VSTForResolveLinux/v0.2.10` fails with no `flake.nix`. Without this tag a
+Nix user has to pin `main`, which moves under them.
+
+### Known
+
+Unchanged from v0.2.10: the locate forwarding is off by default (`FXBRIDGE_RESET=1` re-enables it,
+and it can crash a VST2 through yabridge); a short silence when playback starts with a high-latency
+plugin, which does not affect exports; and a plugin that changes latency mid-session may not be
+re-compensated until the project is reopened.
+
+---
+
 ## v0.2.10 — 2026-09-03
 
 **v0.2.9 could crash Resolve on project load. This turns off the part that did it.**
