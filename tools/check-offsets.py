@@ -139,6 +139,19 @@ MEMBERS_NOT_CHECKED = [
     (0x3ac, "panel height", "the panel"),
 ]
 
+# The gate that empties the effect list.
+#
+# GetBMDPluginInterface() asks the stock interface for its version and refuses to wrap anything
+# when the answer is not this number - src/proxy.cpp does that on purpose, because wrapping an
+# interface whose shape changed is worse than not wrapping it. The visible result of the refusal is
+# an effect list with none of our plugins in it and a quiet line in the log, so it is worth reading
+# the number straight out of the library.
+INTERFACE_VERSION_SYMBOL = "_ZNK22BMDPluginInterfaceImpl25GetPluginInterfaceVersionEv"
+EXPECTED_INTERFACE_VERSION = 100
+
+CONFIG = os.path.expanduser("~/.local/share/DaVinciResolve/configs/config-fairlight.dat")
+
+
 R_X86_64_64 = 1
 R_X86_64_RELATIVE = 8
 STT_FUNC = 2
@@ -373,6 +386,87 @@ def check_members(path):
     return rows
 
 
+
+def interface_version(path):
+    """The constant that GetPluginInterfaceVersion returns, read without running anything.
+
+    The body is a stack-guard preamble and one `mov $imm32,%eax`, so the constant is the immediate
+    of the first such instruction. Returns None when the function is absent or does not have that
+    shape, which is a finding in itself and not a zero.
+    """
+    elf = Elf(path)
+    place = next(((sym[0], sym[1]) for sym in elf.symbols()
+                  if sym[3] == INTERFACE_VERSION_SYMBOL), None)
+    if place is None or not place[1]:
+        return None
+    address, length = place
+    blob = b""
+    for section in elf.sections:
+        if section["addr"] and section["addr"] <= address < section["addr"] + section["size"]:
+            start = section["offset"] + (address - section["addr"])
+            blob = elf.data[start:start + length]
+            break
+    for index in range(len(blob) - 5):
+        if blob[index] == 0xb8:  # mov $imm32, %eax
+            return int.from_bytes(blob[index + 1:index + 5], "little")
+    return None
+
+
+def why_the_list_is_empty(path):
+    """The three things that hide every plugin, in the order they bite."""
+    print("if the effect list is empty, these are the reasons, in order:")
+
+    version = interface_version(path)
+    if version is None:
+        print(f"    interface version   COULD NOT READ - {INTERFACE_VERSION_SYMBOL} is not in this")
+        print("                        library or has a shape this cannot read. That alone would")
+        print("                        empty the list.")
+    elif version != EXPECTED_INTERFACE_VERSION:
+        print(f"    interface version   {version}, and the bridge only wraps "
+              f"{EXPECTED_INTERFACE_VERSION}.")
+        print("                        THIS EMPTIES THE LIST. The bridge sees the mismatch and")
+        print("                        forwards Resolve's own interface untouched, on purpose.")
+        print("                        The log line is 'unexpected interface version, forwarding")
+        print("                        untouched'.")
+    else:
+        print(f"    interface version   {version}  ok")
+
+    if not os.path.exists(CONFIG):
+        print(f"    BMDPlugins.Path     {CONFIG} does not exist, so Resolve was never told to load")
+        print("                        the bridge. Run build.sh, or add the line by hand.")
+    else:
+        line = None
+        try:
+            with open(CONFIG, encoding="utf-8", errors="replace") as handle:
+                for text in handle:
+                    if "BMDPlugins.Path" in text:
+                        line = text.strip()
+        except OSError as problem:
+            line = f"(could not read it: {problem})"
+        if line is None:
+            print("    BMDPlugins.Path     NOT SET in config-fairlight.dat. Resolve loads its own")
+            print("                        library and the list holds only its own effects. An")
+            print("                        update rewrites this file, so it is the first thing to")
+            print("                        lose after a Resolve upgrade.")
+        else:
+            target = line.split("=", 1)[-1].strip()
+            exists = os.path.exists(target)
+            print(f"    BMDPlugins.Path     {target}")
+            print(f"                        {'the file is there' if exists else 'THAT FILE DOES NOT EXIST'}")
+
+    cache = os.path.expanduser("~/.local/share/BMDAudioPlugins/fxbridge-scan-cache.tsv")
+    if not os.path.exists(cache):
+        print("    scan cache          not written yet, which is normal before the first start")
+    else:
+        try:
+            with open(cache, encoding="utf-8", errors="replace") as handle:
+                rows = sum(1 for text in handle if text.strip() and not text.startswith("#"))
+            print(f"    scan cache          {rows} modules")
+        except OSError:
+            print("    scan cache          could not be read")
+    print()
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
@@ -460,6 +554,8 @@ def main():
             for offset, label, wanted, found in missing:
                 print(f"    +0x{offset:03x}  {label}  (wanted {wanted})")
         print()
+
+    why_the_list_is_empty(path)
 
     print("member offsets, read out of the instructions that use them:")
     member_rows = check_members(path)

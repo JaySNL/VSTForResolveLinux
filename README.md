@@ -362,6 +362,12 @@ the replacement constants ready to paste.
 `--dump` lists every slot in the vtable, `--no-version` skips the version scan, and
 `--emit-expected` regenerates the reference table from a Resolve you trust.
 
+**It also answers an empty effect list**, which is the failure a moved offset does not cause. Three
+things hide every plugin: the stock interface reporting a version the bridge refuses to wrap — it
+forwards Resolve's own interface untouched rather than guess at a changed shape — a
+`BMDPlugins.Path` that an update rewrote out of `config-fairlight.dat`, and an empty scan cache.
+All three are read without starting Resolve.
+
 **Member offsets are checked too**, where one function owns them: the channel counts at
 `this+0x150` and `this+0x158`, the per-plugin lock at `this+0x218` and the dirty flag. Those are
 encoded inside instructions rather than named in the symbol table, so the script scans the bytes of
