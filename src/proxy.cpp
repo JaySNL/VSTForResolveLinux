@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -295,6 +296,10 @@ struct ClaimedEffect {
     // What we last told Resolve this effect's latency is, so the log carries a line when it
     // changes and stays quiet when it does not.
     long long reported_latency = -1;
+
+    // The watchdog on the hosted call. See ReportSlowBlock for why it exists.
+    std::atomic<unsigned int> slow_blocks{0};
+    long long worst_block_us = 0;
     std::vector<float> dry;
     // Stand-in buffers for channels Resolve does not provide, so a stereo plugin can still run on
     // a mono track. Allocated at claim time; never on the audio thread.
@@ -1924,6 +1929,49 @@ extern "C" void BridgeBeforeProcess(void* self, const void* timebase, float** in
     effect->dry_channels = wanted;
 }
 
+// How long a hosted block may take before it is worth a line in the log.
+//
+// Resolve holds one lock per plugin for the whole of BMDAudioPluginImpl::PreProcess, and that is
+// the same lock BMDAudioPluginImpl::ResetHistory waits on - verified by disassembly: only five
+// functions in libBMDAudioPlugins.so lock `this+0x218`, and those two are among them. So a slow
+// call here does not merely drop audio, it freezes the interface: the next ClearAudioPreview on
+// the GUI thread queues behind us. Four dumps from Delirio on 2026-09-05 stop at exactly that
+// frame, and the last line the bridge wrote before each freeze was the ResetHistory probe.
+//
+// Nothing is aborted. A VST3 process call through yabridge cannot be cancelled once it is in
+// flight, and pretending otherwise would trade a freeze for a corrupted plugin. What this buys is
+// the NAME of the plugin that stalled, which no dump so far has carried.
+//
+// A 1024-frame block at 48 kHz is 21 ms of audio, so 50 ms has already missed the deadline twice
+// over. FXBRIDGE_SLOW_MS moves it.
+long long SlowBlockMicroseconds()
+{
+    static const long long limit = [] {
+        const char* const set = std::getenv("FXBRIDGE_SLOW_MS");
+        const long long ms = set != nullptr ? std::atoll(set) : 50;
+        return (ms > 0 ? ms : 50) * 1000;
+    }();
+    return limit;
+}
+
+void ReportSlowBlock(ClaimedEffect* effect, long long took_us, unsigned long frames)
+{
+    if (took_us <= SlowBlockMicroseconds()) {
+        return;
+    }
+    if (took_us > effect->worst_block_us) {
+        effect->worst_block_us = took_us;
+    }
+    // The first few, then decades. A stall storm must not become the log.
+    const unsigned int seen = effect->slow_blocks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (seen <= 5 || seen == 10 || seen == 100 || seen == 1000 || seen % 10000 == 0) {
+        Log("audio: SLOW - \"%s\" took %lld.%03lld ms for %lu frames (block %u past the limit, "
+            "worst %lld.%03lld ms). Resolve holds the plugin lock for this whole call.",
+            effect->plugin->Name(), took_us / 1000, took_us % 1000, frames, seen,
+            effect->worst_block_us / 1000, effect->worst_block_us % 1000);
+    }
+}
+
 extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** input,
                                    float** output, unsigned long frames)
 {
@@ -2015,8 +2063,13 @@ extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** inp
         effect->plugin->Reset();
     }
 
+    const auto started = std::chrono::steady_clock::now();
     const bool processed = effect->plugin->Process(effect->channels, asked,
                                                    static_cast<unsigned int>(frames));
+    ReportSlowBlock(effect,
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - started).count(),
+                    frames);
 
     bool overran = false;
     for (unsigned int channel = 0; channel < asked; ++channel) {
@@ -4427,6 +4480,8 @@ void PatchDelayClassVtable()
     Log("audio hook on BMDStereoDelay::Process - primary %s (%p), thunk %s (%p)",
         primary ? "patched" : "off", g_original_process_primary,
         secondary ? "patched" : "FAILED", g_original_process_thunk);
+    Log("audio: a hosted block over %lld ms is logged by name (FXBRIDGE_SLOW_MS)",
+        SlowBlockMicroseconds() / 1000);
 }
 
 }  // namespace

@@ -318,6 +318,28 @@ latency while the project is open may not be re-compensated until it is reopened
 `FXBRIDGE_LATENCY=0` turns the reporting off; `FXBRIDGE_RESET=0` stops the plugin being told the
 playhead jumped. Both exist for narrowing down a problem, not for daily use.
 
+## When Resolve stops responding
+
+**A slow plugin does not only drop audio, it freezes the interface.** Resolve holds one lock per
+plugin for the whole of its processing call, and the same lock is taken when the playhead moves or
+the audio preview is cleared. So while a hosted plugin is working, the next thing you do that
+touches that effect waits behind it, and a plugin that takes seconds to answer looks exactly like
+a hung application.
+
+Since v0.2.12 that is measured rather than guessed at. A hosted block that takes longer than 50 ms
+is written to the log by name:
+
+```
+audio: SLOW - "MAutoDynamicEq" took 4231.077 ms for 1024 frames (block 1 past the limit, worst 4231.077 ms)
+```
+
+`FXBRIDGE_SLOW_MS` moves the threshold. A 1024-frame block at 48 kHz is 21 ms of audio, so 50 ms
+has already missed the deadline twice over.
+
+**Nothing is aborted.** A VST3 processing call through yabridge cannot be cancelled once it is in
+flight, and pretending otherwise would trade a freeze for a corrupted plugin. What the line buys is
+the name of the plugin to remove, which no crash dump carries.
+
 ## Settings between sessions
 
 **Your plugin settings live in the Resolve project.** On by default since v0.2.3, nothing to turn

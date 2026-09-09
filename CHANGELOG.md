@@ -7,6 +7,36 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.2.12 — 2026-09-09
+
+**A freeze now names the plugin that caused it.**
+
+### Added
+
+- **A watchdog on the hosted processing call.** Every block is timed, and a block over 50 ms is
+  logged with the plugin's name, the duration and the worst seen so far. `FXBRIDGE_SLOW_MS` moves
+  the threshold.
+
+  This exists because of a freeze the tester hit four times on 2026-09-05, each with the identical
+  stack: `ClearAudioPreview` → `Previewer::Reset` → `BMDChainFX::ResetHistory` →
+  `BMDAudioPluginImpl::ResetHistory+0x34`, waiting on a lock. Reading the library settles why that
+  matters — of the five functions in `libBMDAudioPlugins.so` that lock a plugin's own
+  `this+0x218`, two are `ResetHistory` and `PreProcess`, and `PreProcess` is the call under which a
+  hosted plugin runs. Resolve therefore holds that lock for the whole of our call, and the first
+  thing the interface does that touches the effect queues behind it.
+
+  **Nothing is aborted.** A VST3 call through yabridge cannot be cancelled once it is in flight.
+  The line buys the plugin's name, which no dump so far has carried.
+
+### Not fixed, and not claimed to be
+
+- **Whether the hosted plugin is the slow party is still unmeasured.** That is the point of the
+  watchdog: the next freeze either names a plugin or clears the bridge. The process was observed at
+  145% CPU while frozen, so it is a spin rather than a plain deadlock — where that CPU goes is not
+  known.
+
+---
+
 ## v0.2.11 — 2026-09-05
 
 **NixOS support, and a tag that Nix can actually build.**
