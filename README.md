@@ -340,6 +340,32 @@ has already missed the deadline twice over.
 flight, and pretending otherwise would trade a freeze for a corrupted plugin. What the line buys is
 the name of the plugin to remove, which no crash dump carries.
 
+## After a Resolve update
+
+**Every constant this bridge patches is a byte offset into one object**: the vtable of
+`BMDStereoDelay` inside `libBMDAudioPlugins.so`. Blackmagic rebuilds that class on every release,
+so a new Resolve can move a slot without changing anything a user would notice — and a bridge that
+patches a moved slot replaces the wrong method. That failure is quiet: drag and drop stops working,
+or a knob renames the effect.
+
+So check it instead of finding out:
+
+```sh
+tools/check-offsets.py
+```
+
+It needs nothing but `python3` — no binutils, no debugger, no build. It prints the Resolve version,
+every slot the bridge uses, and one of three verdicts each: **ok**, **MOVED** with the new offset,
+or **GONE** if the method was renamed or removed. Exit code 0 means nothing moved. A move prints
+the replacement constants ready to paste.
+
+`--dump` lists every slot in the vtable, `--no-version` skips the version scan, and
+`--emit-expected` regenerates the reference table from a Resolve you trust.
+
+**It does not check the member offsets** (`this+0x150` and the rest). Those are encoded inside
+instructions rather than in the symbol table, and finding them needs a disassembler. The script
+lists them at the end so a clean run is not mistaken for a full clearance.
+
 ## Settings between sessions
 
 **Your plugin settings live in the Resolve project.** On by default since v0.2.3, nothing to turn
