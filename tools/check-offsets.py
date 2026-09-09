@@ -551,6 +551,29 @@ def why_the_list_is_empty(path):
         except OSError:
             bridge = None
     if bridge and os.path.exists(bridge):
+        # Is the file at BMDPlugins.Path actually our bridge? Resolve asks it for
+        # GetBMDPluginInterface and falls back silently when the symbol is not there, so a stale
+        # copy, a truncated download or the scanner binary put in the wrong place all look like
+        # an empty list.
+        try:
+            exports = {sym[3] for sym in Elf(bridge).symbols()}
+        except (OSError, ValueError, struct.error):
+            exports = set()
+        if "GetBMDPluginInterface" not in exports:
+            problems += 1
+            print("    the installed file  DOES NOT EXPORT GetBMDPluginInterface, so it is not the")
+            print("                        bridge. Resolve asks for that symbol and falls back to")
+            print("                        its own library when it is missing.")
+        else:
+            try:
+                blob = open(bridge, "rb").read()
+            except OSError:
+                blob = b""
+            build = ("v0.2.10 or newer" if b"off by default since v0.2.10" in blob
+                     else "older than v0.2.10" if b"forwarding a locate" in blob else "unknown")
+            watchdog = "yes" if b"SLOW - " in blob else "no (older than v0.2.12)"
+            print(f"    the installed file  is the bridge, {build}, slow-block watchdog: {watchdog}")
+
         try:
             rows = bridge_dependencies(bridge)
         except (OSError, ValueError, struct.error):
