@@ -366,7 +366,11 @@ the replacement constants ready to paste.
 things hide every plugin: the stock interface reporting a version the bridge refuses to wrap — it
 forwards Resolve's own interface untouched rather than guess at a changed shape — a
 `BMDPlugins.Path` that an update rewrote out of `config-fairlight.dat`, and an empty scan cache.
-All three are read without starting Resolve.
+It also reads the size of one node in Resolve's plugin map — the bridge builds such a node by
+hand, so a changed size means every entry it inserts has the wrong shape — and checks that every
+library `libfxbridge.so` needs is present, because Resolve dlopens the bridge and falls back to
+its own library **without saying so** when that fails. All of it is read without starting Resolve,
+and a finding fails the run rather than only printing.
 
 **Member offsets are checked too**, where one function owns them: the channel counts at
 `this+0x150` and `this+0x158`, the per-plugin lock at `this+0x218` and the dirty flag. Those are

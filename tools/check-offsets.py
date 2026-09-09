@@ -449,6 +449,50 @@ def interface_version(path):
     return None
 
 
+
+def bridge_dependencies(bridge):
+    """Every library libfxbridge.so needs, and whether this machine has it.
+
+    Resolve dlopens the bridge and falls back to its own library WITHOUT SAYING SO when that
+    fails, and a missing dependency is the commonest way for it to fail on a machine the bridge
+    was not built on. The result looks exactly like an empty effect list.
+    """
+    elf = Elf(bridge)
+    dynamic = elf.by_label(".dynamic")
+    dynstr = elf.by_label(".dynstr")
+    if dynamic is None or dynstr is None:
+        return None
+    needed = []
+    for index in range(dynamic["size"] // 16):
+        tag, value = struct.unpack_from("<Qq", elf.data, dynamic["offset"] + index * 16)
+        if tag == 0:
+            break
+        if tag == 1:  # DT_NEEDED
+            start = dynstr["offset"] + value
+            needed.append(elf.data[start:elf.data.index(b"\0", start)].decode("utf-8", "replace"))
+
+    cache = {}
+    try:
+        listing = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=20)
+        for line in listing.stdout.splitlines():
+            if "=>" in line:
+                left, right = line.split("=>", 1)
+                cache[left.strip().split()[0]] = right.strip()
+    except (OSError, subprocess.SubprocessError):
+        cache = {}
+
+    search = ["/lib64", "/usr/lib64", "/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
+              "/usr/lib", "/lib"]
+    rows = []
+    for name in needed:
+        place = cache.get(name)
+        if place is None:
+            place = next((os.path.join(d, name) for d in search
+                          if os.path.exists(os.path.join(d, name))), None)
+        rows.append((name, place))
+    return rows
+
+
 def why_the_list_is_empty(path):
     """The things that hide every plugin, in the order they bite. Returns how many are wrong."""
     print("if the effect list is empty, these are the reasons, in order:")
@@ -496,6 +540,33 @@ def why_the_list_is_empty(path):
             problems += 0 if exists else 1
             print(f"    BMDPlugins.Path     {target}")
             print(f"                        {'the file is there' if exists else 'THAT FILE DOES NOT EXIST'}")
+
+    bridge = None
+    if os.path.exists(CONFIG):
+        try:
+            with open(CONFIG, encoding="utf-8", errors="replace") as handle:
+                for text in handle:
+                    if "BMDPlugins.Path" in text:
+                        bridge = text.split("=", 1)[-1].strip()
+        except OSError:
+            bridge = None
+    if bridge and os.path.exists(bridge):
+        try:
+            rows = bridge_dependencies(bridge)
+        except (OSError, ValueError, struct.error):
+            rows = None
+        if rows is None:
+            print("    bridge libraries    could not be read out of libfxbridge.so")
+        else:
+            gone = [name for name, place in rows if place is None]
+            if gone:
+                problems += 1
+                print(f"    bridge libraries    MISSING {', '.join(gone)}")
+                print("                        THIS EMPTIES THE LIST. Resolve dlopens the bridge and")
+                print("                        falls back to its own library without saying so when")
+                print("                        that fails.")
+            else:
+                print(f"    bridge libraries    all {len(rows)} present")
 
     node = node_size(path)
     if node is None:
