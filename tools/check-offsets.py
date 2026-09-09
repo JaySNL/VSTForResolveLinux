@@ -146,6 +146,19 @@ MEMBERS_NOT_CHECKED = [
 # interface whose shape changed is worse than not wrapping it. The visible result of the refusal is
 # an effect list with none of our plugins in it and a quiet line in the log, so it is worth reading
 # the number straight out of the library.
+# The size of one node in Resolve's plugin map.
+#
+# The bridge clones an entry into that map, so it has to build a node of exactly the right size.
+# The number is not declared anywhere: __emplace_unique_key_args loads it into %edi immediately
+# before `operator new`, so it is read from there. src/proxy.cpp says "the interface version gate
+# (100) guards this number against a Resolve update" - that assumption is what this check tests,
+# because 21.1 still reports 100.
+NODE_SYMBOL = ("_ZNSt3__16__treeINS_12__value_typeI7QStringN21BMDAudioPluginFactory16Plugin"
+               "DefinitionEEENS_19__map_value_compareIS2_S5_NS_4lessIS2_EELb1EEENS_9allocator"
+               "IS5_EEE25__emplace_unique_key_argsIS2_JNS_4pairIKS2_S4_EEEEENSE_INS_15__tree_"
+               "iteratorIS5_PNS_11__tree_nodeIS5_PvEElEEbEERKT_DpOT0_")
+EXPECTED_NODE_BYTES = 0x68
+
 INTERFACE_VERSION_SYMBOL = "_ZNK22BMDPluginInterfaceImpl25GetPluginInterfaceVersionEv"
 EXPECTED_INTERFACE_VERSION = 100
 
@@ -387,6 +400,30 @@ def check_members(path):
 
 
 
+def function_bytes(elf, symbol):
+    """The instruction bytes of one defined function, or b"" when it is not there."""
+    place = next(((sym[0], sym[1]) for sym in elf.symbols() if sym[3] == symbol), None)
+    if place is None or not place[1]:
+        return b""
+    address, length = place
+    for section in elf.sections:
+        if section["addr"] and section["addr"] <= address < section["addr"] + section["size"]:
+            start = section["offset"] + (address - section["addr"])
+            return elf.data[start:start + length]
+    return b""
+
+
+def node_size(path):
+    """The allocation size passed to operator new: `mov $imm32,%edi` then `call`."""
+    blob = function_bytes(Elf(path), NODE_SYMBOL)
+    if not blob:
+        return None
+    for index in range(len(blob) - 6):
+        if blob[index] == 0xbf and blob[index + 5] == 0xe8:
+            return int.from_bytes(blob[index + 1:index + 5], "little")
+    return None
+
+
 def interface_version(path):
     """The constant that GetPluginInterfaceVersion returns, read without running anything.
 
@@ -413,15 +450,18 @@ def interface_version(path):
 
 
 def why_the_list_is_empty(path):
-    """The three things that hide every plugin, in the order they bite."""
+    """The things that hide every plugin, in the order they bite. Returns how many are wrong."""
     print("if the effect list is empty, these are the reasons, in order:")
+    problems = 0
 
     version = interface_version(path)
     if version is None:
+        problems += 1
         print(f"    interface version   COULD NOT READ - {INTERFACE_VERSION_SYMBOL} is not in this")
         print("                        library or has a shape this cannot read. That alone would")
         print("                        empty the list.")
     elif version != EXPECTED_INTERFACE_VERSION:
+        problems += 1
         print(f"    interface version   {version}, and the bridge only wraps "
               f"{EXPECTED_INTERFACE_VERSION}.")
         print("                        THIS EMPTIES THE LIST. The bridge sees the mismatch and")
@@ -432,6 +472,7 @@ def why_the_list_is_empty(path):
         print(f"    interface version   {version}  ok")
 
     if not os.path.exists(CONFIG):
+        problems += 1
         print(f"    BMDPlugins.Path     {CONFIG} does not exist, so Resolve was never told to load")
         print("                        the bridge. Run build.sh, or add the line by hand.")
     else:
@@ -444,6 +485,7 @@ def why_the_list_is_empty(path):
         except OSError as problem:
             line = f"(could not read it: {problem})"
         if line is None:
+            problems += 1
             print("    BMDPlugins.Path     NOT SET in config-fairlight.dat. Resolve loads its own")
             print("                        library and the list holds only its own effects. An")
             print("                        update rewrites this file, so it is the first thing to")
@@ -451,8 +493,23 @@ def why_the_list_is_empty(path):
         else:
             target = line.split("=", 1)[-1].strip()
             exists = os.path.exists(target)
+            problems += 0 if exists else 1
             print(f"    BMDPlugins.Path     {target}")
             print(f"                        {'the file is there' if exists else 'THAT FILE DOES NOT EXIST'}")
+
+    node = node_size(path)
+    if node is None:
+        problems += 1
+        print("    map node size       COULD NOT READ - the map insert is not in this library under")
+        print("                        the name this looks for. The bridge builds a node by hand,")
+        print("                        so a changed name is a changed map.")
+    elif node != EXPECTED_NODE_BYTES:
+        problems += 1
+        print(f"    map node size       0x{node:x}, and the bridge builds 0x{EXPECTED_NODE_BYTES:x}.")
+        print("                        THIS EMPTIES THE LIST. Every entry the bridge inserts has")
+        print("                        the wrong shape, so nothing usable reaches the menu.")
+    else:
+        print(f"    map node size       0x{node:x}  ok")
 
     cache = os.path.expanduser("~/.local/share/BMDAudioPlugins/fxbridge-scan-cache.tsv")
     if not os.path.exists(cache):
@@ -465,6 +522,7 @@ def why_the_list_is_empty(path):
         except OSError:
             print("    scan cache          could not be read")
     print()
+    return problems
 
 
 def main():
@@ -555,7 +613,7 @@ def main():
                 print(f"    +0x{offset:03x}  {label}  (wanted {wanted})")
         print()
 
-    why_the_list_is_empty(path)
+    empty_list_problems = why_the_list_is_empty(path)
 
     print("member offsets, read out of the instructions that use them:")
     member_rows = check_members(path)
@@ -587,7 +645,8 @@ def main():
         for (offset, _), text in zip(sorted(slots.items()), human):
             print(f"  +0x{offset:03x}  {text}")
 
-    return 1 if (moved or missing or bad or size != EXPECTED_BYTES) else 0
+    return 1 if (moved or missing or bad or empty_list_problems
+                 or size != EXPECTED_BYTES) else 0
 
 
 if __name__ == "__main__":
