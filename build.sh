@@ -66,6 +66,28 @@ g++ -std=c++17 -O2 -Wall -Wextra \
     "$root/src/scan_main.cpp" "$root/src/plugin_scan.cpp" "$root/src/vst3_plugin.cpp" \
     "$root/src/host_thread.cpp" "$root/src/plugin_window.cpp" "$root/src/fx_categories.cpp" \
     -ldl -lX11 -lz -lpthread
+# The gate opener for DaVinci Resolve 21.1.
+#
+# 21.1 will not load an external Fairlight plugin library at all: FLPluginHost::Initialize asks
+# Resolve's core interface a yes/no question keyed on "Debug" and returns without reading
+# BMDPlugins.Path when the answer is no. This is a small LD_PRELOAD library that replaces that one
+# conditional jump with NOPs in memory, after Resolve has loaded the library and before it runs the
+# function. Nothing on disk is touched, and on 21.0 it finds no gate and does nothing.
+#
+# Plain C: it has no business linking the C++ runtime into Resolve's address space.
+cc -shared -fPIC -O2 -Wall -Wextra \
+    -o "$out/libfxbridge-gate.so" \
+    "$root/tools/gate/fxbridge-gate.c" -ldl
+cp "$out/libfxbridge-gate.so" "$install_dir/.libfxbridge-gate.so.new"
+chmod 755 "$install_dir/.libfxbridge-gate.so.new"
+mv -f "$install_dir/.libfxbridge-gate.so.new" "$install_dir/libfxbridge-gate.so"
+
+# And the launcher that uses it, copied from the repository rather than written here twice.
+cp "$root/tools/gate/resolve-with-fxbridge" "$install_dir/.resolve-with-fxbridge.new"
+chmod 755 "$install_dir/.resolve-with-fxbridge.new"
+mv -f "$install_dir/.resolve-with-fxbridge.new" "$install_dir/resolve-with-fxbridge"
+echo "built and installed $install_dir/libfxbridge-gate.so and resolve-with-fxbridge"
+
 cp "$out/fxbridge-scan" "$install_dir/.fxbridge-scan.new"
 chmod 755 "$install_dir/.fxbridge-scan.new"
 mv -f "$install_dir/.fxbridge-scan.new" "$install_dir/fxbridge-scan"

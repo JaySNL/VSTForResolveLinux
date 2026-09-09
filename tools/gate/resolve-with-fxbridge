@@ -1,0 +1,27 @@
+#!/bin/sh
+# Start DaVinci Resolve with the fxbridge gate opener preloaded.
+#
+# Needed from Resolve 21.1 on. FLPluginHost::Initialize asks Resolve's core interface a yes/no
+# question keyed on "Debug" before it reads BMDPlugins.Path, and on a public build the answer is no
+# - so no external Fairlight plugin library is loaded at all, and the effect list simply has none
+# of your plugins in it, with nothing in the log to say why.
+#
+# libfxbridge-gate.so replaces that one conditional jump with NOPs, in memory, after Resolve has
+# loaded the library and before it runs the function. Nothing on disk is modified, no root is
+# needed, and not using this script undoes it. On 21.0 and earlier it finds no gate and says so.
+#
+# RESOLVE=/path/to/resolve runs a different install.
+gate="${FXBRIDGE_GATE:-$HOME/.local/share/BMDAudioPlugins/libfxbridge-gate.so}"
+resolve="${RESOLVE:-/opt/resolve/bin/resolve}"
+
+[ -f "$gate" ] || { echo "missing $gate - run build.sh, or set FXBRIDGE_GATE" >&2; exit 1; }
+[ -x "$resolve" ] || { echo "missing $resolve - set RESOLVE to your install" >&2; exit 1; }
+
+# Appended, never replaced: whatever else you preload keeps working.
+if [ -n "$LD_PRELOAD" ]; then
+    LD_PRELOAD="$gate:$LD_PRELOAD"
+else
+    LD_PRELOAD="$gate"
+fi
+export LD_PRELOAD
+exec "$resolve" "$@"

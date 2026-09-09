@@ -49,6 +49,11 @@ bwrap --bind "$ROOT" / --dev /dev --proc /proc --tmpfs /tmp \
             src/scan_main.cpp src/plugin_scan.cpp src/vst3_plugin.cpp src/host_thread.cpp \
             src/plugin_window.cpp src/fx_categories.cpp \
             -ldl -lX11 -lz -lpthread
+        # The gate opener for Resolve 21.1. Plain C on purpose: it is preloaded into Resolve, and
+        # it has no business dragging the C++ runtime in there. Same rootfs, same glibc floor.
+        cc -shared -fPIC -O2 -w \
+            -o /out/libfxbridge-gate.so \
+            tools/gate/fxbridge-gate.c -ldl
         # Both checks run INSIDE the old rootfs, which is the only place they mean anything.
         if ldd -r /out/libfxbridge.so 2>&1 | grep -q "undefined symbol"; then
             echo "REFUSING - undefined symbols against glibc 2.31:" >&2
@@ -57,5 +62,8 @@ bwrap --bind "$ROOT" / --dev /dev --proc /proc --tmpfs /tmp \
         fi
         echo "floor: $(objdump -T /out/libfxbridge.so | grep -o "GLIBC[X]*_[0-9.]*" | sort -uV | tail -1) $(objdump -T /out/libfxbridge.so | grep -o "CXXABI_[0-9.]*" | sort -uV | tail -1)"
       '
-( cd "$OUT" && sha256sum libfxbridge.so fxbridge-scan > SHA256SUMS && cat SHA256SUMS )
+cp "$REPO/tools/gate/resolve-with-fxbridge" "$OUT/resolve-with-fxbridge" 2>/dev/null || true
+chmod 755 "$OUT/resolve-with-fxbridge" 2>/dev/null || true
+( cd "$OUT" && sha256sum libfxbridge.so fxbridge-scan libfxbridge-gate.so resolve-with-fxbridge \
+    > SHA256SUMS && cat SHA256SUMS )
 echo "built $TAG into $OUT"

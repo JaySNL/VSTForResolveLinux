@@ -7,6 +7,60 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.3.0 — 2026-09-09
+
+**DaVinci Resolve 21.1 support.**
+
+### The problem
+
+21.1 refuses to load any external Fairlight plugin library, silently. The tester reported an effect
+list with Resolve's own effects and none of his own; reproduced here in a sandbox against the 21.1
+installer without installing it. Identical configuration, identical bridge, only the Resolve binary
+differing: 21.0.0.0048 wrote 126 bridge lines and spent 1.1 s loading plugins, 21.1.0.0014 wrote
+none and spent 30 ms.
+
+**No offset moved.** All 32 vtable slots, the vtable size, the member offsets and the map node size
+are identical between the two — checked with `tools/check-offsets.py`, which was written for
+exactly this question and reported 32 of 32 on both.
+
+The cause is a new gate at the top of `FLPluginHost::Initialize()`, the function that reads
+`BMDPlugins.Path`. It asks Resolve's core interface a yes/no question keyed on `"Debug"` and
+returns without doing anything when the answer is no. It is a module gate that sits beside the
+edition check — the same virtual is called with `"Studio"`, `"ProxyGenerator"` and
+`"RemoteControl"` — and not a preference. A `Debug` row in `configs/Fairlight/FLDebugSettings.csv`
+was tried first and changes nothing, because that store is read by a different call that returns a
+map rather than a boolean.
+
+### Added
+
+- **`libfxbridge-gate.so`**, an `LD_PRELOAD` library that clears the gate in memory, and
+  **`resolve-with-fxbridge`**, the launcher that uses it. Nothing on disk is modified, no root is
+  needed, and not using the launcher undoes it.
+
+  It hooks `dlopen`, because `libFairlightPage.so` is not linked into `bin/resolve` — it is loaded
+  at runtime, so a constructor would run long before the function exists. It anchors on the symbol
+  `_ZN12FLPluginHost10InitializeEv` and requires the query and the gate to match exactly once
+  inside it: **the gate's raw bytes occur twice in the library**, so a signature search over the
+  whole file would be a coin toss. On any other shape it refuses and logs why.
+
+- **Gate detection in `tools/check-offsets.py`**, so which Resolve you have is a question you can
+  answer without starting it.
+
+### Measured
+
+| | 21.0.0.0048 | 21.1.0.0014 |
+|---|---|---|
+| without the preload | 48 plugins listed | nothing loaded |
+| with the preload | 48 plugins listed, "no gate" logged | 48 plugins listed |
+
+### Not claimed
+
+This clears one check that Blackmagic added. Whether they intended external Fairlight plugins to
+stay available on Linux is not something this repository knows, and nothing here has been asked of
+them.
+
+---
+
 ## v0.2.12 — 2026-09-09
 
 **A freeze now names the plugin that caused it.**

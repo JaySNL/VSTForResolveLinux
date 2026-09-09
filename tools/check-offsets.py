@@ -159,6 +159,19 @@ NODE_SYMBOL = ("_ZNSt3__16__treeINS_12__value_typeI7QStringN21BMDAudioPluginFact
                "iteratorIS5_PNS_11__tree_nodeIS5_PvEElEEbEERKT_DpOT0_")
 EXPECTED_NODE_BYTES = 0x68
 
+# Resolve 21.1's gate on external Fairlight plugins.
+#
+# FLPluginHost::Initialize reads BMDPlugins.Path and loads the library named there. From 21.1 it
+# first asks Resolve's core interface a yes/no question keyed on "Debug" and returns without doing
+# anything when the answer is no, which empties the effect list with no error anywhere. The gate is
+# `call *0x1d0(%rax)` -> `test %bpl,%bpl` -> `je`, and it is recognised here so a user is told which
+# Resolve they have and what it needs.
+GATE_LIBRARY = "libFairlightPage.so"
+GATE_SYMBOL = "_ZN12FLPluginHost10InitializeEv"
+GATE_TEST = bytes([0x40, 0x84, 0xed, 0x0f, 0x84])          # test %bpl,%bpl ; je rel32
+GATE_QUERY = bytes([0xff, 0x90, 0xd0, 0x01, 0x00, 0x00, 0x89, 0xc5])  # call *0x1d0(%rax) ; mov %eax,%ebp
+GATE_SCAN = 0x200
+
 INTERFACE_VERSION_SYMBOL = "_ZNK22BMDPluginInterfaceImpl25GetPluginInterfaceVersionEv"
 EXPECTED_INTERFACE_VERSION = 100
 
@@ -493,6 +506,29 @@ def bridge_dependencies(bridge):
     return rows
 
 
+
+def plugin_gate(audio_library):
+    """Report 21.1's gate on external plugin libraries: (state, detail)."""
+    path = os.path.join(os.path.dirname(audio_library), GATE_LIBRARY)
+    if not os.path.exists(path):
+        return "unknown", f"{path} is not there, so the gate could not be checked"
+    try:
+        elf = Elf(path)
+        blob = function_bytes(elf, GATE_SYMBOL)[:GATE_SCAN]
+    except (OSError, ValueError, struct.error):
+        return "unknown", f"{path} could not be read"
+    if not blob:
+        return "unknown", f"{GATE_SYMBOL} is not in {GATE_LIBRARY}"
+    gates = blob.count(GATE_TEST)
+    queries = blob.count(GATE_QUERY)
+    if gates == 0:
+        return "open", "no gate - this Resolve loads an external plugin library on its own"
+    if gates == 1 and queries == 1 and blob.find(GATE_QUERY) < blob.find(GATE_TEST):
+        return "closed", f"the gate is at {GATE_SYMBOL}+0x{blob.find(GATE_TEST) + 3:x}"
+    return "changed", (f"{gates} gate and {queries} query matches - the shape is not the one the "
+                       f"preload knows, and it will refuse rather than guess")
+
+
 def why_the_list_is_empty(path):
     """The things that hide every plugin, in the order they bite. Returns how many are wrong."""
     print("if the effect list is empty, these are the reasons, in order:")
@@ -590,6 +626,19 @@ def why_the_list_is_empty(path):
                 print("                        that fails.")
             else:
                 print(f"    bridge libraries    all {len(rows)} present")
+
+    state, detail = plugin_gate(path)
+    if state == "open":
+        print(f"    21.1 plugin gate    not present  ({detail})")
+    elif state == "closed":
+        problems += 1
+        print(f"    21.1 plugin gate    CLOSED - {detail}.")
+        print("                        THIS EMPTIES THE LIST. Resolve 21.1 refuses to load any")
+        print("                        external Fairlight plugin library. Start Resolve through")
+        print("                        ~/.local/share/BMDAudioPlugins/resolve-with-fxbridge, which")
+        print("                        preloads libfxbridge-gate.so and clears the check in memory.")
+    else:
+        print(f"    21.1 plugin gate    {state} - {detail}")
 
     node = node_size(path)
     if node is None:
