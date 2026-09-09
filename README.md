@@ -362,9 +362,12 @@ the replacement constants ready to paste.
 `--dump` lists every slot in the vtable, `--no-version` skips the version scan, and
 `--emit-expected` regenerates the reference table from a Resolve you trust.
 
-**It does not check the member offsets** (`this+0x150` and the rest). Those are encoded inside
-instructions rather than in the symbol table, and finding them needs a disassembler. The script
-lists them at the end so a clean run is not mistaken for a full clearance.
+**Member offsets are checked too**, where one function owns them: the channel counts at
+`this+0x150` and `this+0x158`, the per-plugin lock at `this+0x218` and the dirty flag. Those are
+encoded inside instructions rather than named in the symbol table, so the script scans the bytes of
+the function that writes each one and reports whether the number is still there. Six offsets that
+no single function owns stay unchecked, and the script lists them so a clean run is not mistaken
+for a full clearance.
 
 ## Settings between sessions
 

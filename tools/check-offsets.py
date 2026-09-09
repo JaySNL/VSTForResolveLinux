@@ -112,12 +112,27 @@ EXPECTED_BYTES = 0xab8
 
 # Read out of `src/proxy.cpp`, and NOT checked here. Each is a byte offset into the object rather
 # than into the vtable, so it is encoded inside an instruction and only a disassembler finds it.
+# Member offsets: byte offsets into the OBJECT rather than into the vtable, so they are encoded
+# inside instructions and no symbol names them. They are read here by scanning the bytes of the
+# one function that is known to touch each, for a displacement used against a register base.
+#
+# This is a pattern scan, not a disassembler, so it can list a displacement that belongs to some
+# other instruction in the same function. That is why the whole found set is printed: the check is
+# "is the number the bridge uses still in there", and a human reads the rest.
+#
+# symbol -> (offsets the bridge uses, what they are)
+MEMBER_CHECKS = [
+    ("_ZN18BMDAudioPluginImpl18UpdateChannelCountEii", [0x150, 0x158],
+     "input and output channel counts"),
+    ("_ZN18BMDAudioPluginImpl12ResetHistoryEb", [0x218, 0x250],
+     "the per-plugin lock, and the flag that says whether to take it"),
+    ("_ZN11AudioPlugin8SetDirtyEb", [0x99], "the dirty flag"),
+]
+
+# Still not covered by anything here. Each needs a disassembler or a run.
 MEMBERS_NOT_CHECKED = [
-    (0x150, "input channel count", "BMDAudioPluginImpl::UpdateChannelCount writes it"),
-    (0x158, "output channel count", "BMDAudioPluginImpl::UpdateChannelCount writes it"),
-    (0x169, "bypass flag", "read every block"),
-    (0x99, "dirty flag", "SetDirty writes it"),
-    (0x40, "AudioPlugin parent", "the base subobject"),
+    (0x169, "bypass flag", "read every block, and no single function owns it"),
+    (0x40, "AudioPlugin parent", "a base subobject, not an instruction operand"),
     (0x550, "name record", "the label in the effect list"),
     (0x360, "resource tree", "the panel"),
     (0x3a8, "panel width", "the panel"),
@@ -299,6 +314,65 @@ def read_vtable(path):
     return size, slots
 
 
+
+def displacements(blob):
+    """Every disp8/disp32 used against a register base in this run of bytes.
+
+    Not a decoder. It matches the handful of opcodes that carry a member access in this code -
+    mov, lea, cmp and the immediate forms - and reads the displacement that follows their ModRM
+    byte. Over-reporting is acceptable and under-reporting is not, so the caller prints the set.
+    """
+    opcodes = {0x88, 0x89, 0x8a, 0x8b, 0x8d, 0x80, 0x81, 0x83, 0xc6, 0xc7, 0x38, 0x39, 0x3a, 0x3b}
+    found = set()
+    index = 0
+    while index < len(blob) - 6:
+        cursor = index
+        if 0x40 <= blob[cursor] <= 0x4f:  # REX
+            cursor += 1
+        if blob[cursor] in (0x0f,):       # two-byte opcode
+            cursor += 1
+        if blob[cursor] not in opcodes:
+            index += 1
+            continue
+        cursor += 1
+        modrm = blob[cursor]
+        mod, rm = modrm >> 6, modrm & 7
+        if rm == 4:      # SIB byte, a base+index form - skipped, none of ours use it
+            index += 1
+            continue
+        cursor += 1
+        if mod == 1:
+            found.add(blob[cursor])
+        elif mod == 2:
+            found.add(int.from_bytes(blob[cursor:cursor + 4], "little"))
+        index += 1
+    return {d for d in found if 0x08 <= d <= 0x1000}
+
+
+def check_members(path):
+    elf = Elf(path)
+    symbols = {s[3]: (s[0], s[1]) for s in elf.symbols() if s[2] == STT_FUNC}
+    # An address is a virtual address; the bytes live at the file offset of the section holding it.
+    def bytes_at(address, length):
+        for section in elf.sections:
+            if section["addr"] and section["addr"] <= address < section["addr"] + section["size"]:
+                start = section["offset"] + (address - section["addr"])
+                return elf.data[start:start + length]
+        return b""
+
+    rows = []
+    for symbol, wanted, label in MEMBER_CHECKS:
+        place = symbols.get(symbol)
+        if place is None or not place[1]:
+            rows.append((symbol, label, wanted, None, "the function is not in this library"))
+            continue
+        found = displacements(bytes_at(place[0], place[1]))
+        missing = [w for w in wanted if w not in found]
+        rows.append((symbol, label, wanted, found, "" if not missing else
+                     "MISSING " + ", ".join(f"0x{m:x}" for m in missing)))
+    return rows
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
@@ -387,8 +461,25 @@ def main():
                 print(f"    +0x{offset:03x}  {label}  (wanted {wanted})")
         print()
 
-    print("NOT CHECKED by this script - member offsets, which live inside instructions and need a")
-    print("disassembler. A clean run above does not clear these:")
+    print("member offsets, read out of the instructions that use them:")
+    member_rows = check_members(path)
+    bad = 0
+    for symbol, label, wanted, found, note in member_rows:
+        names = ", ".join(f"0x{w:x}" for w in wanted)
+        if found is None:
+            bad += 1
+            print(f"    {label:48} {names:14} COULD NOT CHECK - {note}")
+        elif note:
+            bad += 1
+            print(f"    {label:48} {names:14} {note}")
+            print(f"        the function uses: "
+                  f"{', '.join('0x%x' % d for d in sorted(found)) or '(nothing found)'}")
+        else:
+            print(f"    {label:48} {names:14} ok")
+    print()
+
+    print("STILL not checked - no single function owns these, or they are not instruction")
+    print("operands at all. A clean run above does not clear them:")
     for offset, label, why in MEMBERS_NOT_CHECKED:
         print(f"    this+0x{offset:03x}  {label:24} ({why})")
 
@@ -400,7 +491,7 @@ def main():
         for (offset, _), text in zip(sorted(slots.items()), human):
             print(f"  +0x{offset:03x}  {text}")
 
-    return 1 if (moved or missing or size != EXPECTED_BYTES) else 0
+    return 1 if (moved or missing or bad or size != EXPECTED_BYTES) else 0
 
 
 if __name__ == "__main__":
