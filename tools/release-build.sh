@@ -35,7 +35,8 @@ bwrap --bind "$ROOT" / --dev /dev --proc /proc --tmpfs /tmp \
             -I third_party/dpf/distrho/src/travesty \
             -I /usr/include/carla/includes \
             -o /out/libfxbridge.so \
-            src/proxy.cpp src/carla_host.cpp src/vst2_plugin.cpp src/clap_plugin.cpp \
+            src/proxy.cpp src/chain_lock_fix.cpp src/carla_host.cpp src/vst2_plugin.cpp \
+            src/clap_plugin.cpp \
             src/host_thread.cpp src/vst3_plugin.cpp src/plugin_scan.cpp src/plugin_state.cpp \
             src/fx_categories.cpp src/plugin_window.cpp \
             -ldl -lX11 -lz -lpthread

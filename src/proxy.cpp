@@ -25,6 +25,7 @@
 // faulting, so a wrong guess about a pointer cannot take Resolve down.
 
 #include "carla_host.h"
+#include "chain_lock_fix.h"
 #include "plugin_instance.h"
 #include "fx_categories.h"
 #include "plugin_scan.h"
@@ -4520,6 +4521,10 @@ extern "C" void* GetBMDPluginInterface()
         *reinterpret_cast<void***>(stock) = &g_vtable[2];
         g_interface = stock;
         PatchDelayClassVtable();
+        // Resolve's own lock order inversion, repaired before a single plugin is loaded. It is
+        // not our bug and it is not our lock, but our plugins are what make it reachable:
+        // docs/freeze-deadlock.md.
+        InstallChainLockFix(g_stock_handle, Log);
         LoadConfiguredPlugin();
 
         Log("our vtable installed, version reads %d",

@@ -7,6 +7,85 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.3.0.1 — 2026-09-12
+
+**The Fairlight freeze is a deadlock in Resolve, and this release repairs the lock order.**
+
+### What was measured
+
+A tester's frozen Resolve was captured live with `thread apply all bt`: 468 threads, four of them
+waiting on a mutex, none of them running audio. Two of those four are the whole story.
+
+```
+Thread 1 "GUI Thread":                      Thread 450 "resolve-real":
+  BMDAudioPluginImpl::ResetHistory  wants     BMDChainFX::Process          wants
+  BMDChainFX::ResetHistory          holds     BMDAudioPluginImpl::PreProcess holds
+  Previewer::UnPatch()                        FxInst::Execute()
+  FLInterfaceImp::ClearAudioPreview()         ...LoadFairlightAudioSamples...
+  QGraphicsScene::mouseMoveEvent(...)
+```
+
+Disassembly of `libBMDAudioPlugins.so` names the two mutexes and the order each path takes them in:
+
+| Function | Takes first | Then wants |
+|---|---|---|
+| `BMDChainFX::ResetHistory` | `this+0x568` | `this+0x218` |
+| `BMDAudioPluginImpl::PreProcess` | `this+0x218` | `this+0x568` |
+
+Same object, opposite order. Each thread waits for the lock the other holds, and nothing times out.
+The trigger is a mouse drag on the timeline while audio runs.
+
+### What the bridge has to do with it
+
+The inversion is Blackmagic's and needs no third-party plugin. What hosting changes is how long the
+audio thread stands inside it: `PreProcess` holds `0x218` across the vtable dispatch to the hosted
+plugin, so a plugin bridged through yabridge holds it for a Wine round trip instead of for a few
+microseconds. That turns a rare race into a handoff you hit every session.
+
+### The fix
+
+`BMDChainFX::ResetHistory` is wrapped so it takes `this+0x218` first. Both mutexes are
+`std::recursive_mutex`, so the second take costs a counter increment. Every path on both threads
+then agrees on the order and the inversion is gone. The patch only ever *adds* a lock: it cannot
+introduce a data race, and it costs no latency.
+
+Off with `FXBRIDGE_LOCKFIX=0`.
+
+Every offset is read out of the library's own instructions, never written down, and four checks
+must pass before anything is patched. A build that moved a member still works; a build that
+changed shape is left alone and says so in the log. `tools/lockfix-check.cpp` runs the same
+detection against an installed Resolve without starting it.
+
+### What is verified and what is not
+
+**Verified** on 21.1.0.0014: the offsets read as `+0x218`, `+0x250` and `+0x568`, the thunk adjusts
+32, the wrapper lands in two vtable slots and one thunk slot, and Resolve starts and runs with it.
+The 21.0.4 layout is identical for this function, checked by offset arithmetic against the tester's
+stack.
+
+**Not verified:** that a `ResetHistory` has travelled through the wrapper, and that a session which
+used to freeze no longer does. Both need a project with a hosted plugin and the drag that triggers
+it. The wrapper logs once the first time it runs:
+
+```
+[fxbridge] lockfix: a thunked ResetHistory came through the wrapper, mutex taken first
+```
+
+### Two earlier readings, corrected
+
+**"A slow plugin holds the lock."** Wrong. The v0.2.12 watchdog logged no slow block at all in
+134 KB of log. The audio thread never reached the plugin; it blocked before the call.
+
+**"It is a spin, not a deadlock, because the process sits at 145%."** Wrong. The `%CPU` column of
+`ps` is total CPU divided by elapsed time over the life of the process. Every relevant thread is in
+a futex sleep at 0%.
+
+The full analysis is `docs/freeze-deadlock.md`. `docs/async-process.md` drafts the other option -
+running the hosted plugin off the audio thread - which is not built, because it costs a block of
+latency and this does not.
+
+---
+
 ## v0.3.0 — 2026-09-09
 
 **DaVinci Resolve 21.1 support.**
