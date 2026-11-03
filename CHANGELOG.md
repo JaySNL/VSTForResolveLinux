@@ -7,6 +7,50 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.3.1.1 — 2026-11-03 (fixed offsets, Resolve 21.1.2 only)
+
+**v0.3.1 with its nine member offsets as constants for 21.1.2.0010, and without the code that
+reads them out of Resolve. For anyone who does not want to run v0.3.1 while its antivirus
+detection stands.** This is a side release on the `fixed-21.1.2` branch; v0.3.1 stays the main
+line.
+
+### Why it exists
+
+Microsoft Defender's machine-learning engine flags v0.3.1's `libfxbridge.so` as
+`Trojan:Script/Wacatac.C!ml`; no other engine on VirusTotal does, and v0.3.0.1 was not flagged. It
+is a false positive, reported to Microsoft, and checked here as follows:
+
+- the release binary rebuilds bit-identically from tag v0.3.1
+- against v0.3.0.1 it adds exactly `src/member_layout.cpp`: one new import (`dladdr1`), four new
+  functions, 56 new strings, all from that file; of 704 functions both builds share, only the 7
+  that use the new offsets changed
+- the build toolchain's 27 Ubuntu packages pass `dpkg --verify`
+
+What v0.3.1 added, and what most plausibly trips the model, is that it looks up five functions in
+Resolve's `libBMDAudioPlugins.so` and scans their machine code for instruction patterns. That is
+how it survives Resolve updates; it is also what cheat loaders and malware do to find code.
+
+### What changed against v0.3.1
+
+`src/member_layout.cpp` returns the 21.1.2 table from v0.3.1's entry below as constants. No symbol
+lookup, no `dladdr1`, no reading of Resolve's code, no instruction-pattern strings. Everything
+else is v0.3.1 unchanged, including the lock fix, which still reads its two offsets the way it did
+in v0.3.0.1. The decoder test (`test/member_layout_test.cpp`, `tools/member-layout-test.sh`) is not
+on this branch, since there is no decoder to test.
+
+### The cost
+
+**It is right for exactly one Resolve: 21.1.2.** Every one of these offsets moved by eight bytes
+between 21.1.0 and 21.1.2, and on any other Resolve this build reads and writes at the wrong place
+- the panel step writes through one of them. It cannot tell which Resolve it is in, because that
+is the part that was taken out.
+
+- Resolve 21.1.0 and earlier: v0.3.0.1.
+- Resolve 21.1.2: v0.3.1, or this.
+- Anything newer: v0.3.1 or later, never this.
+
+The bridge log says which build is running: `layout: FIXED for Resolve 21.1.2 (v0.3.1.1)`.
+
 ## v0.3.1 — 2026-11-03
 
 **DaVinci Resolve 21.1.2 support. The bridge now reads the stock effect's member offsets out of
