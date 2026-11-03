@@ -7,6 +7,111 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.3.1 — 2026-11-03
+
+**DaVinci Resolve 21.1.2 support. The bridge now reads the stock effect's member offsets out of
+Resolve's own instructions when it loads, instead of carrying them as constants.**
+
+### The problem
+
+A tester on 21.1.2 reported the bridge broken after updating. Checked here against the 21.1.2
+installer without installing it: `libBMDAudioPlugins.so` and `libFairlightPage.so` taken straight
+out of `DaVinci_Resolve_Studio_21.1.2_Linux.run` with `7z`, version string `21.1.2.0010`.
+
+What did NOT change, measured against 21.1.0.0014:
+
+- all 32 vtable slots the bridge patches, and the vtable's size (0xab8)
+- the map node size (0x68)
+- the 21.1 plugin gate: `FLPluginHost::Initialize` is instruction-for-instruction the same up to
+  and past the gate, so `libfxbridge-gate.so` patches it as before
+- `AudioPluginPreset`: `AudioPlugin::StorePreset` and `LoadPreset` are unchanged, and the pointer
+  and length at +0x00 and +0x08 are all the bridge relies on
+
+What did: **`AudioPlugin` gained eight bytes between +0x50 and +0x68, and every member after that
+point moved by eight.** Matched instruction by instruction across all 188 exported
+`AudioPlugin`, `BMDAudioPluginImpl` and `BMDStereoDelay` methods, whose instruction sequences are
+otherwise identical. The base sub-object at +0xe8 moved to +0xf0 with them (`_ZThn232_` thunks are
+now `_ZThn240_`); the ones at +0x10 and +0x20 did not move.
+
+| Member | 21.1.0 | 21.1.2 | Read out of |
+|---|---|---|---|
+| input / output channel counts | 0x150 / 0x158 | 0x158 / 0x160 | `BMDAudioPluginImpl::UpdateChannelCount` |
+| bypass flag | 0x169 | 0x171 | `BMDAudioPluginImpl::Bypass(bool)` |
+| dirty flag | 0x99 | 0xa1 | `AudioPlugin::SetDirty` |
+| AudioPlugin parent | 0x40 | 0x40 | `AudioPlugin::SetDirty` |
+| name record | 0x550 | 0x558 | `BMDAudioPlugin<BMDStereoDelay>::GetEffectName` |
+| resource tree | 0x360 | 0x368 | `BMDStereoDelay::GenerateUserInterface` |
+| panel width / height | 0x3a8 / 0x3ac | 0x3b0 / 0x3b4 | `BMDStereoDelay::GenerateUserInterface` |
+| per-plugin lock / its flag | 0x218 / 0x250 | 0x220 / 0x258 | `ResetHistory`, `PreProcess` |
+
+v0.3.0.1 on 21.1.2 reads every one of those eight bytes short. Most are reads. The panel step is
+not: it writes a stock vector's `end` at tree+0x18, which on 21.1.2 is inside a different field.
+What the tester saw on screen is not known here; this is what the code does with those numbers.
+
+### The fix
+
+`src/member_layout.cpp` reads each member at load out of the function that owns it, as an exact
+instruction form (register encodings included) that must appear exactly once - or exactly twice
+for the panel's width and height - in that function's bytes, sized by its own dynamic symbol
+entry. Two cross-checks catch a match that is something else: the output count must sit 8 bytes
+after the input count, and the panel height 4 bytes after the width. If any member fails, the
+bridge logs which one and forwards Resolve's stock interface untouched, as it already does for an
+unexpected interface version. Resolve then starts with its own effects and none of yours, instead
+of with a bridge writing on a guess.
+
+The lock fix already worked this way (`src/chain_lock_fix.cpp`, since v0.3.0.1). On 21.1.2 it reads
+0x220 and 0x258 from both halves of the inversion, so it agrees with itself and patches as before.
+
+The bridge log now has one line per start naming every offset it read:
+
+```
+layout: channels +0x158/+0x160, bypass +0x171, dirty +0xa1, parent +0x40, name +0x558, panel tree +0x368 size +0x3b0/+0x3b4
+```
+
+### Checking a new Resolve
+
+- `tools/check-offsets.py` decodes the members by the same rules and prints what the bridge will
+  read, `ok, moved from ...` where a member moved and `REFUSED` where the bridge would refuse. A
+  moved member no longer fails the run; a refused one does.
+- `tools/member-layout-test.sh LIBRARY <nine offsets>` compiles `src/member_layout.cpp` - the
+  shipped code, not a copy - and runs it over the functions cut out of a library file.
+
+**Correction to v0.2.12 and later:** check-offsets listed six members as owned by no single
+function (bypass, parent, name record, resource tree, panel width and height). Each one has an
+owner, named in the table above, and all six are now read and checked.
+
+### Nix
+
+`flake.nix` compiled the plugin without `src/chain_lock_fix.cpp`, which v0.3.0.1 added. A
+Nix-built bridge then carries an undefined `InstallChainLockFix`, and Resolve's `dlopen` of it
+fails - which Resolve answers by loading its own library, silently. Both files are in the list
+now. **Not measured:** no Nix build was run here; this is read from the source list.
+
+### Verified
+
+- `tools/member-layout-test.sh` passes on 21.1.0.0014 and 21.1.2.0010 with the offsets in the
+  table, and fails on 21.1.2 when given the 21.1.0 numbers (8 members wrong).
+- `ReadMemberLayout` run in memory (`dlopen`, `dlsym`, `dladdr1`) against both stock libraries
+  reads the same numbers.
+- `tools/check-offsets.py` reports both builds as above.
+
+- Inside Resolve 21.1.2.0010, three sessions on the development machine: the `layout:` line names
+  every 21.1.2 offset, the lock fix patches at +0x220/+0x258, 122 plugins are listed, six
+  instances claimed and named themselves through the record at +0x558, channel counts read 1 on
+  mono plugins and 2 on a stereo one, the panel strip found 19 items (as every 21.1.0 session
+  did), editors open and take knob changes, and a project save stores the hosted state.
+
+**Not measured:** the bridge's own dirty-flag write at +0xa1 (it runs only with
+`FXBRIDGE_STATE_STORE=1`), and bypass at +0x171 by ear.
+
+**Seen once, not fixed here:** in the first session, opening pp-track's editor crashed Resolve
+inside the NVIDIA driver, under pp-track's own `glDrawArrays`, on the bridge's timer thread. It did
+not recur in the next two sessions with the same editor. It is the timer-thread GUI crash recorded
+on 21.0 in `docs/2026-08-25-what-changed.md` (family B), so it predates both 21.1.2 and this
+change. Ruled out so far: the thread split alone and pp-track with this driver alone (a standalone
+CLAP host survives every thread layout), and CEF's ANGLE libraries (new in 21.1.2, but not loaded
+inside Resolve).
+
 ## v0.3.0.1 — 2026-09-12
 
 **The Fairlight freeze is a deadlock in Resolve, and this release repairs the lock order.**

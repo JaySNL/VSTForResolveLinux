@@ -419,12 +419,25 @@ library `libfxbridge.so` needs is present, because Resolve dlopens the bridge an
 its own library **without saying so** when that fails. All of it is read without starting Resolve,
 and a finding fails the run rather than only printing.
 
-**Member offsets are checked too**, where one function owns them: the channel counts at
-`this+0x150` and `this+0x158`, the per-plugin lock at `this+0x218` and the dirty flag. Those are
-encoded inside instructions rather than named in the symbol table, so the script scans the bytes of
-the function that writes each one and reports whether the number is still there. Six offsets that
-no single function owns stay unchecked, and the script lists them so a clean run is not mistaken
-for a full clearance.
+**Member offsets are not constants**: the channel counts, the bypass and dirty flags, the
+per-plugin lock, the effect's name record and the panel. They are encoded inside instructions
+rather than named in the symbol table, and 21.1.2 moved every one of them by eight bytes. So the
+bridge reads each one out of the function that owns it when it loads, and refuses — forwarding
+Resolve's own interface untouched — if any one is not where its instruction says. The bridge log
+names every offset it read, on a line starting `layout:`.
+
+The script decodes them by the same rules and prints what the bridge will read: **ok**, **ok,
+moved from** the 21.1.0 number, or **REFUSED**, which fails the run. To run the bridge's own
+decoding code over a library file, without Resolve:
+
+```sh
+tools/member-layout-test.sh /opt/resolve/libs/libBMDAudioPlugins.so 0x150 0x158 0x169 0x99 0x40 0x550 0x360 0x3a8 0x3ac
+```
+
+A new Resolve can be checked before installing it: `7z x -oOUT DaVinci_Resolve_Studio_X_Linux.run
+libs/libBMDAudioPlugins.so libs/libFairlightPage.so`, then give either tool
+`OUT/libs/libBMDAudioPlugins.so`. check-offsets reads the gate from the `libFairlightPage.so`
+beside it; pass it `--no-version` too, because the version is read from the installed Resolve.
 
 ## Settings between sessions
 

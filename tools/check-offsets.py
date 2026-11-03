@@ -14,9 +14,10 @@ python3: no binutils, no debugger, no index, no build.
     tools/check-offsets.py /path/to/libBMDAudioPlugins.so    # any other copy
     tools/check-offsets.py --dump                            # every slot, not just ours
 
-What it does NOT check: the member offsets (`this+0x150`, `this+0x218` and the rest). Those live
-in instruction encodings, not in the symbol table, and finding them needs a disassembler. They are
-listed at the end so nobody reads a clean run as "everything is verified".
+The member offsets (`this+0x150`, `this+0x218` and the rest) are not constants any more: the
+bridge reads them out of the library's instructions when it loads (src/member_layout.cpp and
+src/chain_lock_fix.cpp). This script decodes them by the same rules and reports what the bridge
+will read, and whether it will refuse to load - 21.1.2 moved every one of them by eight.
 """
 
 import bisect
@@ -110,34 +111,41 @@ EXPECTED = {
 # The whole vtable object is copied, so its size is a constant too.
 EXPECTED_BYTES = 0xab8
 
-# Read out of `src/proxy.cpp`, and NOT checked here. Each is a byte offset into the object rather
-# than into the vtable, so it is encoded inside an instruction and only a disassembler finds it.
 # Member offsets: byte offsets into the OBJECT rather than into the vtable, so they are encoded
-# inside instructions and no symbol names them. They are read here by scanning the bytes of the
-# one function that is known to touch each, for a displacement used against a register base.
+# inside instructions and no symbol names them. The bridge reads each one at load out of the one
+# function that owns it, as an exact instruction form that must appear exactly as often as listed
+# here - src/member_layout.cpp. This table is that file's, decoded the same way, so a run says what
+# the bridge will read before Resolve is started. Keep the two in step.
 #
-# This is a pattern scan, not a disassembler, so it can list a displacement that belongs to some
-# other instruction in the same function. That is why the whole found set is printed: the check is
-# "is the number the bridge uses still in there", and a human reads the rest.
-#
-# symbol -> (offsets the bridge uses, what they are)
-MEMBER_CHECKS = [
-    ("_ZN18BMDAudioPluginImpl18UpdateChannelCountEii", [0x150, 0x158],
-     "input and output channel counts"),
-    ("_ZN18BMDAudioPluginImpl12ResetHistoryEb", [0x218, 0x250],
-     "the per-plugin lock, and the flag that says whether to take it"),
-    ("_ZN11AudioPlugin8SetDirtyEb", [0x99], "the dirty flag"),
+# (what it is, owning function, bytes up to and including ModRM, displacement bytes, the values in
+# 21.1.0 - one per match the bridge requires)
+MEMBER_FORMS = [
+    ("input channels", "_ZN18BMDAudioPluginImpl18UpdateChannelCountEii",
+     bytes([0x48, 0x89, 0x83]), 4, [0x150]),
+    ("output channels", "_ZN18BMDAudioPluginImpl18UpdateChannelCountEii",
+     bytes([0x48, 0x89, 0xb3]), 4, [0x158]),
+    ("bypass flag", "_ZN18BMDAudioPluginImpl6BypassEb",
+     bytes([0x40, 0x88, 0xb7]), 4, [0x169]),
+    ("dirty flag", "_ZN11AudioPlugin8SetDirtyEb",
+     bytes([0x40, 0x88, 0xb7]), 4, [0x99]),
+    ("AudioPlugin parent", "_ZN11AudioPlugin8SetDirtyEb",
+     bytes([0x48, 0x8b, 0x7f]), 1, [0x40]),
+    ("name record", "_ZNK14BMDAudioPluginI14BMDStereoDelayE13GetEffectNameEv",
+     bytes([0x48, 0x8b, 0x86]), 4, [0x550]),
+    ("resource tree", "_ZN14BMDStereoDelay21GenerateUserInterfaceEv",
+     bytes([0x4d, 0x8d, 0xb5]), 4, [0x360]),
+    ("panel width and height", "_ZN14BMDStereoDelay21GenerateUserInterfaceEv",
+     bytes([0xf3, 0x41, 0x0f, 0x11, 0x85]), 4, [0x3a8, 0x3ac]),
 ]
 
-# Still not covered by anything here. Each needs a disassembler or a run.
-MEMBERS_NOT_CHECKED = [
-    (0x169, "bypass flag", "read every block, and no single function owns it"),
-    (0x40, "AudioPlugin parent", "a base subobject, not an instruction operand"),
-    (0x550, "name record", "the label in the effect list"),
-    (0x360, "resource tree", "the panel"),
-    (0x3a8, "panel width", "the panel"),
-    (0x3ac, "panel height", "the panel"),
+# The lock fix reads its two offsets the same way, from the prologue of each half of the
+# inversion, and refuses unless both halves agree - src/chain_lock_fix.cpp.
+# (function, `this` register as ModRM r/m, bytes scanned)
+LOCK_READERS = [
+    ("_ZN18BMDAudioPluginImpl12ResetHistoryEb", 7, 0x60),
+    ("_ZN18BMDAudioPluginImpl10PreProcessEPPflm", 3, 0x80),
 ]
+LOCK_IN_21_1_0 = [0x218, 0x250]
 
 # The gate that empties the effect list.
 #
@@ -354,61 +362,79 @@ def read_vtable(path):
 
 
 
-def displacements(blob):
-    """Every disp8/disp32 used against a register base in this run of bytes.
+def find_form(blob, lead, disp_bytes):
+    """Every displacement `lead` carries in `blob`, trying every byte offset - FindAll() in
+    src/member_layout.cpp. A false match inside another instruction then shows up as one match
+    too many, and the bridge refuses."""
+    found = []
+    for at in range(len(blob) - len(lead) - disp_bytes + 1):
+        if blob[at:at + len(lead)] == lead:
+            raw = blob[at + len(lead):at + len(lead) + disp_bytes]
+            found.append(int.from_bytes(raw, "little", signed=True))
+    return found
 
-    Not a decoder. It matches the handful of opcodes that carry a member access in this code -
-    mov, lea, cmp and the immediate forms - and reads the displacement that follows their ModRM
-    byte. Over-reporting is acceptable and under-reporting is not, so the caller prints the set.
-    """
-    opcodes = {0x88, 0x89, 0x8a, 0x8b, 0x8d, 0x80, 0x81, 0x83, 0xc6, 0xc7, 0x38, 0x39, 0x3a, 0x3b}
-    found = set()
-    index = 0
-    while index < len(blob) - 6:
-        cursor = index
-        if 0x40 <= blob[cursor] <= 0x4f:  # REX
-            cursor += 1
-        if blob[cursor] in (0x0f,):       # two-byte opcode
-            cursor += 1
-        if blob[cursor] not in opcodes:
-            index += 1
+
+def first_disp32(blob, opcode, base):
+    """The first `opcode disp32(%base)`, any REX - FindLea() and FindMovByte() in
+    src/chain_lock_fix.cpp."""
+    room = 7 if opcode == 0x8d else 6
+    for at in range(len(blob) - room + 1):
+        op = at + (1 if 0x40 <= blob[at] <= 0x4f else 0)
+        if op + 6 > len(blob):
             continue
-        cursor += 1
-        modrm = blob[cursor]
-        mod, rm = modrm >> 6, modrm & 7
-        if rm == 4:      # SIB byte, a base+index form - skipped, none of ours use it
-            index += 1
-            continue
-        cursor += 1
-        if mod == 1:
-            found.add(blob[cursor])
-        elif mod == 2:
-            found.add(int.from_bytes(blob[cursor:cursor + 4], "little"))
-        index += 1
-    return {d for d in found if 0x08 <= d <= 0x1000}
+        modrm = blob[op + 1]
+        if blob[op] == opcode and (modrm & 0xc0) == 0x80 and (modrm & 7) == base:
+            return int.from_bytes(blob[op + 2:op + 6], "little", signed=True)
+    return None
 
 
 def check_members(path):
+    """(what, offsets read, offsets in 21.1.0, why the bridge refuses or "") per member."""
     elf = Elf(path)
-    symbols = {s[3]: (s[0], s[1]) for s in elf.symbols() if s[2] == STT_FUNC}
-    # An address is a virtual address; the bytes live at the file offset of the section holding it.
-    def bytes_at(address, length):
-        for section in elf.sections:
-            if section["addr"] and section["addr"] <= address < section["addr"] + section["size"]:
-                start = section["offset"] + (address - section["addr"])
-                return elf.data[start:start + length]
-        return b""
-
     rows = []
-    for symbol, wanted, label in MEMBER_CHECKS:
-        place = symbols.get(symbol)
-        if place is None or not place[1]:
-            rows.append((symbol, label, wanted, None, "the function is not in this library"))
-            continue
-        found = displacements(bytes_at(place[0], place[1]))
-        missing = [w for w in wanted if w not in found]
-        rows.append((symbol, label, wanted, found, "" if not missing else
-                     "MISSING " + ", ".join(f"0x{m:x}" for m in missing)))
+    read = {}
+    for label, symbol, lead, disp_bytes, before in MEMBER_FORMS:
+        blob = function_bytes(elf, symbol)
+        found = find_form(blob, lead, disp_bytes)
+        why = ""
+        if not blob:
+            why = f"{symbol} is not in this library"
+        elif len(found) != len(before):
+            why = f"the form appears {len(found)} times, the bridge needs {len(before)}"
+        elif any(not 0 < value < 0x10000 for value in found):
+            why = "a displacement that is not a member"
+        read[label] = found
+        rows.append((label, found, before, why))
+
+    # The pairs that are one field each in Resolve's code - DecodeMemberLayout's cross-checks.
+    def cross(label, ok, why):
+        for index, row in enumerate(rows):
+            if row[0] == label and not row[3] and not ok:
+                rows[index] = row[:3] + (why,)
+    channels = read.get("input channels", []), read.get("output channels", [])
+    cross("output channels", len(channels[0]) == 1 and len(channels[1]) == 1
+          and channels[1][0] == channels[0][0] + 8, "does not follow the input count by 8")
+    panel = read.get("panel width and height", [])
+    cross("panel width and height", len(panel) == 2 and panel[1] == panel[0] + 4,
+          "height does not follow width by 4")
+    # Pointers and vectors sit on 8 bytes, a float on 4; the two flags are bytes and unchecked.
+    for label, align in (("input channels", 8), ("AudioPlugin parent", 8), ("name record", 8),
+                         ("resource tree", 8), ("panel width and height", 4)):
+        values = read.get(label, [])
+        cross(label, bool(values) and values[0] % align == 0, f"not {align}-byte aligned")
+
+    # The lock fix: the mutex and its flag, named identically by both halves of the inversion.
+    halves = []
+    for symbol, base, scan in LOCK_READERS:
+        blob = function_bytes(elf, symbol)[:scan]
+        halves.append((first_disp32(blob, 0x8d, base), first_disp32(blob, 0x8a, base)))
+    lock = list(halves[0]) if None not in halves[0] else []
+    why = ""
+    if not lock:
+        why = "ResetHistory does not read a mutex and a flag off `this`"
+    elif halves[1] != halves[0]:
+        why = "PreProcess names different offsets - the lock fix will not patch"
+    rows.append(("the per-plugin lock, and its flag (lock fix)", lock, LOCK_IN_21_1_0, why))
     return rows
 
 
@@ -758,27 +784,21 @@ def main():
 
     empty_list_problems = why_the_list_is_empty(path)
 
-    print("member offsets, read out of the instructions that use them:")
-    member_rows = check_members(path)
+    print("member offsets, as the bridge reads them out of the instructions at load:")
     bad = 0
-    for symbol, label, wanted, found, note in member_rows:
-        names = ", ".join(f"0x{w:x}" for w in wanted)
-        if found is None:
+    for label, found, before, why in check_members(path):
+        names = ", ".join(f"0x{value:x}" for value in found) or "-"
+        if why:
             bad += 1
-            print(f"    {label:48} {names:14} COULD NOT CHECK - {note}")
-        elif note:
-            bad += 1
-            print(f"    {label:48} {names:14} {note}")
-            print(f"        the function uses: "
-                  f"{', '.join('0x%x' % d for d in sorted(found)) or '(nothing found)'}")
+            print(f"    {label:46} {names:14} REFUSED - {why}")
+        elif found != before:
+            old = ", ".join(f"0x{value:x}" for value in before)
+            print(f"    {label:46} {names:14} ok, moved from {old} (21.1.0)")
         else:
-            print(f"    {label:48} {names:14} ok")
-    print()
-
-    print("STILL not checked - no single function owns these, or they are not instruction")
-    print("operands at all. A clean run above does not clear them:")
-    for offset, label, why in MEMBERS_NOT_CHECKED:
-        print(f"    this+0x{offset:03x}  {label:24} ({why})")
+            print(f"    {label:46} {names:14} ok")
+    if bad:
+        print("    A REFUSED member means the bridge forwards Resolve's stock interface untouched:")
+        print("    Resolve starts normally and the effect list has none of your plugins.")
 
     if "--dump" in flags:
         print()

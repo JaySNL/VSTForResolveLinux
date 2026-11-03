@@ -26,6 +26,7 @@
 
 #include "carla_host.h"
 #include "chain_lock_fix.h"
+#include "member_layout.h"
 #include "plugin_instance.h"
 #include "fx_categories.h"
 #include "plugin_scan.h"
@@ -586,6 +587,11 @@ extern "C" void BridgeEditorReassert()
 void* g_vtable[2 + kSlotCount];
 const void* g_interface = nullptr;
 void* g_stock_handle = nullptr;
+
+// Every member offset on the stock effect that this bridge reads or writes, read out of
+// libBMDAudioPlugins.so at load - src/member_layout.h. Filled before our vtable is installed, so
+// none of the code that uses it can run without it.
+MemberLayout g_layout;
 
 // Make the page holding `address` writable. The interface object may live in a mapping that RELRO
 // has already turned read-only; without this the vptr write would fault.
@@ -1818,8 +1824,9 @@ namespace {
 // bytes past the end of a one-entry array - and when those bytes happened to hold a writable
 // address, the block was copied over it. The crash then appeared on Resolve's mixing thread, in
 // AddChannelSourceToChannelBus, dereferencing a channel pointer that had never been filled.
-constexpr size_t kInputChannelCountOffset = 0x150;
-constexpr size_t kOutputChannelCountOffset = 0x158;
+//
+// Those addresses and offsets are 21.1.0. 21.1.2 moved both counts by eight, so they are read
+// out of that same pair of instructions at load: g_layout.input_channels and .output_channels.
 
 // The bypass switch on the effect's own header.
 //
@@ -1831,7 +1838,8 @@ constexpr size_t kOutputChannelCountOffset = 0x158;
 // Read out of BMDAudioPluginImpl::Bypass(bool), which is the only writer:
 //
 //   4eebc0+:  mov %sil,0x169(%rdi)
-constexpr size_t kBypassFlagOffset = 0x169;
+//
+// 0x169 in 21.1.0, 0x171 in 21.1.2 - read out of that store at load, as g_layout.bypass_flag.
 
 bool EffectIsBypassed(const ClaimedEffect* effect)
 {
@@ -1840,7 +1848,7 @@ bool EffectIsBypassed(const ClaimedEffect* effect)
     }
     unsigned char flag = 0;
     const auto* const field =
-        static_cast<const unsigned char*>(effect->primary_base) + kBypassFlagOffset;
+        static_cast<const unsigned char*>(effect->primary_base) + g_layout.bypass_flag;
     if (!SafeRead(field, &flag, sizeof(flag))) {
         return false;  // unreadable is not "bypassed" - do not silence audio on a failed read
     }
@@ -1852,7 +1860,7 @@ unsigned int ChannelsResolveGave(const ClaimedEffect* effect, bool output)
         return 0;
     }
     const auto* const field = static_cast<const unsigned char*>(effect->primary_base) +
-                              (output ? kOutputChannelCountOffset : kInputChannelCountOffset);
+                              (output ? g_layout.output_channels : g_layout.input_channels);
     unsigned long count = 0;
     if (!SafeRead(field, &count, sizeof(count))) {
         return 0;
@@ -2875,8 +2883,8 @@ std::atomic<bool> g_state_flush{false};
 // read first, and a null one means this effect is left alone.
 constexpr size_t kSetDirtyOffset = 0xa68;
 constexpr size_t kIsDirtyOffset = 0xa70;
-constexpr size_t kAudioPluginParentOffset = 0x40;
-constexpr size_t kDirtyFlagOffset = 0x99;
+// The flag and the parent are read out of SetDirty at load: g_layout.dirty_flag (0x99 in 21.1.0,
+// 0xa1 in 21.1.2) and g_layout.parent (0x40 in both).
 
 // Does the project save walk our effect at all?
 //
@@ -2941,7 +2949,7 @@ void MarkEffectChanged(const ClaimedEffect& effect)
         return;
     }
     void* parent = nullptr;
-    if (!SafeRead(static_cast<unsigned char*>(plugin) + kAudioPluginParentOffset, &parent,
+    if (!SafeRead(static_cast<unsigned char*>(plugin) + g_layout.parent, &parent,
                   sizeof(parent))) {
         if (talk) {
             Log("dirty: \"%s\" would not let its parent be read - not marked",
@@ -2961,15 +2969,15 @@ void MarkEffectChanged(const ClaimedEffect& effect)
     auto* const set_dirty = *reinterpret_cast<SetDirty*>(g_stock_vtable + kSetDirtyOffset);
     set_dirty(plugin, true);
 
-    // Read the byte back. IsDirty is `cmpb $0x0, 0x99(%rdi)`, so this is the exact thing
-    // Resolve will test, and reporting the write without reading it is how a no-op looks
-    // like a success.
+    // Read the byte back. IsDirty is `cmpb $0x0, 0x99(%rdi)` in 21.1.0 (0xa1 in 21.1.2), so this
+    // is the exact thing Resolve will test, and reporting the write without reading it is how a
+    // no-op looks like a success.
     unsigned char flag = 0;
-    const bool read = SafeRead(static_cast<unsigned char*>(plugin) + kDirtyFlagOffset, &flag,
+    const bool read = SafeRead(static_cast<unsigned char*>(plugin) + g_layout.dirty_flag, &flag,
                                sizeof(flag));
     if (talk) {
-        Log("dirty: marked \"%s\" - the flag at +0x99 now reads %s",
-            effect.state_key.c_str(),
+        Log("dirty: marked \"%s\" - the flag at +0x%zx now reads %s",
+            effect.state_key.c_str(), g_layout.dirty_flag,
             !read ? "unreadable" : (flag != 0 ? "set" : "STILL CLEAR"));
     }
 }
@@ -3064,7 +3072,9 @@ constexpr size_t kGenerateUserInterfaceOffset = 0x460;
 // So the name is one indirection off the primary object. Rather than hook a call that returns a
 // string by value, the record is cloned for our instance and the clone's name pointer is ours. The
 // stock record is untouched, so every other Delay keeps its own name.
-constexpr size_t kNameRecordOffset = 0x550;
+//
+// 0x550 in 21.1.0, 0x558 in 21.1.2 - read out of that instruction when the bridge loads, as
+// g_layout.name_record.
 constexpr size_t kNameRecordCloneBytes = 256;
 
 void RenameInstance(void* primary_base, const ClaimedEffect* effect)
@@ -3076,10 +3086,10 @@ void RenameInstance(void* primary_base, const ClaimedEffect* effect)
         return;
     }
 
-    auto* const field = reinterpret_cast<unsigned char*>(primary_base) + kNameRecordOffset;
+    auto* const field = reinterpret_cast<unsigned char*>(primary_base) + g_layout.name_record;
     void* record = nullptr;
     if (!SafeRead(field, &record, sizeof(record)) || record == nullptr) {
-        Log("rename skipped: no name record at +0x%zx", kNameRecordOffset);
+        Log("rename skipped: no name record at +0x%zx", g_layout.name_record);
         return;
     }
 
@@ -3327,9 +3337,11 @@ int ClaimInstance(void* instance)
 //
 // So replacing the panel is a matter of building this tree ourselves. What is not yet known is the
 // tree's own layout, which is why this step lets the stock builder run and then reads the result.
-constexpr size_t kResourceTreeOffset = 0x360;
-constexpr size_t kPanelWidthOffset = 0x3a8;
-constexpr size_t kPanelHeightOffset = 0x3ac;
+//
+// The tree and the two sizes are 0x360, 0x3a8 and 0x3ac in 21.1.0, 0x368, 0x3b0 and 0x3b4 in
+// 21.1.2 - read out of those instructions at load, as g_layout.resource_tree, .panel_width and
+// .panel_height. The strip below WRITES at tree+0x18, so a stale tree offset is not a wrong
+// read but eight bytes of Resolve's object overwritten.
 
 // The tree's item list. Dumped from a freshly built Delay panel on 2026-08-24:
 //
@@ -3368,7 +3380,7 @@ extern "C" void BridgeGenerateUserInterface(void* self)
         reinterpret_cast<Builder>(stock)(self);
     }
 
-    auto* const tree = reinterpret_cast<unsigned char*>(self) + kResourceTreeOffset;
+    auto* const tree = reinterpret_cast<unsigned char*>(self) + g_layout.resource_tree;
     void* begin = nullptr;
     void* end = nullptr;
     if (SafeRead(tree + kTreeItemsBegin, &begin, sizeof(begin)) &&
@@ -3389,11 +3401,11 @@ extern "C" void BridgeGenerateUserInterface(void* self)
             auto* const bytes = reinterpret_cast<const unsigned char*>(self);
             float width = 0.0f;
             float height = 0.0f;
-            std::memcpy(&width, bytes + kPanelWidthOffset, sizeof(width));
-            std::memcpy(&height, bytes + kPanelHeightOffset, sizeof(height));
+            std::memcpy(&width, bytes + g_layout.panel_width, sizeof(width));
+            std::memcpy(&height, bytes + g_layout.panel_height, sizeof(height));
             Log("panel: the stock tree is built - %.0f x %.0f", static_cast<double>(width),
                 static_cast<double>(height));
-            const unsigned char* const tree = bytes + kResourceTreeOffset;
+            const unsigned char* const tree = bytes + g_layout.resource_tree;
             char line[200];
             for (int row = 0; row < 4; ++row) {
                 int written = std::snprintf(line, sizeof(line), "panel: tree+0x%02x ", row * 16);
@@ -3567,7 +3579,7 @@ float ProbeParameterValue(void* self, unsigned int index, void* original)
 // rdi and `this` in rsi. Declaring a 24-byte POD return makes the compiler generate exactly
 // that, including the sret pointer coming back in rax. Getting this wrong is not theoretical:
 // the effect-name hooks were pulled from this bridge for reading `this` as a write buffer, and
-// the note above kNameRecordOffset says so.
+// the note on the name record above RenameInstance says so.
 //
 // The string is Resolve's libc++, so it is built with Resolve's own resize rather than by
 // writing the layout from memory - one allocator, no guesses. The stock code does the same
@@ -4500,6 +4512,13 @@ extern "C" void* GetBMDPluginInterface()
         Log("stock interface at %p, version %d", stock, version);
         if (version != kExpectedInterfaceVersion) {
             Log("unexpected interface version, forwarding untouched");
+            return stock;
+        }
+
+        // A Resolve whose member layout cannot be read with certainty is left alone, not written
+        // to on a guess. 21.1.2 moved them all by eight; src/member_layout.h.
+        if (!ReadMemberLayout(g_stock_handle, &g_layout, Log)) {
+            Log("member layout unreadable, forwarding untouched");
             return stock;
         }
 
