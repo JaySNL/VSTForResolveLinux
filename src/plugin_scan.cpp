@@ -12,6 +12,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -205,7 +206,7 @@ void RootsFor(PluginFormat format, std::vector<std::string>& roots)
 {
     const std::string home = HomeDirectory();
     const char* variable = nullptr;
-    const char* fixed[4] = {nullptr, nullptr, nullptr, nullptr};
+    const char* fixed[8] = {};
     const char* under_home = nullptr;
 
     if (format == PluginFormat::Clap) {
@@ -213,11 +214,15 @@ void RootsFor(PluginFormat format, std::vector<std::string>& roots)
         under_home = "/.clap";
         fixed[0] = "/usr/lib/clap";
         fixed[1] = "/usr/local/lib/clap";
+        fixed[2] = "/usr/lib64/clap";
+        fixed[3] = "/usr/local/lib64/clap";
     } else if (format == PluginFormat::Vst3) {
         variable = "VST3_PATH";
         under_home = "/.vst3";
         fixed[0] = "/usr/lib/vst3";
         fixed[1] = "/usr/local/lib/vst3";
+        fixed[2] = "/usr/lib64/vst3";
+        fixed[3] = "/usr/local/lib64/vst3";
     } else if (format == PluginFormat::Vst2) {
         variable = "VST_PATH";
         under_home = "/.vst";
@@ -225,6 +230,10 @@ void RootsFor(PluginFormat format, std::vector<std::string>& roots)
         fixed[1] = "/usr/local/lib/vst";
         fixed[2] = "/usr/lib/lxvst";
         fixed[3] = "/usr/local/lib/lxvst";
+        fixed[4] = "/usr/lib64/vst";
+        fixed[5] = "/usr/local/lib64/vst";
+        fixed[6] = "/usr/lib64/lxvst";
+        fixed[7] = "/usr/local/lib64/lxvst";
     }
 
     if (variable != nullptr) {
@@ -905,10 +914,17 @@ void Scan()
     // name between runs is an effect that stops loading.
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) { return a.path < b.path; });
-    candidates.erase(std::unique(candidates.begin(), candidates.end(),
-                                 [](const Candidate& a, const Candidate& b) {
-                                     return a.path == b.path;
-                                 }),
+    // lib64 can be an alias of lib. Compare canonical paths, but keep the first original path
+    // in sorted order to preserve existing plugin names, cache keys and path-based filters
+    // wherever possible.
+    std::set<std::pair<PluginFormat, std::string>> visited;
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                    [&visited](const Candidate& candidate) {
+                                        char* resolved = realpath(candidate.path.c_str(), nullptr);
+                                        std::string identity = resolved != nullptr ? resolved : candidate.path;
+                                        std::free(resolved);
+                                        return !visited.emplace(candidate.format, identity).second;
+                                    }),
                      candidates.end());
 
     // One name per entry, and the name has to be unique: the key is built from it, and two effects
