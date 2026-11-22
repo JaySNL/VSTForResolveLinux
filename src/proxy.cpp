@@ -35,6 +35,7 @@
 #include "host_thread.h"
 
 #include <dlfcn.h>
+#include <link.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -383,9 +384,6 @@ std::atomic<size_t> g_effect_count{0};
 // still in the array with their final settings, because nothing ever removes them.
 std::mutex g_effect_append_lock;
 
-// The effect whose editor Resolve last opened. The window is shared, so one editor shows at a time.
-std::atomic<ClaimedEffect*> g_focused_effect{nullptr};
-
 ClaimedEffect* FindEffect(const void* key)
 {
     const size_t count = g_effect_count.load(std::memory_order_acquire);
@@ -402,8 +400,7 @@ ClaimedEffect* FindEffect(const void* key)
 //
 // A slot in the primary vtable group arrives with `this` pointing at the impl base, which is
 // sixteen bytes BELOW the pointer CreatePluginInstance returned, so FindEffect misses it. The
-// editor hooks got away with that because they fall back to the focused effect. A parameter
-// call cannot: the answer belongs to one effect and would be wrong for any other.
+// answer belongs to one effect and would be wrong for any other.
 ClaimedEffect* FindEffectAny(const void* key)
 {
     ClaimedEffect* const known = FindEffect(key);
@@ -483,13 +480,7 @@ ClaimedEffect* AppendEffect(void* instance_key, void* audio_plugin_key)
 // one plugin could exist. It is not right now: with two effects in a project, opening the second
 // one's panel remapped the FIRST one's window - visible in the log on 2026-08-25 as
 // "editor remapped" for instance 1 while Resolve was calling InitializeEffectEdit for instance 2.
-// So each hook passes the effect it was called for, and the flags live on that effect.
-
-ClaimedEffect* EffectOrFocused(void* self)
-{
-    ClaimedEffect* const effect = FindEffect(self);
-    return effect != nullptr ? effect : g_focused_effect.load();
-}
+// The per-effect flags and strict ownership lookup prevent that cross-instance remapping.
 
 // Defined further down, next to the state saver that also needs it. Declared here because the
 // editor pump has to know whether an effect still exists before it keeps a window open for it.
@@ -571,7 +562,7 @@ extern "C" void BridgeEditorReassert()
         // confusing artefact and a pointer waiting to be used. Reported by the tester on
         // 2026-08-29: deleting a plugin from a clip or a track leaves its GUI open from time to
         // time. This runs on the pump thread, which owns our windows, and closes only ours.
-        if (effect.editor_shown.load() && !EffectIsLive(effect)) {
+        if ((effect.editor_shown.load() || effect.editor_wanted.load()) && !EffectIsLive(effect)) {
             BridgeEditorHideFor(&effect, "the effect is gone from the project");
             continue;
         }
@@ -1620,13 +1611,273 @@ extern "C" bool BridgeHasEditor(void* self)
     return stock || ours;
 }
 
+namespace {
+
+// The editor returned by GetEffectEdit is an EffectEditor subobject of a
+// Fairlight panel. Its fourth virtual function is ShowEditor(bool). Resolve's
+// original vtable belongs to *all* native panels and lives in GNU_RELRO, so
+// never write to it. Give only our own panels a private copy instead.
+constexpr size_t kPanelShowEditorSlot = 3;
+constexpr size_t kUpdateEffectEditTitleOffset = 0x7c0;
+constexpr size_t kHideSubWindowsOffset = 0x830;
+using PanelShowEditorFn = void (*)(void*, bool);
+using PanelGetterFn = void* (*)(void*);
+
+struct PanelHook {
+    void** stock_vptr = nullptr;
+    void** copied_vptr = nullptr;
+    PanelShowEditorFn original = nullptr;
+    // The full copy includes all sub-vtables, RTTI and offset-to-top words.
+    // It lives until process exit, since Resolve may retain panel pointers.
+    void* allocation = nullptr;
+};
+struct PanelOwner {
+    ClaimedEffect* effect = nullptr;
+    void* widget = nullptr;
+    void* plugin_self = nullptr;
+    PanelGetterFn getter = nullptr;
+};
+
+std::mutex g_panel_lock;
+PanelHook g_panel_hooks[8];
+PanelOwner g_panel_owners[kMaxClaimedEffects];
+
+// The fallback is a Resolve-version capability, not a panel's lifetime state.
+// ForgetPanel must not re-enable it when an editor closes or gets rebuilt.
+enum class PanelHookSupport { Unknown, Supported, Unsupported };
+std::atomic<PanelHookSupport> g_panel_hook_support{PanelHookSupport::Unknown};
+
+// The registry is append-only, so prefer the newest live claim if Resolve
+// has reused an address. Do not fall back to the focused effect.
+ClaimedEffect* FindPanelEffect(void* self)
+{
+    if (self == nullptr)
+        return nullptr;
+    const size_t count = g_effect_count.load(std::memory_order_acquire);
+    for (size_t i = count; i > 0; --i) {
+        ClaimedEffect& effect = g_effects[i - 1];
+        if ((effect.instance_key == self || effect.audio_plugin_key == self ||
+             effect.primary_base == self) &&
+            effect.plugin != nullptr && EffectIsLive(effect)) {
+            return &effect;
+        }
+    }
+    return nullptr;
+}
+
+void ForgetPanel(void* self)
+{
+    ClaimedEffect* effect = FindPanelEffect(self);
+    if (effect == nullptr)
+        return;
+    const std::lock_guard<std::mutex> guard(g_panel_lock);
+    g_panel_owners[effect - g_effects] = {};
+}
+
+void BridgePanelShowEditor(void* widget, bool show)
+{
+    void** vptr = nullptr;
+    PanelShowEditorFn original = nullptr;
+    PanelOwner owner{};
+    {
+        const std::lock_guard<std::mutex> guard(g_panel_lock);
+        if (SafeRead(widget, &vptr, sizeof(vptr))) {
+            for (const auto& hook : g_panel_hooks) {
+                if (hook.copied_vptr == vptr) {
+                    original = hook.original;
+                    break;
+                }
+            }
+        }
+        for (size_t i = kMaxClaimedEffects; i > 0; --i) {
+            const auto& candidate = g_panel_owners[i - 1];
+            if (candidate.widget == widget && candidate.effect != nullptr &&
+                EffectIsLive(*candidate.effect)) {
+                owner = candidate;
+                break;
+            }
+        }
+    }
+    // Never hold our registry lock when calling Resolve or a hosted plugin.
+    if (original == nullptr)
+        return;
+    original(widget, show);
+
+    // The stock call may rebuild the panel. Recheck ownership before opening
+    // the separate hosted plugin window.
+    if (owner.effect == nullptr || owner.getter == nullptr ||
+        FindPanelEffect(owner.plugin_self) != owner.effect ||
+        owner.getter(owner.plugin_self) != widget)
+        return;
+    {
+        const std::lock_guard<std::mutex> guard(g_panel_lock);
+        const auto& current = g_panel_owners[owner.effect - g_effects];
+        if (current.widget != widget || current.effect != owner.effect)
+            return;
+    }
+    if (show) {
+        BridgeEditorShowFor(owner.effect, "ShowEditor(true)");
+    } else {
+        BridgeEditorHideFor(owner.effect, "ShowEditor(false)");
+    }
+}
+
+// Accept the named method or a non-virtual adjusting thunk. Its adjustment
+// depends on the concrete class; forwarding the saved thunk preserves it.
+bool IsPanelShowEditorSymbol(const char* symbol)
+{
+    if (symbol == nullptr)
+        return false;
+    const char* name = symbol;
+    if (std::strncmp(name, "_ZThn", 5) == 0) {
+        name += 5;
+        const char* digits = name;
+        while (*name >= '0' && *name <= '9')
+            ++name;
+        if (name == digits || *name != '_')
+            return false;
+        ++name;
+    } else if (std::strncmp(name, "_Z", 2) == 0) {
+        name += 2;
+    } else {
+        return false;
+    }
+    return std::strcmp(name, "N15FLPluginUIPanel10ShowEditorEb") == 0 ||
+           std::strcmp(name, "N21UiEffectEditDialogImp10ShowEditorEb") == 0;
+}
+
+// A missing owner entry does not mean ShowEditor is unsupported: Resolve can
+// close or rebuild panels before another GetEffectEdit refreshes that entry.
+// Only use the legacy signals if the vtable layout was actually rejected.
+bool UsePanelFallback()
+{
+    return g_panel_hook_support.load(std::memory_order_acquire) ==
+           PanelHookSupport::Unsupported;
+}
+
+void RememberPanel(void* self, void* widget, PanelGetterFn getter)
+{
+    ClaimedEffect* effect = FindPanelEffect(self);
+    if (effect == nullptr)
+        return;
+    const std::lock_guard<std::mutex> guard(g_panel_lock);
+    auto& owner = g_panel_owners[effect - g_effects];
+    owner = {};
+    if (widget == nullptr)
+        return;
+
+    void** vptr = nullptr;
+    void* method = nullptr;
+    if (!SafeRead(widget, &vptr, sizeof(vptr)) || vptr == nullptr ||
+        !SafeRead(vptr + kPanelShowEditorSlot, &method, sizeof(method)))
+        return;
+
+    PanelHook* known = nullptr;
+    PanelHook* available = nullptr;
+    for (auto& hook : g_panel_hooks) {
+        if (hook.copied_vptr == vptr || hook.stock_vptr == vptr) {
+            known = &hook;
+            break;
+        }
+        if (hook.stock_vptr == nullptr && available == nullptr)
+            available = &hook;
+    }
+    if (known == nullptr) {
+        // Running out of private dispatch records is not evidence that the
+        // Resolve vtable layout is unsupported.
+        if (available == nullptr)
+            return;
+        Dl_info method_info{};
+        Dl_info table_info{};
+        void* symbol_info = nullptr;
+        if (!dladdr(method, &method_info) ||
+            method_info.dli_sname == nullptr || method_info.dli_saddr != method ||
+            !IsPanelShowEditorSymbol(method_info.dli_sname) ||
+            !dladdr1(vptr, &table_info, &symbol_info, RTLD_DL_SYMENT) ||
+            symbol_info == nullptr || table_info.dli_saddr == nullptr ||
+            table_info.dli_sname == nullptr ||
+            (std::strcmp(table_info.dli_sname, "_ZTV15FLPluginUIPanel") != 0 &&
+             std::strcmp(table_info.dli_sname, "_ZTV21UiEffectEditDialogImp") != 0)) {
+            if (g_panel_hook_support.load(std::memory_order_relaxed) ==
+                PanelHookSupport::Unknown)
+                g_panel_hook_support.store(PanelHookSupport::Unsupported,
+                                           std::memory_order_release);
+            static bool reported = false;
+            if (!reported) {
+                Log("editor: unsupported ShowEditor vtable; using title/hide fallback");
+                reported = true;
+            }
+            return;
+        }
+        const auto* sym = static_cast<const ElfW(Sym)*>(symbol_info);
+        const size_t bytes = static_cast<size_t>(sym->st_size);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(table_info.dli_saddr);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(vptr);
+        if (bytes < (kPanelShowEditorSlot + 1) * sizeof(void*) || bytes > 65536 ||
+            address < base || address - base > bytes ||
+            bytes - (address - base) < (kPanelShowEditorSlot + 1) * sizeof(void*)) {
+            if (g_panel_hook_support.load(std::memory_order_relaxed) ==
+                PanelHookSupport::Unknown)
+                g_panel_hook_support.store(PanelHookSupport::Unsupported,
+                                           std::memory_order_release);
+            Log("editor: invalid panel vtable symbol bounds; using fallback");
+            return;
+        }
+        void* allocation = std::malloc(bytes);
+        if (allocation == nullptr)
+            return;
+        if (!SafeRead(reinterpret_cast<const void*>(base), allocation, bytes)) {
+            std::free(allocation);
+            return;
+        }
+        auto* copy_vptr = reinterpret_cast<void**>(
+            static_cast<unsigned char*>(allocation) + (address - base));
+        copy_vptr[kPanelShowEditorSlot] = reinterpret_cast<void*>(&BridgePanelShowEditor);
+
+        // Publish the dispatch record before changing the widget's vptr.
+        // A concurrent ShowEditor call must always find its stock function.
+        available->stock_vptr = vptr;
+        available->copied_vptr = copy_vptr;
+        available->original = reinterpret_cast<PanelShowEditorFn>(method);
+        available->allocation = allocation;
+        known = available;
+
+        // Only this widget belonging to our effect changes vptr. No Resolve
+        // GNU_RELRO page or other (native) Fairlight panel is modified.
+        iovec local{&copy_vptr, sizeof(copy_vptr)};
+        iovec remote{widget, sizeof(copy_vptr)};
+        if (process_vm_writev(getpid(), &local, 1, &remote, 1, 0) !=
+            static_cast<ssize_t>(sizeof(copy_vptr))) {
+            // Keep the unused published copy alive. The map is static and
+            // immutable after publication; avoid invalidating a concurrent
+            // dispatch even if this particular repoint failed.
+            return;
+        }
+        Log("editor: private ShowEditor vtable installed (%s)", method_info.dli_sname);
+    } else if (known->stock_vptr == vptr) {
+        // A rebuilt panel starts with the stock vptr; repoint it at our copy.
+        void** copy_vptr = known->copied_vptr;
+        iovec local{&copy_vptr, sizeof(copy_vptr)};
+        iovec remote{widget, sizeof(copy_vptr)};
+        if (process_vm_writev(getpid(), &local, 1, &remote, 1, 0) !=
+            static_cast<ssize_t>(sizeof(copy_vptr)))
+            return;
+    }
+
+    for (auto& previous : g_panel_owners) {
+        if (&previous != &owner && previous.widget == widget)
+            previous = {};
+    }
+    owner = {effect, widget, self, getter};
+    g_panel_hook_support.store(PanelHookSupport::Supported, std::memory_order_release);
+}
+}  // namespace
+
 extern "C" void* BridgeGetEffectEdit(void* self)
 {
-    void* widget = nullptr;
-    if (g_original_get_effect_edit != nullptr) {
-        widget = reinterpret_cast<void* (*)(void*)>(g_original_get_effect_edit)(self);
-    }
-    Log("GetEffectEdit: stock returns %p", widget);
+    const auto getter = reinterpret_cast<PanelGetterFn>(g_original_get_effect_edit);
+    void* widget = getter != nullptr ? getter(self) : nullptr;
+    RememberPanel(self, widget, getter);
     return widget;
 }
 
@@ -1639,14 +1890,15 @@ extern "C" long BridgeInitializeEffectEdit(void* self, const char* title, void* 
             g_original_initialize_editor)(self, title, parent);
     }
     Log("InitializeEffectEdit: stock returned %ld, opening the hosted editor", result);
-    BridgeEditorShowFor(EffectOrFocused(self), "InitializeEffectEdit");
+    BridgeEditorShowFor(FindPanelEffect(self), "InitializeEffectEdit");
     return result;
 }
 
 extern "C" void BridgeCloseEffectEdit(void* self)
 {
+    ForgetPanel(self);
     Log("CloseEffectEdit");
-    BridgeEditorHideFor(EffectOrFocused(self), "CloseEffectEdit");
+    BridgeEditorHideFor(FindPanelEffect(self), "CloseEffectEdit");
     if (g_original_close_editor != nullptr) {
         reinterpret_cast<void (*)(void*)>(g_original_close_editor)(self);
     }
@@ -1686,11 +1938,9 @@ extern "C" bool BridgeHasEditorThunk(void* self)
 
 extern "C" void* BridgeGetEffectEditThunk(void* self)
 {
-    void* widget = nullptr;
-    if (g_original_get_effect_edit_thunk != nullptr) {
-        widget = reinterpret_cast<void* (*)(void*)>(g_original_get_effect_edit_thunk)(self);
-    }
-    Log("AudioPlugin::GetEffectEdit: stock returns %p", widget);
+    const auto getter = reinterpret_cast<PanelGetterFn>(g_original_get_effect_edit_thunk);
+    void* widget = getter != nullptr ? getter(self) : nullptr;
+    RememberPanel(self, widget, getter);
     return widget;
 }
 
@@ -1707,14 +1957,15 @@ extern "C" long BridgeInitializeEffectEditThunk(void* self, const char* title, v
             g_original_initialize_editor_thunk)(self, title, parent);
     }
     Log("AudioPlugin::InitializeEffectEdit: stock returned %ld, opening the hosted editor", result);
-    BridgeEditorShowFor(EffectOrFocused(self), "AudioPlugin::InitializeEffectEdit");
+    BridgeEditorShowFor(FindPanelEffect(self), "AudioPlugin::InitializeEffectEdit");
     return result;
 }
 
 extern "C" void BridgeCloseEffectEditThunk(void* self)
 {
+    ForgetPanel(self);
     Log("AudioPlugin::CloseEffectEdit");
-    BridgeEditorHideFor(EffectOrFocused(self), "AudioPlugin::CloseEffectEdit");
+    BridgeEditorHideFor(FindPanelEffect(self), "AudioPlugin::CloseEffectEdit");
     if (g_original_close_editor_thunk != nullptr) {
         reinterpret_cast<void (*)(void*)>(g_original_close_editor_thunk)(self);
     }
@@ -2475,10 +2726,6 @@ constexpr int kProbeCap = 400;
 
 constexpr int kTraceCap = 6;
 
-// The two slots the panel button really drives.
-constexpr size_t kUpdateEffectEditTitleOffset = 0x7c0;
-constexpr size_t kHideSubWindowsOffset = 0x830;
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -2732,32 +2979,38 @@ extern "C" void BridgeReportSlot(unsigned int slot, void* self)
         return;
     }
     TraceSlot& entry = g_trace_slots[slot];
-    if (++entry.reports <= kTraceCap) {
-        Log("trace: AudioPlugin::%s  (+0x%03zx)", entry.name, entry.offset);
+    if (entry.reports++ < kTraceCap) {
+        Log("trace: %s (+0x%03zx) this=%p", entry.name, entry.offset, self);
     }
-
-    // The panel button is a show/hide toggle, not a second InitializeEffectEdit. Resolve builds its
-    // editor object once and from then on drives it with these two calls, so these are the ones the
-    // hosted window has to follow. Measured on 2026-08-24: one press logs UpdateEffectEditTitle and
-    // the OnEditorIdle heartbeat resumes; the next press logs HideSubWindows.
-    if (entry.offset == kUpdateEffectEditTitleOffset) {
-        BridgeEditorShowFor(EffectOrFocused(self), "UpdateEffectEditTitle");
-    } else if (entry.offset == kHideSubWindowsOffset) {
-        // A hide is a hide. This used to re-read a hide that arrived while the window was already
-        // gone as a show, to put Resolve's toggle back in phase after the window manager closed
-        // one of our windows - Resolve's editor object still believes it is showing and there is
-        // no way to tell it otherwise.
-        //
-        // That guess cost more than it paid. Close a plugin window, then close the modal, and the
-        // window came straight back: the modal's own hide arrived with our window already gone and
-        // was read as a request to open it. Reported by the tester on 2026-08-29, at 00:53 of the
-        // recording.
-        //
-        // The guess is not needed any more, because there is a real signal now: clicking the
-        // effect in the Audio FX panel calls InitializeEffectEdit and opens the window. A press of
-        // the panel toggle that spends itself hiding nothing is a cheap failure next to a window
-        // that reopens against the user.
-        BridgeEditorHideFor(EffectOrFocused(self), "HideSubWindows");
+    // A panel's toggle is not a second InitializeEffectEdit. Measured on
+    // 2026-08-24: one press calls UpdateEffectEditTitle, the next calls
+    // HideSubWindows. These signals are a fallback only when the Resolve
+    // vtable layout is unsupported, not when a particular panel is closed.
+    //
+    // A hide is a hide. This used to re-read a hide that arrived while the window was already
+    // gone as a show, to put Resolve's toggle back in phase after the window manager closed
+    // one of our windows - Resolve's editor object still believes it is showing and there is
+    // no way to tell it otherwise.
+    //
+    // That guess cost more than it paid. Close a plugin window, then close the modal, and the
+    // window came straight back: the modal's own hide arrived with our window already gone and
+    // was read as a request to open it. Reported by the tester on 2026-08-29, at 00:53 of the
+    // recording.
+    //
+    // The guess is not needed any more, because there is a real signal now: clicking the
+    // effect in the Audio FX panel calls InitializeEffectEdit and opens the window. A press of
+    // the panel toggle that spends itself hiding nothing is a cheap failure next to a window
+    // that reopens against the user.
+    if (entry.offset == kUpdateEffectEditTitleOffset ||
+        entry.offset == kHideSubWindowsOffset) {
+        ClaimedEffect* effect = FindPanelEffect(self);
+        if (effect != nullptr && UsePanelFallback()) {
+            if (entry.offset == kUpdateEffectEditTitleOffset) {
+                BridgeEditorShowFor(effect, "UpdateEffectEditTitle (fallback)");
+            } else {
+                BridgeEditorHideFor(effect, "HideSubWindows (fallback)");
+            }
+        }
     }
 }
 
@@ -2765,6 +3018,8 @@ extern "C" void BridgeReportSlot(unsigned int slot, void* self)
 // panel button does next lands in the log.
 extern "C" void BridgeArmEditorTrace()
 {
+    if (!EnabledByEnvironment("FXBRIDGE_EDITOR_TRACE"))
+        return;
     for (TraceSlot& entry : g_trace_slots) {
         entry.reports = 0;
     }
@@ -3197,7 +3452,6 @@ int ClaimInstance(void* instance)
         if (entry->plugin != nullptr) {
             entry->dry.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
             entry->spare.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
-            g_focused_effect.store(entry);
             if (class_name != nullptr) {
                 Log("effect: hosting \"%s\" - class \"%s\" from %s", entry->plugin->Name(),
                     class_name, path);
@@ -4320,8 +4574,14 @@ void PatchDelayClassVtable()
     PatchOurSlot(kCloseEffectEditThunkOffset, &g_original_close_editor_thunk,
                     reinterpret_cast<void*>(&BridgeCloseEffectEditThunk));
 
+    // Title/hide remain a fallback if this Resolve version's ShowEditor
+    // symbol cannot be verified. Other trace slots are diagnostic only.
     for (TraceSlot& entry : g_trace_slots) {
-        PatchOurSlot(entry.offset, entry.original, entry.replacement);
+        if (entry.offset == kUpdateEffectEditTitleOffset ||
+            entry.offset == kHideSubWindowsOffset ||
+            EnabledByEnvironment("FXBRIDGE_EDITOR_TRACE")) {
+            PatchOurSlot(entry.offset, entry.original, entry.replacement);
+        }
     }
 
     // The latency and reset probe. Measures, changes nothing: every slot calls the stock body and
@@ -4478,8 +4738,10 @@ void PatchDelayClassVtable()
             g_preset_state ? "ON" : "off");
     }
 
-    Log("editor trace installed on %zu slots",
-        sizeof(g_trace_slots) / sizeof(g_trace_slots[0]));
+    if (EnabledByEnvironment("FXBRIDGE_EDITOR_TRACE")) {
+        Log("editor trace installed on %zu slots",
+            sizeof(g_trace_slots) / sizeof(g_trace_slots[0]));
+    }
 
     Log("editor hooks installed - primary %s, AudioPlugin base %s",
         has_editor ? "patched" : "FAILED", has_editor_thunk ? "patched" : "FAILED");
