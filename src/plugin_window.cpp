@@ -242,6 +242,26 @@ void ApplyWindowRulesLocked(Window handle, unsigned int width, unsigned int heig
     XSetWMHints(g_display, handle, &wm);
 }
 
+// Ask the window manager to keep the plugin editor above other windows.
+void RequestKeepAboveLocked(Window handle)
+{
+    const Atom state = XInternAtom(g_display, "_NET_WM_STATE", False);
+    const Atom above = XInternAtom(g_display, "_NET_WM_STATE_ABOVE", False);
+
+    XEvent event{};
+    event.xclient.type = ClientMessage;
+    event.xclient.window = handle;
+    event.xclient.message_type = state;
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = 1;  // _NET_WM_STATE_ADD
+    event.xclient.data.l[1] = above;
+    event.xclient.data.l[2] = 0;
+    event.xclient.data.l[3] = 1;  // Normal application
+
+    XSendEvent(g_display, RootWindow(g_display, DefaultScreen(g_display)), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
+}
+
 // Ask the window manager to bring this window forward and give it the keyboard.
 //
 // A map alone does not do it: KWin's focus-stealing prevention leaves a newly mapped window behind
@@ -290,6 +310,14 @@ PluginWindow* PluginWindowCreate(unsigned int width, unsigned int height, const 
     XSetWMProtocols(g_display, handle, &g_delete_window, 1);
     // Before the map, never after: a window manager reads these when it takes the window over.
     ApplyWindowRulesLocked(handle, width != 0 ? width : 800, height != 0 ? height : 600);
+
+    // Set the initial EWMH state only before the first map. On a mapped window, state changes
+    // must go through the window manager.
+    const Atom state = XInternAtom(g_display, "_NET_WM_STATE", False);
+    const Atom above = XInternAtom(g_display, "_NET_WM_STATE_ABOVE", False);
+    XChangeProperty(g_display, handle, state, XA_ATOM, 32, PropModeReplace,
+                    reinterpret_cast<const unsigned char*>(&above), 1);
+
     XMapRaised(g_display, handle);
     RequestActivationLocked(handle);
     XFlush(g_display);
@@ -327,6 +355,7 @@ bool PluginWindowShow(PluginWindow* window)
         return false;
     }
     XMapRaised(g_display, window->handle);
+    RequestKeepAboveLocked(window->handle);
     // Reopening asks for the keyboard for the same reason the first open does: the user clicked
     // the effect to get here. A window that comes back behind Resolve reads as one that did not
     // come back at all.
