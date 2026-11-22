@@ -1448,3 +1448,23 @@ differently", probing what Resolve asks *us* cannot answer it. The mechanism was
 the whole time - `EffectsController::GetPathLatency`, `DelayCompensation`, and the track advance -
 and none of it is on the plugin interface. Look at what the host does for itself before
 instrumenting what it asks of you.
+
+
+## Resolve's own VST host code (moved from the README)
+
+Blackmagic does not support this. Their manual lists VST as macOS and Windows only, and nothing in
+the Linux interface loads a VST.
+
+The binary is a different story. `libFairlightPage.so` carries **VST host code** — 198 symbols
+under `VSTPlugin` — and the parts of it this project has actually read are real implementations,
+not empty shells: `VSTPlugin::StorePreset` and `VSTPlugin::LoadPreset` drive a plugin's own
+`effGetChunk` and `effSetChunk`, and `VSTHost::LoadPlugin` has a body. Reading those is what taught
+this project how Resolve stores plugin settings, and it is why your settings now live in the
+project file.
+
+**That is symbols and a few method bodies, not a working host.** Nothing here has run any of it,
+and why it is unreachable from the Linux interface is not established. Two `VST3Host` methods were
+measured as stubs, so the VST3 side and the VST2 side do not look alike.
+
+*(An earlier version of this readme said the Linux build ships no VST host, and a first attempt at
+this correction called it "a complete VST2 host". Both were more than the evidence.)*

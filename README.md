@@ -6,42 +6,46 @@
 [![Changelog](https://img.shields.io/badge/changelog-read-lightgrey)](CHANGELOG.md)
 
 **VST2, VST3 and CLAP plugins running inside DaVinci Resolve on Linux.** Not bounced out to an
-external editor — loaded on the track, with their own GUIs, live on the timeline.
+external editor: loaded on the track, with their own GUIs, live on the timeline.
 
 Blackmagic does not support this. Their manual lists VST as macOS and Windows only, and nothing in
-the Linux interface loads a VST.
-
-The binary is a different story. `libFairlightPage.so` carries **VST host code** — 198 symbols
-under `VSTPlugin` — and the parts of it this project has actually read are real implementations,
-not empty shells: `VSTPlugin::StorePreset` and `VSTPlugin::LoadPreset` drive a plugin's own
-`effGetChunk` and `effSetChunk`, and `VSTHost::LoadPlugin` has a body. Reading those is what taught
-this project how Resolve stores plugin settings, and it is why your settings now live in the
-project file.
-
-**That is symbols and a few method bodies, not a working host.** Nothing here has run any of it,
-and why it is unreachable from the Linux interface is not established. Two `VST3Host` methods were
-measured as stubs, so the VST3 side and the VST2 side do not look alike.
-
-*(An earlier version of this readme said the Linux build ships no VST host, and a first attempt at
-this correction called it "a complete VST2 host". Both were more than the evidence.)*
+the Linux interface loads a VST. `libFairlightPage.so` does carry VST host symbols, but nothing here
+has run any of them and why they are unreachable is not established; the evidence is in
+[`docs/engineering-log.md`](docs/engineering-log.md). This library takes a different route: it
+registers through Resolve's private plugin ABI and hosts the plugins itself.
 
 ![Four plugins open at once inside Resolve: PodcastPlugins TRACK, Waves NS1, Waves Clarity Vx DeReverb and soothe2, with the mixer showing the effect chain](docs/media/plugins-running.png)
 
-Four plugins open at once, on one track. Look at the **Effects** column in the mixer: `pp-track`,
-`soothe2…`, `Clarity V…`, `NS1` — each effect carries its own name, and each is a real plugin
+Four plugins open at once on one track. The **Effects** column in the mixer shows `pp-track`,
+`soothe2…`, `Clarity V…`, `NS1`: each effect carries its own name, and each is a real plugin
 processing real audio.
 
-### Sixty seconds of it, warts included
+## Which release for which Resolve
+
+Requires **DaVinci Resolve Studio 21** on Linux. The free version does not load this ABI.
+
+| Your Resolve | Release | Notes |
+|---|---|---|
+| 21.0 to 21.1.0 | [v0.3.0.1](https://github.com/JaySNL/VSTForResolveLinux/releases/tag/v0.3.0.1) | |
+| 21.1.2 | [v0.3.1](https://github.com/JaySNL/VSTForResolveLinux/releases/tag/v0.3.1) (latest) | Reads Resolve's member offsets at load. If it cannot, it refuses and forwards Resolve's own effects untouched. |
+| 21.1.2 only | [v0.3.1.1](https://github.com/JaySNL/VSTForResolveLinux/releases/tag/v0.3.1.1) | Side release: the same fix with the offsets fixed in the code. For anyone wary of Microsoft Defender's machine-learning flag on v0.3.1 (`Trojan:Script/Wacatac.C!ml`), a false positive reported to Microsoft; no other engine flags it. Wrong on any other Resolve. |
+
+Resolve 21.2 has been reported working by a contributor. Not verified here.
+
+Method 2 below downloads the latest release. For another one, replace `latest/download` in the URLs
+with `download/<tag>`, or check out that tag before building with Method 1.
+
+## Sixty seconds of it, warts included
 
 ![Loading several plugins in a row and driving smartEQ4's controls inside Resolve](docs/media/demo.gif)
 
-[Full recording (66s, with audio)](docs/media/demo.mp4) — several plugins loaded one after another,
+[Full recording (66s, with audio)](docs/media/demo.mp4): several plugins loaded one after another,
 ending with smartEQ4 running a live spectrum analyser while its controls are driven.
 
 It is not a clean take, deliberately. **One plugin opens with an empty editor and only draws after
 the effect is removed and undone**, and the recording keeps that in. The others open first time.
 
-## It works
+## What works
 
 **Plugins land in Resolve's own categories**, mixed in with the built-in Fairlight FX. `De-Esser`,
 `De-Hummer`, `Noise Reduction`, `Limiter`, `Multiband Compressor` and `Soft Clipper` below are
@@ -59,7 +63,7 @@ Blackmagic's; everything else is ours.
 | **VST2**, Windows via yabridge | audio + editor |
 | **Plugin names** | each effect named on the track, not "Delay" |
 | **Categories** | Dynamics, EQ, Restoration, Reverb, Metering, Pitch, Guitar… |
-| **Shell plugins** | one file publishing hundreds — the Waves WaveShell exposes 718 — with a filter to choose which appear |
+| **Shell plugins** | one file publishing hundreds (the Waves WaveShell exposes 718), with a filter to choose which appear |
 | **Several at once** | four plugins on one track in the shot above; no shared state between effects |
 
 **Verified working:** soothe2 · smartEQ4 · smartComp3 · the ERA6 suite (14) · CrumplePop Complete
@@ -68,21 +72,22 @@ Waves (Clarity Vx, NS1, RVox, DeBreath, F6, Vocal Rider, MaxxVolume, PAZ, Sibila
 Carla · custom CLAP plugins. **130 plugins listed** on the development machine, 75 of them from a
 single Waves shell.
 
+> **Not a supported product.** It patches structures inside Resolve's own process at run time and
+> can take Resolve down mid-edit. Save often.
+
 ## Install
 
-Requires **DaVinci Resolve Studio 21** on Linux. The free version does not load this ABI.
+There are two ways in. **Pick one and follow it to the end**; they do not interleave.
 
-There are two ways in. **Pick one and follow it to the end** — they do not interleave.
-
-| | Method 1 — build it | Method 2 — download the binary |
+| | Method 1: build it | Method 2: download the binary |
 |---|---|---|
 | You need | the Carla dev headers, zlib, Xlib, a C++17 compiler | nothing but `curl` |
 | Config file | written for you | you add one line |
 | Best when | you want the newest code | you want it working in a minute |
 
----
+Whichever you pick, finish with [Start Resolve](#start-resolve).
 
-### Method 1 — build it
+### Method 1: build it
 
 `build.sh` compiles, installs **and** writes Resolve's config line for you.
 
@@ -107,19 +112,19 @@ cd VSTForResolveLinux
 ./build.sh
 ```
 
-That compiles, installs to `~/.local/share/BMDAudioPlugins/libfxbridge.so`, and adds the
-`BMDPlugins.Path` line to `~/.local/share/DaVinciResolve/configs/config-fairlight.dat` — keeping a
-timestamped copy of your file first. Run it twice and nothing is duplicated.
+This compiles and installs into `~/.local/share/BMDAudioPlugins/`: `libfxbridge.so`, the scanner
+`fxbridge-scan` (run once at the end, see [The first scan](#the-first-scan)), the gate preload
+`libfxbridge-gate.so` and the launcher `resolve-with-fxbridge`. It adds the `BMDPlugins.Path` line
+to `~/.local/share/DaVinciResolve/configs/config-fairlight.dat`, keeping a timestamped copy of your
+file first. Run it twice and nothing is duplicated.
 
 `FXBRIDGE_NO_CONFIGURE=1 ./build.sh` skips the config step and prints the line instead.
+`FXBRIDGE_NO_SCAN=1 ./build.sh` skips the scan.
 
-**Step 4. Start Resolve.** The plugins are in the Audio FX panel.
+Continue at [Start Resolve](#start-resolve). Nothing else between here and that section applies to
+Method 1.
 
-That is the whole method. Nothing below Step 4 applies to you.
-
----
-
-### Method 2 — download the binary
+### Method 2: download the binary
 
 Every release carries a prebuilt `libfxbridge.so`, free of cost, next to the source it was built
 from.
@@ -128,15 +133,16 @@ from.
 
 ```sh
 mkdir -p ~/.local/share/BMDAudioPlugins
-curl -L -o ~/.local/share/BMDAudioPlugins/libfxbridge.so \
-  https://github.com/JaySNL/VSTForResolveLinux/releases/latest/download/libfxbridge.so
-curl -L -o ~/.local/share/BMDAudioPlugins/fxbridge-scan \
-  https://github.com/JaySNL/VSTForResolveLinux/releases/latest/download/fxbridge-scan
-chmod +x ~/.local/share/BMDAudioPlugins/fxbridge-scan
+cd ~/.local/share/BMDAudioPlugins
+base=https://github.com/JaySNL/VSTForResolveLinux/releases/latest/download
+for f in libfxbridge.so fxbridge-scan libfxbridge-gate.so resolve-with-fxbridge; do
+  curl -L -o "$f" "$base/$f"
+done
+chmod +x fxbridge-scan resolve-with-fxbridge
 ```
 
-The second file is the scanner. Run it once before you start Resolve, and it does the slow part
-out here where you can watch it:
+`fxbridge-scan` is the scanner. Run it once before you start Resolve, and it does the slow part out
+here where you can watch it:
 
 ```sh
 ~/.local/share/BMDAudioPlugins/fxbridge-scan
@@ -145,6 +151,9 @@ out here where you can watch it:
 ```
   [##########..............]  42%  139/330  3m11s elapsed  ~4m22s left  MTurboDelayMB
 ```
+
+`libfxbridge-gate.so` and `resolve-with-fxbridge` are only needed on Resolve 21.1 and later (see
+[Start Resolve](#start-resolve)); they are harmless on 21.0.
 
 **Step 2. Close DaVinci Resolve.** It owns the config file and rewrites it on quit, so an edit made
 while it runs is thrown away. This step is not optional.
@@ -164,8 +173,6 @@ BMDPlugins.Path = /home/YOU/.local/share/BMDAudioPlugins/libfxbridge.so
 **Replace `YOU` with your own username.** `whoami` prints it. The path has to be written out in
 full: `~` and `$HOME` are not expanded here.
 
-**Step 4. Start Resolve.** The plugins are in the Audio FX panel.
-
 #### If Step 3 goes wrong, nothing tells you
 
 Resolve quietly loads its own plugin library and the Audio FX panel looks exactly as it did before.
@@ -176,13 +183,12 @@ No error, no warning. Three things have to be right:
 - The key only works in **`config-fairlight.dat`**. Resolve keeps it in `config.dat` across restarts
   and ignores it there.
 
-This readme published the wrong form until 2026-08-26 — the folder, no `=`, and a `~` — which is
-three failures out of three. Reported by Delirio, who also asked for these two methods to be
-pulled apart.
+Earlier versions of this readme published the wrong form (the folder, no `=`, and a `~`) until
+2026-08-26. Reported by Delirio, who also asked for these two methods to be pulled apart.
 
 #### What the prebuilt binary asks of your system
 
-Compiled on Ubuntu 20.04, so it asks for `GLIBC_2.16`, `GLIBCXX_3.4.22` and `CXXABI_1.3.9` at most —
+Compiled on Ubuntu 20.04, so it asks for `GLIBC_2.16`, `GLIBCXX_3.4.22` and `CXXABI_1.3.9` at most:
 libstdc++ from GCC 6.1 onward, which covers Ubuntu 18.04, Debian 9, Rocky 8 and Fedora 25 and newer.
 Read the floor back rather than trusting it:
 
@@ -194,7 +200,26 @@ objdump -T ~/.local/share/BMDAudioPlugins/libfxbridge.so \
 Whether **Resolve itself** runs on distributions that old is a separate question, and one this
 project has not tested.
 
----
+### Start Resolve
+
+**Resolve 21.0 and earlier:** start it as usual. The plugins are in the Audio FX panel.
+
+**Resolve 21.1 and later:** start it through the launcher, or the effect list holds Resolve's own
+effects and none of yours, with nothing in the log to say why:
+
+```sh
+~/.local/share/BMDAudioPlugins/resolve-with-fxbridge
+```
+
+21.1 skips the setting that loads external plugin libraries unless an internal check passes. The
+launcher preloads `libfxbridge-gate.so`, which patches that check **in memory** only: nothing on
+disk is modified, no root is needed, and not using the launcher undoes it. On 21.0 and earlier the
+preload finds no gate and writes one line saying so. Arguments are passed on to Resolve;
+`RESOLVE=/path/to/resolve` runs an install other than `/opt/resolve/bin/resolve`, and
+`FXBRIDGE_GATE=/path/to/libfxbridge-gate.so` points at a gate library elsewhere. The disassembly
+and the measurements are in [`docs/resolve-21.1-gate.md`](docs/resolve-21.1-gate.md).
+
+`tools/check-offsets.py` reports whether your Resolve has the gate, without starting it.
 
 ### Nothing appeared?
 
@@ -204,22 +229,36 @@ Either method. Ask whether the bridge was loaded at all:
 grep -c fxbridge ~/.local/share/DaVinciResolve/logs/ResolveDebug.txt
 ```
 
-**Zero** means Resolve never loaded it: the config line is wrong, or this is the free version rather
-than Studio. **Above zero** means it loaded, and these lines say what it found:
+**Zero** means Resolve never loaded it: the config line is wrong, this is the free version rather
+than Studio, or you are on 21.1 or later and did not start through the launcher. **Above zero**
+means it loaded, and these lines say what it found:
 
 ```sh
 grep 'fxbridge.*scan:' ~/.local/share/DaVinciResolve/logs/ResolveDebug.txt | head
 ```
 
 **Windows plugins need a patched yabridge.** The version in your distribution's repositories draws
-plugin GUIs correctly and then takes almost no mouse input — read [`docs/yabridge.md`](docs/yabridge.md)
+plugin GUIs correctly and then takes almost no mouse input. Read [`docs/yabridge.md`](docs/yabridge.md)
 before concluding this project is broken. Native Linux CLAP and VST3 plugins need nothing extra.
 
 ## Choosing which plugins appear
 
-**Formats** — `FXBRIDGE_SCAN_FORMATS`, default `clap,vst2,vst3`.
+**Where plugins are looked for.** Per format, in this order: the environment variable
+(`CLAP_PATH`, `VST3_PATH`, `VST_PATH`, colon-separated), then the folder under your home
+(`~/.clap`, `~/.vst3`, `~/.vst`; VST2 also `~/.lxvst`), then the system folders:
 
-**Plugins inside a shell** — `~/.local/share/BMDAudioPlugins/fxbridge-shell-allow.txt`, one
+| Format | System folders |
+|---|---|
+| CLAP | `/usr/lib/clap`, `/usr/local/lib/clap` |
+| VST3 | `/usr/lib/vst3`, `/usr/local/lib/vst3` |
+| VST2 | `/usr/lib/vst`, `/usr/local/lib/vst`, `/usr/lib/lxvst`, `/usr/local/lib/lxvst` |
+
+After v0.3.1 (merged on main, in no release yet): `/usr/lib64/{clap,vst3,vst,lxvst}` and
+`/usr/local/lib64/...` are searched too, and plugins reached twice through symlinks are listed once.
+
+**Formats.** `FXBRIDGE_SCAN_FORMATS`, default `clap,vst2,vst3`.
+
+**Plugins inside a shell.** `~/.local/share/BMDAudioPlugins/fxbridge-shell-allow.txt`, one
 substring per line, matched against the plugin's name. Without this file a shell contributes only
 its first plugin, so a 718-plugin shell never floods the menu:
 
@@ -231,7 +270,7 @@ Vocal Rider
 DeBreath
 ```
 
-**Plugins to skip entirely** — `~/.local/share/BMDAudioPlugins/fxbridge-scan-deny.txt`. Written
+**Plugins to skip entirely.** `~/.local/share/BMDAudioPlugins/fxbridge-scan-deny.txt`. Written
 before the first plugin is opened, listing every plugin found on the machine, all commented out.
 Delete the `# ` in front of a line to stop that plugin being opened at all:
 
@@ -242,68 +281,62 @@ Waves
 ```
 
 A pattern is a plain **substring of the plugin's full path**, matched without regard to case. It is
-not a glob and not a regular expression — `*.vst3` matches nothing, because the asterisk is a
+not a glob and not a regular expression: `*.vst3` matches nothing, because the asterisk is a
 literal asterisk. Your edits are never overwritten; delete the file to have it rebuilt from the
-current scan.
+current scan. The check runs before anything is opened, so it also covers a plugin that hangs the
+scan.
 
-This matters mainly for the **first** start after installing a plugin, which is the one that has to
-open it, and for a plugin that hangs the scan — the check runs before anything is opened.
+**Categories.** A VST3's own subcategory is used when the name table has no rule for it. To add a
+rule, edit `CategoryFor()` in `src/fx_categories.cpp`; see [`docs/categories.md`](docs/categories.md).
 
-### The first scan, and why it is the only slow one
+The filters take effect on the next Resolve start. No rebuild.
 
-Reading a plugin's name means opening it, and opening a Windows VST3 through yabridge starts a
-Wine host. Measured here: `dlopen` 0 ms, **`ModuleEntry` 327–352 ms**, `ModuleExit` 26–29 ms,
-`dlclose` 0 ms. On a tester's machine the same step takes one to three seconds per plugin. With a
-few hundred plugins that is minutes, once.
+## The first scan
 
-Three things make that once bearable:
+Reading a plugin's name means opening it, and opening a Windows VST3 through yabridge starts a Wine
+host: one to three seconds per plugin on a typical machine, so a few hundred plugins take minutes,
+**once**. After that:
 
-- **`fxbridge-scan` does it outside Resolve**, with a progress bar. `build.sh` runs it for you
-  after it installs. A plugin that faults while being read then takes down a command rather than an
-  edit session.
-- **Eight modules are opened at once.** Independent Wine hosts, so they start alongside each other:
-  2,910 s serial against 1,232 s parallel over the same 21 modules here. `FXBRIDGE_SCAN_THREADS`
-  changes the number.
-- **Nothing learned is thrown away.** The cache is written after every module, so Ctrl-C is safe
-  and the next run continues where the last one stopped. A cached start reads the file and opens
-  nothing: **0,003 s** here, against 2,910 s cold.
+- **`fxbridge-scan` does it outside Resolve**, with a progress bar. `build.sh` runs it for you. A
+  plugin that faults while being read then takes down a command rather than an edit session.
+- **Eight modules are opened at once**; `FXBRIDGE_SCAN_THREADS` changes the number.
+- **Nothing learned is thrown away.** The cache
+  (`~/.local/share/BMDAudioPlugins/fxbridge-scan-cache.tsv`) is written after every module, so
+  Ctrl-C is safe and the next run continues where the last one stopped. A cached start opens
+  nothing. Delete the file to force a rescan; it repairs itself if truncated.
+- **Only new or changed plugins are read again.** The cache key is the size and modification time
+  of the binary inside each bundle.
 
-The cache key is the size and modification time of the binary inside each bundle, so a plugin you
-update or install is read again and the rest are not.
+**Plugins that stopped a start.** `~/.local/share/BMDAudioPlugins/fxbridge-scan-crashed.txt`. You do
+not write this one. A plugin that hangs or faults while its name is read takes the start down with
+it; a module that is still open at the end of two starts in a row is written here and skipped from
+then on. The log says so. The first time proves nothing, so that module is first listed in
+`fxbridge-scan-suspect.txt` and opened again. Delete a line from the crashed file to have that plugin
+opened again, or delete the file to try all of them.
 
-**Plugins that stopped a start** — `~/.local/share/BMDAudioPlugins/fxbridge-scan-crashed.txt`. You
-do not write this one. Reading a plugin's name runs that plugin's code inside Resolve, so a plugin
-that hangs or faults there takes the start down with it — and without this, every later start would
-open the same module, in the same order, and stop in the same place.
+The measurements, the crash-recovery rules and the scan cache are in
+[`docs/first-scan.md`](docs/first-scan.md).
 
-The scan notes which module it is about to open and rubs the note out when that module answers. A
-note still there at the next start names a module that was open when the last one ended. **The
-first time proves nothing** — a start closed by hand blames whatever happened to be open — so that
-module goes to `fxbridge-scan-suspect.txt` and is opened again. Only a module that is open at the
-end of a second start is written to the crashed file and skipped, and the log says so both times.
+## Settings between sessions
 
-A scan that runs all the way through clears the suspect list, because everything in it answered.
-Delete a line from the crashed file to have that plugin opened again, or delete the file to try all
-of them.
+**Your plugin settings live in the Resolve project.** On by default since v0.2.3, nothing to turn
+on. They belong to the effect, they move with the project, and they survive a chain that gets
+rearranged. Verified with eight effects on one timeline: all eight saved and all eight restored,
+including a 2.3 MB smartEQ4 chunk.
 
-**Nothing learned is thrown away.** The cache is written after every module rather than at the end
-of the scan, so a start that stops halfway keeps every answer it already had. The next start begins
-where that one stopped. This matters most with a large Windows collection: each module costs about
-one to three seconds through yabridge, so a first scan of a few hundred of them is minutes long —
-but it only has to happen once, and it no longer has to happen in one sitting.
+**One thing to know.** Resolve writes the effects model only when it already thinks the project
+changed, and an edit made inside a plugin's own window is invisible to it. Nothing is lost: your
+change is written on the next thing you do that Resolve *can* see, a fader or a clip. If you want a
+session that changes nothing else to be covered too, start Resolve with `FXBRIDGE_STATE_STORE=1`.
 
-**Categories** — a VST3's own subcategory is used when the name table has no rule for it. To add a
-rule, edit `CategoryFor()` in `src/fx_categories.cpp`.
-
-Both take effect on the next Resolve start. No rebuild.
+The full account (how the channel was found, what it cannot do, and the two claims this project got
+wrong on the way) is in [`docs/settings.md`](docs/settings.md).
 
 ## Latency
 
-Plugins with lookahead — a linear-phase EQ, a limiter, anything oversampled — need the rest of the
+Plugins with lookahead (a linear-phase EQ, a limiter, anything oversampled) need the rest of the
 timeline delayed to match, or the audio walks away from the picture. Resolve does that compensation
-itself and does it well. It only has to be told the number, and until v0.2.9 this bridge told it
-zero for every effect.
-
+itself; it only has to be told the number. Until v0.2.9 this bridge told it zero for every effect.
 It now reports what the plugin reports, so stacking effects no longer pushes the audio out of sync.
 The log names each one:
 
@@ -312,22 +345,23 @@ The log names each one:
 ```
 
 Two things are known and not fixed. Playback starts with a short silence when a high-latency plugin
-is loaded — **exports are unaffected**, and the cause is still open. And a plugin that changes its
+is loaded; **exports are unaffected**, and the cause is still open. And a plugin that changes its
 latency while the project is open may not be re-compensated until it is reopened.
 
-`FXBRIDGE_LATENCY=0` turns the reporting off; `FXBRIDGE_RESET=0` stops the plugin being told the
-playhead jumped. Both exist for narrowing down a problem, not for daily use.
+`FXBRIDGE_LATENCY=0` turns the reporting off. Forwarding the playhead position to the plugin
+(a "locate") is **off by default** since v0.2.10, because it crashed Resolve with a VST2 through
+yabridge; `FXBRIDGE_RESET=1` turns it on. Both exist for narrowing down a problem, not for daily
+use. Details in [`docs/latency-and-reset.md`](docs/latency-and-reset.md).
 
 ## When Resolve stops responding
 
 **A slow plugin does not only drop audio, it freezes the interface.** Resolve holds one lock per
 plugin for the whole of its processing call, and the same lock is taken when the playhead moves or
-the audio preview is cleared. So while a hosted plugin is working, the next thing you do that
-touches that effect waits behind it, and a plugin that takes seconds to answer looks exactly like
-a hung application.
+the audio preview is cleared. While a hosted plugin is working, the next thing you do that touches
+that effect waits behind it, and a plugin that takes seconds to answer looks exactly like a hung
+application.
 
-Since v0.2.12 that is measured rather than guessed at. A hosted block that takes longer than 50 ms
-is written to the log by name:
+Since v0.2.12 a hosted block that takes longer than 50 ms is written to the log by name:
 
 ```
 audio: SLOW - "MAutoDynamicEq" took 4231.077 ms for 1024 frames (block 1 past the limit, worst 4231.077 ms)
@@ -338,168 +372,83 @@ has already missed the deadline twice over.
 
 **Nothing is aborted.** A VST3 processing call through yabridge cannot be cancelled once it is in
 flight, and pretending otherwise would trade a freeze for a corrupted plugin. What the line buys is
-the name of the plugin to remove, which no crash dump carries.
-
-## DaVinci Resolve 21.1
-
-**21.1 will not load any external Fairlight plugin library, and says nothing about it.** The effect
-list holds Resolve's own effects and none of yours. Nothing is wrong with your install: the
-configuration is read, the file is found, and the library is never opened.
-
-`FLPluginHost::Initialize()` is the function that reads `BMDPlugins.Path`. In 21.0 it does so
-immediately. In 21.1 it first asks Resolve's core interface a yes/no question keyed on the string
-`"Debug"`, and returns without doing anything when the answer is no:
-
-```
-call  QString::fromAscii_helper("Debug", 5)
-call  *0x1d0(%rbx)          ; a virtual on the core interface -> bool
-test  %bpl,%bpl
-je    +0xd4                 ; false: never read the setting, never load anything
-```
-
-That is a module gate, not a preference. The same virtual is called from 78 places in
-`libFairlightPage.so`; the four that pass a literal pass `"Studio"`, `"ProxyGenerator"`,
-`"RemoteControl"` and `"Debug"`. Writing a `Debug` row into
-`configs/Fairlight/FLDebugSettings.csv` was tried first and changes nothing — that store is read by
-`DebugSettingsManager::GetDebugSetting`, which returns a map rather than the boolean this gate
-reads. **There is no setting to turn on.**
-
-So start Resolve through the launcher instead:
-
-```sh
-~/.local/share/BMDAudioPlugins/resolve-with-fxbridge
-```
-
-It preloads `libfxbridge-gate.so`, which replaces that one conditional jump with NOPs **in memory**,
-after Resolve has loaded the library and before it runs the function. Nothing on disk is modified,
-no root is needed, Blackmagic's own files stay as they shipped, and not using the launcher undoes
-it. On 21.0 and earlier the gate is not there, the preload finds nothing and writes one line saying
-so.
-
-The patcher anchors on the symbol `_ZN12FLPluginHost10InitializeEv` and requires the query and the
-gate to appear exactly once inside it — **the gate's raw bytes occur twice in the library**, so a
-plain signature search would be a coin toss. If the shape ever changes it refuses and says why,
-rather than writing six bytes into the wrong place.
-
-`tools/check-offsets.py` reports the gate as present or absent, so you can tell which Resolve you
-have without starting it.
-
-Measured on 21.1.0.0014 and 21.0.0.0048: unpatched 21.1 loads nothing at all; through the launcher
-it lists 48 plugins, and 21.0 behaves identically with and without the preload.
+the name of the plugin to remove, which no crash dump carries. The lock order inversion behind the
+freeze is in [`docs/freeze-deadlock.md`](docs/freeze-deadlock.md).
 
 ## After a Resolve update
 
-**Every constant this bridge patches is a byte offset into one object**: the vtable of
-`BMDStereoDelay` inside `libBMDAudioPlugins.so`. Blackmagic rebuilds that class on every release,
-so a new Resolve can move a slot without changing anything a user would notice — and a bridge that
-patches a moved slot replaces the wrong method. That failure is quiet: drag and drop stops working,
-or a knob renames the effect.
+Blackmagic rebuilds the class this bridge patches on every release, so a new Resolve can move
+something without changing anything you would notice. If a plugin stops working after an update:
 
-So check it instead of finding out:
+1. **Empty effect list.** Check that `BMDPlugins.Path` is still in `config-fairlight.dat` (an update
+   can rewrite it out), that on 21.1 or later you start through `resolve-with-fxbridge`, and that
+   the scan cache is not empty. If the bridge does not recognise the new Resolve it logs that and
+   forwards Resolve's own effects untouched; a `layout:` line in the log names every offset it
+   read.
+2. **Check without starting Resolve.** `tools/check-offsets.py` needs only `python3`. It prints the
+   Resolve version, every slot the bridge uses and a verdict per slot: **ok**, **MOVED** or
+   **GONE**; exit code 0 means nothing moved.
+3. **Use the matching release.** See [Which release for which Resolve](#which-release-for-which-resolve).
 
-```sh
-tools/check-offsets.py
-```
+A new Resolve can be checked before installing it; the procedure, the member-offset decoding and
+the other tools are in [`docs/after-a-resolve-update.md`](docs/after-a-resolve-update.md).
 
-It needs nothing but `python3` — no binutils, no debugger, no build. It prints the Resolve version,
-every slot the bridge uses, and one of three verdicts each: **ok**, **MOVED** with the new offset,
-or **GONE** if the method was renamed or removed. Exit code 0 means nothing moved. A move prints
-the replacement constants ready to paste.
+## Environment variables
 
-`--dump` lists every slot in the vtable, `--no-version` skips the version scan, and
-`--emit-expected` regenerates the reference table from a Resolve you trust.
+Set them in the shell that starts Resolve. For a switch, a value starting with `0` is off and any
+other non-empty value is on, except `FXBRIDGE_STATE_STORE`, where only `1` counts.
 
-**It also answers an empty effect list**, which is the failure a moved offset does not cause. Three
-things hide every plugin: the stock interface reporting a version the bridge refuses to wrap — it
-forwards Resolve's own interface untouched rather than guess at a changed shape — a
-`BMDPlugins.Path` that an update rewrote out of `config-fairlight.dat`, and an empty scan cache.
-It also reads the size of one node in Resolve's plugin map — the bridge builds such a node by
-hand, so a changed size means every entry it inserts has the wrong shape — and checks that every
-library `libfxbridge.so` needs is present, because Resolve dlopens the bridge and falls back to
-its own library **without saying so** when that fails. All of it is read without starting Resolve,
-and a finding fails the run rather than only printing.
+| Variable | Default | Effect |
+|---|---|---|
+| `FXBRIDGE_SCAN_FORMATS` | `clap,vst2,vst3` | Which formats are listed |
+| `FXBRIDGE_SCAN_THREADS` | `8` | Modules opened at once during a scan |
+| `FXBRIDGE_SCAN_KEEP_OPEN` | off | Keep modules open after the scan reads them (old behaviour; many Wine hosts) |
+| `FXBRIDGE_SLOW_MS` | `50` | Threshold for the `audio: SLOW` log line |
+| `FXBRIDGE_LATENCY` | on | `0` stops reporting plugin latency |
+| `FXBRIDGE_RESET` | off | `1` forwards a locate (playhead jump) to the plugin |
+| `FXBRIDGE_STATE_STORE` | off | `1` also saves settings for a session that changes nothing else |
+| `FXBRIDGE_WINDOW_TYPE` | `dialog` | Editor window type: `dialog`, `utility` or `normal` |
+| `FXBRIDGE_OPEN_ON_CLAIM` | off | `1` opens every editor at project load instead of on click |
+| `FXBRIDGE_GATE` | `~/.local/share/BMDAudioPlugins/libfxbridge-gate.so` | Gate library used by `resolve-with-fxbridge` |
+| `RESOLVE` | `/opt/resolve/bin/resolve` | Resolve binary started by `resolve-with-fxbridge` |
+| `FXBRIDGE_NO_CONFIGURE` | unset | `build.sh`: skip the config edit and print the line |
+| `FXBRIDGE_NO_SCAN` | unset | `build.sh`: skip the scan |
+| `CLAP_PATH`, `VST3_PATH`, `VST_PATH` | unset | Extra plugin folders, colon-separated |
 
-**Member offsets are not constants**: the channel counts, the bypass and dirty flags, the
-per-plugin lock, the effect's name record and the panel. They are encoded inside instructions
-rather than named in the symbol table, and 21.1.2 moved every one of them by eight bytes. So the
-bridge reads each one out of the function that owns it when it loads, and refuses — forwarding
-Resolve's own interface untouched — if any one is not where its instruction says. The bridge log
-names every offset it read, on a line starting `layout:`.
+Other `FXBRIDGE_*` variables in `src/` are probes and switches for development and are not
+supported.
 
-The script decodes them by the same rules and prints what the bridge will read: **ok**, **ok,
-moved from** the 21.1.0 number, or **REFUSED**, which fails the run. To run the bridge's own
-decoding code over a library file, without Resolve:
+## Known issues
 
-```sh
-tools/member-layout-test.sh /opt/resolve/libs/libBMDAudioPlugins.so 0x150 0x158 0x169 0x99 0x40 0x550 0x360 0x3a8 0x3ac
-```
-
-A new Resolve can be checked before installing it: `7z x -oOUT DaVinci_Resolve_Studio_X_Linux.run
-libs/libBMDAudioPlugins.so libs/libFairlightPage.so`, then give either tool
-`OUT/libs/libBMDAudioPlugins.so`. check-offsets reads the gate from the `libFairlightPage.so`
-beside it; pass it `--no-version` too, because the version is read from the installed Resolve.
-
-## Settings between sessions
-
-**Your plugin settings live in the Resolve project.** On by default since v0.2.3, nothing to turn
-on. They belong to the effect, they move with the project, and they survive a chain that gets
-rearranged.
-
-Verified with eight effects on one timeline: all eight saved and all eight restored, including a
-2.3 MB smartEQ4 chunk.
-
-**One thing to know.** Resolve writes the effects model only when it already thinks the project
-changed, and an edit made inside a plugin's own window is invisible to it. Nothing is lost — your
-change is written on the next thing you do that Resolve *can* see, a fader or a clip. If you want a
-session that changes nothing else to be covered too, start Resolve with `FXBRIDGE_STATE_STORE=1`.
-
-The full account — how the channel was found, what it cannot do, and the two claims this project got
-wrong on the way — is in [`docs/settings.md`](docs/settings.md).
-
-## It does not work, or not yet
-
-- **Two plugins draw a GUI but take no mouse input** — Smooth Operator Pro (VST2) and Accentize
-  SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. YMMV, i haven't been able to test EVERY vst yet.
+- **Two plugins draw a GUI but take no mouse input**: Smooth Operator Pro (VST2) and Accentize
+  SpectralBalance2 (VST3). Carla reproduces both, so this is not the bridge. Not every plugin has
+  been tested.
 - **A plugin editor sometimes opens empty**, and fills only after the effect is removed and the
   removal undone. Visible in the recording above. Not diagnosed; it is not tied to one format.
-- **A plugin-only change does not make the project dirty.** Settings themselves are kept now, in
-  the project — see *Settings between sessions*. What is missing is the nudge: Resolve serialises
-  the effects model only when it already thinks something changed, and an edit made inside a
-  hosted plugin's own window is invisible to it. The settings are not lost, they are written on
-  the next thing you do that Resolve can see. `FXBRIDGE_STATE_STORE=1` closes the gap for a
-  session that changes nothing else at all.
-- **Startup used to start a Wine host for every Windows plugin you own.** Fixed in v0.2.5, and it
-  was the cause of the high-CPU reports. Reading a VST3's class names means opening it, and for a
-  Windows plugin that means yabridge starting a Wine host — which this bridge then kept alive for
-  the whole session, on purpose, because a note in the source said it "costs a file handle".
-  Measured on a tester's machine on 2026-08-29: `pgrep -fc yabridge-host` returned **336** with no
-  project open, Resolve went from 229 threads to 706, the machine from 9.5 GB of memory in use to
-  22.8 GB, and three cores spun at 100%. Modules are now closed after the scan reads them, and what
-  they answered is cached in `~/.local/share/BMDAudioPlugins/fxbridge-scan-cache.tsv`, so a normal
-  start opens nothing at all. Delete that file to force a rescan; it repairs itself if truncated.
-  `FXBRIDGE_SCAN_KEEP_OPEN=1` restores the old behaviour.
-- **The first start after installing or updating a plugin is still slow**, because that is when the
-  scan has to open it. The cache is keyed on the library's size and modification time.
+- **A plugin-only change does not make the project dirty.** Settings are kept in the project (see
+  [Settings between sessions](#settings-between-sessions)); what is missing is the nudge.
+  `FXBRIDGE_STATE_STORE=1` closes the gap.
+- **The first start after installing or updating a plugin is slow**, because that is when the scan
+  has to open it. See [The first scan](#the-first-scan).
 - **A plugin's GUI is a separate window**, not a panel inside Resolve. The inspector panel for a
-  bridged effect stays black on purpose. Under Wayland both windows go through XWayland. It is
-  listed in the window switcher and takes the keyboard when it opens; `FXBRIDGE_WINDOW_TYPE`
+  bridged effect stays black on purpose. Under Wayland both windows go through XWayland. The window
+  is listed in the window switcher and takes the keyboard when it opens; `FXBRIDGE_WINDOW_TYPE`
   accepts `dialog` (the default), `utility` and `normal` if your window manager wants otherwise.
-- **An editor opens when you click the effect**, not when the project loads. Every plugin GUI used
-  to be constructed during the project load, which is the last thing a large project needs.
-  `FXBRIDGE_OPEN_ON_CLAIM=1` brings that back if a machine turns out to have no other way to open
-  a window.
+  After v0.3.1 (on main, in no release yet), editor windows also request `_NET_WM_STATE_ABOVE`, so
+  they stay above Resolve.
+- **An editor opens when you click the effect**, not when the project loads, which is the last
+  thing a large project needs. `FXBRIDGE_OPEN_ON_CLAIM=1` brings the old behaviour back if a
+  machine turns out to have no other way to open a window.
 - **Resolve sometimes does not exit cleanly.** Undiagnosed.
 - **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
   *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
-- **Audio Units** — not applicable, Apple-only format.
-- **Tested on three machines**, all DaVinci Resolve Studio 21, and only one of them is mine. The
-  other two each found a bug this release fixes — an editor that would not reopen after the window
-  manager closed it, and an editor that never opened at all. Neither fix has been confirmed by the
-  person who reported it yet.
-
-> **Not a supported product.** It patches structures inside Resolve's own process at run time and
-> can take Resolve down mid-edit. Save often.
-
+- **Audio Units** are not applicable: Apple-only format.
+- **Startup used to start a Wine host for every Windows plugin you own.** Fixed in v0.2.5; it was
+  the cause of the high-CPU reports. Modules are now closed after the scan reads them.
+  `FXBRIDGE_SCAN_KEEP_OPEN=1` restores the old behaviour.
+- **Tested on three machines**, all DaVinci Resolve Studio 21, and only one of them is the
+  author's. See [CHANGELOG.md](CHANGELOG.md) for what each release fixed and what was confirmed by
+  the reporter.
 
 Every release, and what changed in it, is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -507,19 +456,22 @@ Every release, and what changed in it, is in [CHANGELOG.md](CHANGELOG.md).
 
 Resolve on Linux loads its own Fairlight FX through a private Blackmagic plugin ABI, named by a
 `BMDPlugins.Path` setting that nothing documents. This library registers through that ABI, clones a
-stock effect's menu definition once per scanned plugin, and claims the instance Resolve creates —
+stock effect's menu definition once per scanned plugin, and claims the instance Resolve creates,
 then hosts a real VST2, VST3 or CLAP plugin behind it, with its own audio buffers, its own editor
 window and no state shared between effects.
 
-- [`docs/categories.md`](docs/categories.md) — how a category is decided, and how it is set
-- [`docs/yabridge.md`](docs/yabridge.md) — Windows plugins, and the branch you need
-- [`docs/engineering-log.md`](docs/engineering-log.md) — how the ABI was found, and every dead end
+- [`docs/categories.md`](docs/categories.md): how a category is decided, and how it is set
+- [`docs/yabridge.md`](docs/yabridge.md): Windows plugins, and the branch you need
+- [`docs/resolve-21.1-gate.md`](docs/resolve-21.1-gate.md): the 21.1 plugin gate
+- [`docs/after-a-resolve-update.md`](docs/after-a-resolve-update.md): checking a new Resolve
+- [`docs/first-scan.md`](docs/first-scan.md): scan timings, cache and crash recovery
+- [`docs/engineering-log.md`](docs/engineering-log.md): how the ABI was found, and every dead end
   in order. The dead ends are most of the value.
 
 ## Prior art
 
 No published implementation was found. `BMDAudioPluginFactory` and `QueryPluginList` return zero
-hits across GitHub's indexed code, and web searches turn up only the adjacent tools —
+hits across GitHub's indexed code, and web searches turn up only the adjacent tools:
 [yabridge](https://github.com/robbert-vdh/yabridge), [LinVst](https://github.com/osxmidi/LinVst) and
 [airwave](https://github.com/psycha0s/airwave) let a *DAW* load Windows plugins, which is a different
 problem; this project uses yabridge underneath.
@@ -529,7 +481,7 @@ other forges, or a patch in a forum post. If you got here first, say so and you 
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE). Third-party notices in [`THIRD-PARTY.md`](THIRD-PARTY.md).
+MIT, see [`LICENSE`](LICENSE). Third-party notices in [`THIRD-PARTY.md`](THIRD-PARTY.md).
 
 Parts of this were written with an LLM in the loop. The source and a working binary are both here,
 free of cost, so anyone can check what it does rather than take the description on trust.
@@ -541,7 +493,7 @@ one file.
 No Steinberg SDK is used: VST3 goes through [travesty](https://github.com/DISTRHO/DPF), DPF's
 clean-room C headers (ISC), and VST2 through a clean-room ABI written for this project.
 
-This is interoperability work — making software talk to plugin formats its vendor chose not to
+This is interoperability work: making software talk to plugin formats its vendor chose not to
 support on one platform. In the EU, [Directive 2009/24/EC Article 6](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX%3A32009L0024)
 expressly permits decompilation for interoperability. Resolve's EULA is a separate, contractual
 matter; read it and decide for yourself.
