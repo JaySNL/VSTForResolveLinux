@@ -20,14 +20,17 @@
 #include <dirent.h>
 #include <poll.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "host_thread.h"
@@ -120,10 +123,240 @@ v3_result V3_API HostGetName(void*, v3_str_128 name)
     return V3_OK;
 }
 
-v3_result V3_API HostCreateInstance(void*, v3_tuid, v3_tuid, void** obj)
+// Host-owned VST3 messages. Unlike the static host interfaces, these objects
+// have real reference counts: plugins may retain a message or its attributes.
+extern const v3_attribute_list_cpp kAttributeVtable;
+extern const v3_message_cpp kMessageVtable;
+
+struct HostAttributes {
+    const v3_attribute_list_cpp* vtable = &kAttributeVtable;
+    std::atomic<uint32_t> refs{1};
+    enum class Kind { Integer, Float, String, Binary };
+    struct Value {
+        Kind kind = Kind::Integer;
+        int64_t integer = 0;
+        double floating = 0;
+        std::vector<int16_t> string;
+        std::vector<uint8_t> binary;
+    };
+    // Transparent comparison avoids allocating a temporary string on lookup.
+    std::map<std::string, Value, std::less<>> values;
+
+    template <class Fill>
+    static v3_result Set(void* self, const char* id, Kind kind, Fill fill)
+    {
+        if (id == nullptr) {
+            return V3_INVALID_ARG;
+        }
+        try {
+            Value value;
+            value.kind = kind;
+            fill(value);
+            static_cast<HostAttributes*>(self)->values[id] = std::move(value);
+            return V3_OK;
+        } catch (...) {
+            return V3_NOMEM;
+        }
+    }
+
+    static const Value* Get(void* self, const char* id, Kind kind)
+    {
+        if (id == nullptr) {
+            return nullptr;
+        }
+        const auto& values = static_cast<HostAttributes*>(self)->values;
+        const auto it = values.find(id);
+        return it != values.end() && it->second.kind == kind ? &it->second : nullptr;
+    }
+
+    static uint32_t V3_API Ref(void* self)
+    {
+        return ++static_cast<HostAttributes*>(self)->refs;
+    }
+    static uint32_t V3_API Unref(void* self)
+    {
+        auto* p = static_cast<HostAttributes*>(self);
+        const uint32_t left = --p->refs;
+        if (left == 0) {
+            delete p;
+        }
+        return left;
+    }
+    static v3_result V3_API QueryInterface(void* self, const v3_tuid iid, void** obj)
+    {
+        if (!obj) {
+            return V3_INVALID_ARG;
+        }
+        *obj = nullptr;
+        if (!v3_tuid_match(iid, v3_funknown_iid) &&
+            !v3_tuid_match(iid, v3_attribute_list_iid)) {
+            return V3_NO_INTERFACE;
+        }
+        *obj = self;
+        Ref(self);
+        return V3_OK;
+    }
+    static v3_result V3_API SetInt(void* self, const char* id, int64_t n)
+    {
+        return Set(self, id, Kind::Integer, [n](Value& v) { v.integer = n; });
+    }
+    static v3_result V3_API GetInt(void* self, const char* id, int64_t* n)
+    {
+        const auto* v = Get(self, id, Kind::Integer);
+        if (!v || !n) {
+            return V3_INVALID_ARG;
+        }
+        *n = v->integer;
+        return V3_OK;
+    }
+    static v3_result V3_API SetFloat(void* self, const char* id, double n)
+    {
+        return Set(self, id, Kind::Float, [n](Value& v) { v.floating = n; });
+    }
+    static v3_result V3_API GetFloat(void* self, const char* id, double* n)
+    {
+        const auto* v = Get(self, id, Kind::Float);
+        if (!v || !n) {
+            return V3_INVALID_ARG;
+        }
+        *n = v->floating;
+        return V3_OK;
+    }
+    static v3_result V3_API SetString(void* self, const char* id, const int16_t* s)
+    {
+        if (!s) {
+            return V3_INVALID_ARG;
+        }
+        return Set(self, id, Kind::String, [s](Value& v) {
+            const int16_t* end = s;
+            while (*end) ++end;
+            v.string.assign(s, end + 1);
+        });
+    }
+    static v3_result V3_API GetString(void* self, const char* id, int16_t* s, uint32_t bytes)
+    {
+        const auto* v = Get(self, id, Kind::String);
+        if (!v || !s || bytes < sizeof(int16_t)) {
+            return V3_INVALID_ARG;
+        }
+        const size_t capacity = bytes / sizeof(int16_t);
+        // The size is in bytes, not UTF-16 code units. Always terminate the
+        // destination, including when the caller provides a short buffer.
+        const size_t count = std::min(capacity - 1, v->string.size() - 1);
+        std::memcpy(s, v->string.data(), count * sizeof(int16_t));
+        s[count] = 0;
+        return V3_OK;
+    }
+    static v3_result V3_API SetBinary(void* self, const char* id, const void* data, uint32_t size)
+    {
+        if (!data && size) {
+            return V3_INVALID_ARG;
+        }
+        return Set(self, id, Kind::Binary, [data, size](Value& v) {
+            if (size) {
+                const auto* p = static_cast<const uint8_t*>(data);
+                v.binary.assign(p, p + size);
+            }
+        });
+    }
+    static v3_result V3_API GetBinary(void* self, const char* id, const void** data, uint32_t* size)
+    {
+        const auto* v = Get(self, id, Kind::Binary);
+        if (!v || !data || !size) {
+            return V3_INVALID_ARG;
+        }
+        *data = v->binary.data();
+        *size = static_cast<uint32_t>(v->binary.size());
+        return V3_OK;
+    }
+};
+
+const v3_attribute_list_cpp kAttributeVtable = {
+    {HostAttributes::QueryInterface, HostAttributes::Ref, HostAttributes::Unref},
+    {HostAttributes::SetInt, HostAttributes::GetInt, HostAttributes::SetFloat,
+     HostAttributes::GetFloat, HostAttributes::SetString, HostAttributes::GetString,
+     HostAttributes::SetBinary, HostAttributes::GetBinary},
+};
+
+struct HostMessage {
+    const v3_message_cpp* vtable = &kMessageVtable;
+    std::atomic<uint32_t> refs{1};
+    std::string id;
+    HostAttributes* attributes = new HostAttributes;
+    ~HostMessage() { HostAttributes::Unref(attributes); }
+
+    static uint32_t V3_API Ref(void* self)
+    {
+        return ++static_cast<HostMessage*>(self)->refs;
+    }
+    static uint32_t V3_API Unref(void* self)
+    {
+        auto* p = static_cast<HostMessage*>(self);
+        const uint32_t left = --p->refs;
+        if (left == 0) {
+            delete p;
+        }
+        return left;
+    }
+    static v3_result V3_API QueryInterface(void* self, const v3_tuid iid, void** obj)
+    {
+        if (!obj) {
+            return V3_INVALID_ARG;
+        }
+        *obj = nullptr;
+        if (!v3_tuid_match(iid, v3_funknown_iid) &&
+            !v3_tuid_match(iid, v3_message_iid)) {
+            return V3_NO_INTERFACE;
+        }
+        *obj = self;
+        Ref(self);
+        return V3_OK;
+    }
+    static const char* V3_API GetId(void* self)
+    {
+        return static_cast<HostMessage*>(self)->id.c_str();
+    }
+    static void V3_API SetId(void* self, const char* id)
+    {
+        auto& target = static_cast<HostMessage*>(self)->id;
+        try {
+            target = id ? id : "";
+        } catch (...) {
+            target.clear();
+        }
+    }
+    static v3_attribute_list** V3_API GetAttributes(void* self)
+    {
+        return reinterpret_cast<v3_attribute_list**>(static_cast<HostMessage*>(self)->attributes);
+    }
+};
+
+const v3_message_cpp kMessageVtable = {
+    {HostMessage::QueryInterface, HostMessage::Ref, HostMessage::Unref},
+    {HostMessage::GetId, HostMessage::SetId, HostMessage::GetAttributes},
+};
+
+v3_result V3_API HostCreateInstance(void*, v3_tuid cid, v3_tuid iid, void** obj)
 {
+    if (!obj) {
+        return V3_INVALID_ARG;
+    }
     *obj = nullptr;
-    return V3_NOT_IMPLEMENTED;
+    try {
+        if (v3_tuid_match(cid, v3_message_iid) &&
+            (v3_tuid_match(iid, v3_message_iid) || v3_tuid_match(iid, v3_funknown_iid))) {
+            *obj = new HostMessage;
+            return V3_OK;
+        }
+        if (v3_tuid_match(cid, v3_attribute_list_iid) &&
+            (v3_tuid_match(iid, v3_attribute_list_iid) || v3_tuid_match(iid, v3_funknown_iid))) {
+            *obj = new HostAttributes;
+            return V3_OK;
+        }
+    } catch (...) {
+        return V3_NOMEM;
+    }
+    return V3_NO_INTERFACE;
 }
 
 const v3_host_application_cpp g_host_vtable = {
