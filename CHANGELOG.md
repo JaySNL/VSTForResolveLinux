@@ -7,6 +7,105 @@ later turned out to be wrong, the correction stays next to the original rather t
 
 ---
 
+## v0.3.2 — 2026-11-24
+
+**DaVinci Resolve 21.2, verified here. Plugin windows that stay open and on top, VST3 plugins
+that talk to their own editor, and lib64 plugin folders - four community fixes by mbaksa
+(#3 to #6). And a project save no longer waits forever on a plugin that stops answering.**
+
+### Resolve 21.2
+
+Nothing had to change. Checked on 21.2.0.0006 against 21.1.2.0010:
+
+- `tools/check-offsets.py`: 32 of 32 slots in place, vtable 0xab8, map node 0x68, the plugin gate
+  at `FLPluginHost::Initialize+0x93`, all as on 21.1.2. The reference table regenerated from 21.2
+  with `--emit-expected` is identical to the one in the file.
+- The nine member offsets read at load are 21.1.2's, and `tools/member-layout-test.sh` passes:
+  `channels +0x158/+0x160, bypass +0x171, dirty +0xa1, parent +0x40, name +0x558, panel tree +0x368
+  size +0x3b0/+0x3b4`.
+- The symbols #6 hooks are all exported.
+- Inside Resolve 21.2.0.0006 on the development machine, over several sessions: plugins load in
+  all three formats, editors open, close and reopen, two smartEQ4 instances on one track, LSP's
+  analysers draw, and project saves store and restore every hosted state.
+
+### Plugin windows (#6 and #5)
+
+**The bridge now opens and closes a plugin's window when Resolve calls `ShowEditor(bool)` on that
+effect's panel** (#6). It used to read two other calls as stand-ins: `UpdateEffectEditTitle` as
+"open" and `HideSubWindows` as "close". Resolve makes both for other reasons too, such as deleting
+an effect or a change of focus. That is how a window could vanish the moment it opened or took the
+focus (issue #2, reported on KDE under X11), and how a deleted effect could open its window again.
+
+- The hook goes into a private copy of each panel's vtable, and only after the method's symbol
+  name has been checked (`FLPluginUIPanel` and `UiEffectEditDialogImp`). Resolve's own effects
+  keep the stock function. The log says `editor: private ShowEditor vtable installed`.
+- The old title/hide signals remain as a fallback, used only when a Resolve's vtable is not
+  recognised: `editor: unsupported ShowEditor vtable; using title/hide fallback`.
+- The fallback to the last focused effect is gone, so an editor operation can no longer land on
+  the wrong instance.
+- `FXBRIDGE_EDITOR_TRACE=1` turns the verbose editor trace on; it is off by default.
+
+**Plugin windows stay above Resolve** (#5). They ask for `_NET_WM_STATE_ABOVE` when first mapped,
+and again through an EWMH client message when reopened, so the state holds after a close and
+reopen.
+
+### VST3 host messages (#3)
+
+`IHostApplication::createInstance` now makes `IMessage` and `IAttributeList` objects (integer,
+float, string and binary attributes) where it used to answer "not implemented". VST3 plugins whose
+audio side talks to their editor through these messages now update during playback. Verified here
+with LSP's Spectrum Analyzer x2 and Oscilloscope x2, which draw live during playback.
+
+### lib64 plugin folders (#4)
+
+`/usr/lib64/{clap,vst3,vst,lxvst}` and `/usr/local/lib64/...` are searched by default, as Fedora
+installs plugins there. A plugin reached through two symlinked folders is listed once, matched by
+`realpath()`. **Not measured here**: this machine has no lib64 plugin folders.
+
+### A project save that waits on a plugin is bounded
+
+**Seen once, on 21.2 on 2026-11-24.** Adding a second smartEQ4 (VST2, through yabridge) to a track
+froze Resolve for good. The project save asked the new instance for its settings within a second of
+its editor opening. Its Wine host took the request and never answered, and Resolve's interface
+thread sat in yabridge's `recv()` until it was killed. Not reproduced in later attempts.
+
+Two changes, in `src/bounded_save.cpp`:
+
+- **The state call runs on the bridge's host main thread** now, under the lock that thread holds.
+  That is the one thread VST2, VST3 and CLAP all accept for a state call, and the same thread that
+  drives the plugin's editor, so a save can no longer land in the middle of editor work. It used
+  to be made straight from Resolve's interface thread, against the bridge's own rule in
+  `host_thread.h`, and it overlapped exactly that editor work in the freeze above.
+- **Resolve waits at most 10 seconds.** Past that, the effect is saved with the settings that
+  plugin gave at its previous save in this session, or with nothing if there was none, and the log
+  says so: `preset: "smartEQ4" did not answer (timed out) - attaching the ... bytes it gave last
+  time`. While that call stays out, later saves skip that plugin at once instead of each one costing
+  another 10 seconds.
+
+**What it does not do:** cancel the stuck call. Nothing can cancel a call that is inside a plugin.
+A plugin whose host has died stays dead for the rest of the session: its editor no longer opens or
+closes, and Resolve can hang on quit. Before this change, the same plugin froze the whole interface.
+
+Verified:
+
+- `tools/bounded-save-test.sh` drives the shipped code with fake plugins, one of which never
+  answers: 8 checks, covering the thread the call runs on, the 10-second limit, the skip while a
+  call is out, recovery once it returns, and a job given up on before it ran never reaching its
+  plugin. Two deliberate breakages of the code each fail it.
+- Inside Resolve 21.2.0.0006, two project saves with eight bridged effects on the timeline (VST2
+  through yabridge, VST3 and CLAP): 16 of 16 states attached, none timed out, 0.24 s and 0.19 s per
+  save. Resolve quit cleanly afterwards.
+
+**The cost:** each save now waits for the host main thread's next tick, up to 16 ms per bridged
+effect.
+
+### Not fixed
+
+- **Sidechain.** Resolve shows its sidechain routing only for effects it considers
+  sidechain-capable, and a bridged effect is not one of them. The bridge feeds a plugin's main input
+  only: a VST2 plugin's extra inputs receive silence, and VST3 and CLAP plugins get no second bus.
+  Issue #2.
+
 ## v0.3.1.1 — 2026-11-03 (fixed offsets, Resolve 21.1.2 only)
 
 **v0.3.1 with its nine member offsets as constants for 21.1.2.0010, and without the code that

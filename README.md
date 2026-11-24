@@ -27,10 +27,8 @@ Requires **DaVinci Resolve Studio 21** on Linux. The free version does not load 
 | Your Resolve | Release | Notes |
 |---|---|---|
 | 21.0 to 21.1.0 | [v0.3.0.1](https://github.com/JaySNL/VSTForResolveLinux/releases/tag/v0.3.0.1) | |
-| 21.1.2 | [v0.3.1](https://github.com/JaySNL/VSTForResolveLinux/releases/tag/v0.3.1) (latest) | Reads Resolve's member offsets at load. If it cannot, it refuses and forwards Resolve's own effects untouched. |
-| 21.1.2 only | [v0.3.1.1](https://github.com/JaySNL/VSTForResolveLinux/releases/tag/v0.3.1.1) | Side release: the same fix with the offsets fixed in the code. For anyone wary of Microsoft Defender's machine-learning flag on v0.3.1 (`Trojan:Script/Wacatac.C!ml`), a false positive reported to Microsoft; no other engine flags it. Wrong on any other Resolve. |
-
-Resolve 21.2 has been reported working by a contributor. Not verified here.
+| 21.1.2 and 21.2 | [v0.3.2](https://github.com/JaySNL/VSTForResolveLinux/releases/tag/v0.3.2) (latest) | Reads Resolve's member offsets at load. If it cannot, it refuses and forwards Resolve's own effects untouched. Verified on 21.2.0.0006. |
+| 21.1.2 only | [v0.3.1.1](https://github.com/JaySNL/VSTForResolveLinux/releases/tag/v0.3.1.1) | Side release: v0.3.1 with the offsets fixed in the code. For anyone wary of Microsoft Defender's machine-learning flag on v0.3.1 (`Trojan:Script/Wacatac.C!ml`), a false positive reported to Microsoft; no other engine flags it. Wrong on any other Resolve. |
 
 Method 2 below downloads the latest release. For another one, replace `latest/download` in the URLs
 with `download/<tag>`, or check out that tag before building with Method 1.
@@ -253,7 +251,7 @@ before concluding this project is broken. Native Linux CLAP and VST3 plugins nee
 | VST3 | `/usr/lib/vst3`, `/usr/local/lib/vst3` |
 | VST2 | `/usr/lib/vst`, `/usr/local/lib/vst`, `/usr/lib/lxvst`, `/usr/local/lib/lxvst` |
 
-After v0.3.1 (merged on main, in no release yet): `/usr/lib64/{clap,vst3,vst,lxvst}` and
+Since v0.3.2, `/usr/lib64/{clap,vst3,vst,lxvst}` and
 `/usr/local/lib64/...` are searched too, and plugins reached twice through symlinks are listed once.
 
 **Formats.** `FXBRIDGE_SCAN_FORMATS`, default `clap,vst2,vst3`.
@@ -375,6 +373,11 @@ flight, and pretending otherwise would trade a freeze for a corrupted plugin. Wh
 the name of the plugin to remove, which no crash dump carries. The lock order inversion behind the
 freeze is in [`docs/freeze-deadlock.md`](docs/freeze-deadlock.md).
 
+**A project save waits at most 10 seconds for a plugin** (since v0.3.2). A plugin that does not
+hand over its settings in time is saved with what it gave at its previous save in the session, and
+the log names it: `preset: "<name>" did not answer`. The stuck call itself cannot be cancelled, so
+that plugin stays unusable until Resolve restarts, but the rest of Resolve keeps working.
+
 ## After a Resolve update
 
 Blackmagic rebuilds the class this bridge patches on every release, so a new Resolve can move
@@ -434,12 +437,14 @@ supported.
   bridged effect stays black on purpose. Under Wayland both windows go through XWayland. The window
   is listed in the window switcher and takes the keyboard when it opens; `FXBRIDGE_WINDOW_TYPE`
   accepts `dialog` (the default), `utility` and `normal` if your window manager wants otherwise.
-  After v0.3.1 (on main, in no release yet), editor windows also request `_NET_WM_STATE_ABOVE`, so
-  they stay above Resolve.
+  Since v0.3.2, editor windows also request `_NET_WM_STATE_ABOVE`, so they stay above Resolve.
 - **An editor opens when you click the effect**, not when the project loads, which is the last
   thing a large project needs. `FXBRIDGE_OPEN_ON_CLAIM=1` brings the old behaviour back if a
   machine turns out to have no other way to open a window.
 - **Resolve sometimes does not exit cleanly.** Undiagnosed.
+- **No sidechain.** Resolve shows its sidechain routing only for effects it considers
+  sidechain-capable, and a bridged effect is not one. The bridge feeds a plugin's main input only;
+  a VST2 plugin's extra inputs receive silence.
 - **No top-level "VST" group** like macOS and Windows show. That grouping comes from the plugin
   *type*, and Linux Resolve has no VST type. Categories work; a separate VST section cannot.
 - **Audio Units** are not applicable: Apple-only format.
