@@ -33,6 +33,7 @@
 #include "plugin_window.h"
 #include "plugin_state.h"
 #include "host_thread.h"
+#include "bounded_save.h"
 
 #include <dlfcn.h>
 #include <link.h>
@@ -336,6 +337,11 @@ struct ClaimedEffect {
     uint64_t state_stamp = 0;
     bool state_said_gone = false;
     bool state_said_mute = false;
+
+    // What the plugin answered at the last project save, kept so a save it does not answer in time
+    // can attach these instead of nothing. Only AttachPluginChunk touches it, always on Resolve's
+    // thread. See bounded_save.h.
+    std::vector<uint8_t> preset_last;
 
     // The parameter probe. Empty unless FXBRIDGE_PARAM_PROBE=1.
     //
@@ -4319,8 +4325,25 @@ void AttachPluginChunk(ClaimedEffect* effect, void* preset)
         return;
     }
 
+    // Long enough for a plugin that serialises a lot of state, short enough that a plugin which
+    // never answers costs one pause instead of the whole session. Later saves skip the wait
+    // entirely while that call is still out.
+    constexpr std::chrono::milliseconds kSaveLimit{10000};
     std::vector<uint8_t> blob;
-    if (!effect->plugin->SaveState(blob) || blob.empty()) {
+    const BoundedSave saved = SaveStateBounded(effect->plugin, blob, kSaveLimit);
+    if (saved == BoundedSave::Saved && !blob.empty()) {
+        effect->preset_last = blob;
+    } else if (saved == BoundedSave::TimedOut || saved == BoundedSave::Stalled) {
+        // Logged past the cap: a plugin that stopped answering is the one save worth finding.
+        if (effect->preset_last.empty()) {
+            Log("preset: \"%s\" did not answer (%s) and was never saved before - nothing attached",
+                effect->label_narrow, BoundedSaveName(saved));
+            return;
+        }
+        Log("preset: \"%s\" did not answer (%s) - attaching the %zu bytes it gave last time",
+            effect->label_narrow, BoundedSaveName(saved), effect->preset_last.size());
+        blob = effect->preset_last;
+    } else {
         if (talk) {
             Log("preset: \"%s\" reported no settings - nothing attached", effect->label_narrow);
         }

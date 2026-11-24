@@ -37,7 +37,7 @@ bwrap --bind "$ROOT" / --dev /dev --proc /proc --tmpfs /tmp \
             -o /out/libfxbridge.so \
             src/proxy.cpp src/chain_lock_fix.cpp src/member_layout.cpp src/carla_host.cpp src/vst2_plugin.cpp \
             src/clap_plugin.cpp \
-            src/host_thread.cpp src/vst3_plugin.cpp src/plugin_scan.cpp src/plugin_state.cpp \
+            src/host_thread.cpp src/vst3_plugin.cpp src/plugin_scan.cpp src/plugin_state.cpp src/bounded_save.cpp \
             src/fx_categories.cpp src/plugin_window.cpp \
             -ldl -lX11 -lz -lpthread
         # The pre-launch scanner ships with the library, and floors at the same glibc, so it is
